@@ -1,9 +1,13 @@
 name: ci
 
+# workflow_dispatch lets cut-release trigger checks on its release branch —
+# PRs created with GITHUB_TOKEN don't fire pull_request workflows, and the
+# branch-protection required checks must still report on the head SHA.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

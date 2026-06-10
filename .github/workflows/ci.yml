@@ -57,7 +57,7 @@ jobs:
           file "$BIN" | grep -qE "statically linked|static-pie linked" || { echo "not statically linked"; exit 1; }
           "$BIN" --version
           "$BIN" --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dense-linux-x86_64
           path: target/x86_64-unknown-linux-musl/release/dense

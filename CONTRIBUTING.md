@@ -38,8 +38,10 @@ through a PR (main is branch-protected):
 
 1. Actions → **cut-release** → Run workflow (leave `version` empty to
    compute it from the commit log). It runs `scripts/release.sh --no-tag`
-   on a `release/vX.Y.Z` branch and opens the release PR.
-2. **Merge the release PR** — that review is the release authorization.
+   on a `release/vX.Y.Z` branch and prints the PR link in the run summary.
+2. **Open and merge the release PR** — opening it by hand is deliberate
+   (bot-created PRs fire no checks), and the merge is the release
+   authorization.
 3. **tag-release** fires on the merge, tags the merged commit `vX.Y.Z`,
    and dispatches the build; the GitHub Release publishes automatically.
 

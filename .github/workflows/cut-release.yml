@@ -2,12 +2,10 @@ name: cut-release
 
 # Cut a release from the Actions tab: computes the next vX.Y.Z from
 # Conventional Commits (git-cliff), bumps Cargo.toml, regenerates
-# CHANGELOG.md, and opens a release PR. Merging that PR (the authorized,
-# branch-protection-compliant step) triggers tag-release.yml, which tags
-# the merged commit and dispatches the build.
-#
-# Needs "Allow GitHub Actions to create and approve pull requests" enabled
-# under Settings -> Actions -> General.
+# CHANGELOG.md, pushes a release branch, and prints the PR link. A human
+# opens the PR (bot-created PRs fire no pull_request checks, so the
+# required checks would never report) and merges it — that merge triggers
+# tag-release.yml, which tags the merged commit and dispatches the build.
 on:
   workflow_dispatch:
     inputs:
@@ -18,8 +16,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
-  actions: write
 
 concurrency: cut-release
 
@@ -46,18 +42,14 @@ jobs:
           git checkout -b "release/v${ver}"
           ./scripts/release.sh --no-tag "$ver"
           echo "ver=${ver}" >> "$GITHUB_ENV"
-      - name: Open the release PR
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Push the release branch
         run: |
           git push origin "release/v${ver}"
-          body="Release v${ver}: version bump + changelog (cut by the cut-release action).
-          Merging this PR tags the merged commit as v${ver} and publishes the release."
-          gh pr create \
-            --base main --head "release/v${ver}" \
-            --title "chore(release): v${ver}" \
-            --body "$body"
-          # bot-created PRs don't fire pull_request workflows; run the
-          # required checks on the release branch explicitly
-          gh workflow run ci.yml --ref "release/v${ver}"
-          echo "release PR for v${ver} opened — merge it to tag + publish" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## release v${ver} cut"
+            echo "Open the release PR (your click makes the required checks run):"
+            echo
+            echo "https://github.com/${GITHUB_REPOSITORY}/compare/main...release/v${ver}?expand=1&title=chore(release)%3A%20v${ver}"
+            echo
+            echo "Merging it tags the commit as v${ver} and publishes the release."
+          } >> "$GITHUB_STEP_SUMMARY"

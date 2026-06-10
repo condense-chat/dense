@@ -35,7 +35,8 @@ condense monorepo as a git submodule, but versions and ships on its own.
 - **Releasing.** PR-based (main is branch-protected): the cut-release action
   (or `./scripts/release.sh --no-tag` on a branch — same script) computes the
   next `vX.Y.Z` from the commit log (git-cliff), bumps `Cargo.toml`,
-  regenerates `CHANGELOG.md`, and opens a release PR; merging it triggers
+  regenerates `CHANGELOG.md`, and pushes a release branch (the run summary
+  links the PR to open); merging that PR triggers
   tag-release, which tags the merged commit and dispatches the build. Full
   procedure in CONTRIBUTING.md — not in the user-facing README.
 

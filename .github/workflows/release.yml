@@ -27,7 +27,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Linux build deps
         if: startsWith(matrix.platform, 'linux')
         run: sudo apt-get update && sudo apt-get install -y musl-tools file
@@ -65,7 +65,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v4

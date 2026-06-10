@@ -1,0 +1,12 @@
+# cargo-deny — CI runs `check advisories bans sources` (licenses unchecked;
+# the dep tree is MIT/Apache-typical and we ship a binary, not a crate).
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

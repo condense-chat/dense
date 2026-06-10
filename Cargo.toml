@@ -30,7 +30,7 @@ sha2 = "0.10"
 hex = "0.4"
 webbrowser = "1"
 backon = "1"
-cliclack = "0.3"
+cliclack = "0.5"
 gethostname = "1"
 owo-colors = { version = "4", features = ["supports-colors"] }
 self-replace = "1"

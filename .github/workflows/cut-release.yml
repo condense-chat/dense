@@ -19,6 +19,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency: cut-release
 
@@ -56,4 +57,7 @@ jobs:
             --base main --head "release/v${ver}" \
             --title "chore(release): v${ver}" \
             --body "$body"
+          # bot-created PRs don't fire pull_request workflows; run the
+          # required checks on the release branch explicitly
+          gh workflow run ci.yml --ref "release/v${ver}"
           echo "release PR for v${ver} opened — merge it to tag + publish" >> "$GITHUB_STEP_SUMMARY"

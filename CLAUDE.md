@@ -32,12 +32,12 @@ condense monorepo as a git submodule, but versions and ships on its own.
   hold that.
 - **Before committing:** `cargo fmt --check`, `cargo clippy --all-targets -D
   warnings`, `cargo test` all green.
-- **Releasing.** The cut-release GitHub Action (or `./scripts/release.sh`
-  locally — same script) computes the next `vX.Y.Z` from the commit log
-  (git-cliff), bumps `Cargo.toml`, regenerates `CHANGELOG.md`, commits, and
-  tags; the tag (pushed, or dispatched by the action) builds the matrix and
-  publishes the GitHub Release. Full procedure in CONTRIBUTING.md — not in
-  the user-facing README.
+- **Releasing.** PR-based (main is branch-protected): the cut-release action
+  (or `./scripts/release.sh --no-tag` on a branch — same script) computes the
+  next `vX.Y.Z` from the commit log (git-cliff), bumps `Cargo.toml`,
+  regenerates `CHANGELOG.md`, and opens a release PR; merging it triggers
+  tag-release, which tags the merged commit and dispatches the build. Full
+  procedure in CONTRIBUTING.md — not in the user-facing README.
 
 ## Layout
 

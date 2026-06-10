@@ -33,18 +33,24 @@ clarification only; no narrative or historical paragraphs.
 
 ## Releasing
 
-Releases are cut from `main` with [git-cliff](https://git-cliff.org).
-The usual path is the **cut-release action**: Actions → cut-release →
-Run workflow (leave `version` empty to compute it from the commit log).
-It runs `scripts/release.sh`, pushes the release commit + tag, and
-dispatches the build — needs nothing but repo write access.
+Releases are cut from `main` with [git-cliff](https://git-cliff.org),
+through a PR (main is branch-protected):
 
-The same cut works locally:
+1. Actions → **cut-release** → Run workflow (leave `version` empty to
+   compute it from the commit log). It runs `scripts/release.sh --no-tag`
+   on a `release/vX.Y.Z` branch and opens the release PR.
+2. **Merge the release PR** — that review is the release authorization.
+3. **tag-release** fires on the merge, tags the merged commit `vX.Y.Z`,
+   and dispatches the build; the GitHub Release publishes automatically.
+
+The cut also works locally on a branch:
 
 ```sh
-./scripts/release.sh            # next version from the commit log
-./scripts/release.sh 1.4.0      # or pin it explicitly
+./scripts/release.sh --no-tag           # version from the commit log
+./scripts/release.sh --no-tag 1.4.0     # or pin it explicitly
 ```
+
+then open the PR yourself — tagging still happens on merge.
 
 The script bumps `Cargo.toml` (+ `Cargo.lock`), regenerates `CHANGELOG.md`,
 commits `chore(release): vX.Y.Z`, and creates the `vX.Y.Z` tag. Review, then:

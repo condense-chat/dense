@@ -1,0 +1,45 @@
+name: tag-release
+
+# When a release PR lands on main, tag the merged commit and dispatch the
+# release build. Detection works for squash ("chore(release): vX.Y.Z") and
+# merge-commit ("... from .../release/vX.Y.Z") messages, and the version is
+# cross-checked against Cargo.toml so an unrelated commit mentioning a
+# version can't cut a release.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: tag-release
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag the release merge and dispatch the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          ver_msg="$(grep -oE '(chore\(release\): v|release/v)[0-9]+\.[0-9]+\.[0-9]+' <<<"$HEAD_MSG" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+          ver_toml="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ -z "$ver_msg" ] || [ "$ver_msg" != "$ver_toml" ]; then
+            echo "not a release merge (msg: ${ver_msg:-none}, Cargo.toml: ${ver_toml}) — nothing to do"
+            exit 0
+          fi
+          tag="v${ver_toml}"
+          if git ls-remote --exit-code origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} already exists — nothing to do"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag"
+          git push origin "$tag"
+          gh workflow run release.yml --ref "$tag"
+          echo "tagged ${tag}; release build dispatched" >> "$GITHUB_STEP_SUMMARY"

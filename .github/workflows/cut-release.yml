@@ -1,0 +1,47 @@
+name: cut-release
+
+# Cut a release from the Actions tab: computes the next vX.Y.Z from
+# Conventional Commits (git-cliff), bumps Cargo.toml, regenerates
+# CHANGELOG.md, commits, tags, pushes, and dispatches the release build.
+# Same code path as a local cut — both run scripts/release.sh.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z); empty computes it from the commit log"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: cut-release
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+      - name: Cut release commit + tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          ./scripts/release.sh $VERSION
+      - name: Push and dispatch the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(git describe --tags --exact-match)"
+          git push origin main --follow-tags
+          gh workflow run release.yml --ref "$tag"
+          echo "cut ${tag}; release build dispatched" >> "$GITHUB_STEP_SUMMARY"

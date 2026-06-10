@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources
+
+  dist:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools file
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build static musl binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Smoke
+        run: |
+          BIN="target/x86_64-unknown-linux-musl/release/dense"
+          file "$BIN" | grep -qE "statically linked|static-pie linked" || { echo "not statically linked"; exit 1; }
+          "$BIN" --version
+          "$BIN" --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dense-linux-x86_64
+          path: target/x86_64-unknown-linux-musl/release/dense
+          if-no-files-found: error

@@ -1,0 +1,35 @@
+# Panics stay denied in src/; tests may unwrap/expect — a failed assertion is
+# the point there.
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+
+# Source item ordering (clippy::arbitrary_source_item_ordering).
+#
+# Enforces the structural kind order — declarations, then definitions, then data,
+# then behaviour:
+#   mod → use → const → type → trait → enum/struct → impl → fn
+# Submodule `mod foo;` declarations lead the file; `use` is its own group
+# (rustfmt keeps the std/external/local grouping). Only OUTLINE module
+# declarations are ordered — inline `mod foo { }` (e.g. `#[cfg(test)] mod tests`)
+# is left wherever it sits, so test modules stay at the bottom. Within-group
+# ordering is the CLAUDE.md convention (pub → pub(crate) → private, then
+# alphabetical), which clippy can't express, so it isn't machine-enforced.
+module-item-order-groupings = [
+    ["modules", ["mod", "foreign_mod"]],
+    ["extern_crates", ["extern_crate"]],
+    ["imports", ["use"]],
+    ["macros", ["macro", "global_asm"]],
+    ["consts", ["const", "static"]],
+    ["type_aliases", ["ty_alias"]],
+    ["traits", ["trait", "trait_alias"]],
+    ["data", ["enum", "struct", "union"]],
+    ["impls", ["impl"]],
+    ["functions", ["fn"]],
+]
+module-items-ordered-within-groupings = "none"
+# Order the inner items of these categories alphabetically (struct fields, enum
+# variants, trait methods). `impls` is intentionally omitted so impl methods can
+# follow the visibility-then-alpha convention (public interface on top) rather
+# than being forced strictly alphabetical.
+source-item-ordering = ["enum", "module", "struct", "trait"]

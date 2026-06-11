@@ -14,8 +14,15 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     cfg.remember_profile()?;
 
+    let note = format!(
+        "dense is open source — read the code: {}",
+        env!("CARGO_PKG_REPOSITORY")
+    );
     if interactive {
         let _ = cliclack::intro(ui::cyan("condense setup"));
+        let _ = cliclack::log::remark(ui::dim(&note));
+    } else {
+        println!("{}\n", ui::dim(&note));
     }
 
     let do_persist = ask(

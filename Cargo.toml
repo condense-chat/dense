@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 color-eyre = "0.6"
-directories = "5"
+directories = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -30,7 +30,7 @@ sha2 = "0.10"
 hex = "0.4"
 webbrowser = "1"
 backon = "1"
-cliclack = "0.3"
+cliclack = "0.5"
 gethostname = "1"
 owo-colors = { version = "4", features = ["supports-colors"] }
 self-replace = "1"
@@ -56,3 +56,7 @@ arbitrary_source_item_ordering = "deny"
 strip = true
 lto = true
 codegen-units = 1
+# size over speed — this binary execs a child and polls HTTP; opt-level
+# benchmarking showed no perceptible difference, panics are lint-banned.
+opt-level = "s"
+panic = "abort"

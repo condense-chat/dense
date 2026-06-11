@@ -6,6 +6,15 @@ yanked = "deny"
 
 [bans]
 multiple-versions = "warn"
+# Duplicates we can't unify from here — skipped so new ones stay visible.
+skip = [
+    { crate = "getrandom@0.2", reason = "ring pins getrandom 0.2; the rest of the tree is current" },
+    { crate = "supports-color", reason = "owo-colors carries both of its feature generations" },
+    { crate = "wit-bindgen", reason = "wasi shim of getrandom; never built for shipped targets" },
+]
+skip-tree = [
+    { crate = "windows-sys", reason = "windows ecosystem version churn; only built on windows" },
+]
 
 [sources]
 unknown-registry = "deny"

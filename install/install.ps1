@@ -11,8 +11,8 @@ $ErrorActionPreference = "Stop"
 
 # Environment endpoints — the serving cli host rewrites these three
 # assignments (and only these) for non-prod zones.
-$CliUrl = "https://cli.condense.chat"
 $ApiUrl = "https://api.condense.chat"
+$ReleaseUrl = "https://github.com/condense-chat/dense"
 $AuthRequired = "1"
 
 function Write-Arrow($msg) {
@@ -30,7 +30,7 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 # Version we'd install (from the manifest), and what's already installed.
 $targetVersion = ""
 try {
-    $targetVersion = (Invoke-RestMethod -Uri "$CliUrl/windows-x86_64/dense/manifest.json").version
+    $targetVersion = (Invoke-RestMethod -Uri "$ReleaseUrl/releases/latest/download/manifest-windows-x86_64.json").version
 } catch {}
 
 $updating = $false
@@ -38,7 +38,8 @@ $existing = (Get-Command dense -ErrorAction SilentlyContinue).Source
 if ($existing) {
     $installedVersion = ""
     try { $installedVersion = ((& $existing --version) -split ' ')[-1] } catch {}
-    if ($targetVersion -and ($installedVersion -eq $targetVersion)) {
+    # "dev" builds carry no orderable version — always offer the refresh.
+    if ($targetVersion -and ($targetVersion -ne "dev") -and ($installedVersion -eq $targetVersion)) {
         Write-Arrow "dense $targetVersion is already installed. Run ``dense -h`` for more info."
         return
     }
@@ -57,7 +58,7 @@ if ($existing) {
 # An update swaps the binary wherever it already lives; a fresh install
 # lands in our bin dir.
 $dest = if ($existing) { $existing } else { Join-Path $binDir "dense.exe" }
-$url = "$CliUrl/windows-x86_64/dense/stable"
+$url = "$ReleaseUrl/releases/latest/download/dense-windows-x86_64.exe"
 $tmp = "$dest.download"
 Write-Arrow "downloading dense from $url"
 try {
@@ -84,5 +85,6 @@ if ($updating) {
 
 $env:Path = "$binDir;$env:Path"
 if (-not $env:CONDENSE_URL) { $env:CONDENSE_URL = $ApiUrl }
+if (-not $env:CONDENSE_RELEASE_URL) { $env:CONDENSE_RELEASE_URL = $ReleaseUrl }
 $env:CONDENSE_AUTH_REQUIRED = $AuthRequired
 & $dest setup

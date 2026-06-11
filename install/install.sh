@@ -10,8 +10,8 @@ set -euo pipefail
 
 # Environment endpoints — the serving cli host rewrites these three
 # assignments (and only these) for non-prod zones.
-CLI_URL="https://cli.condense.chat"
 API_URL="https://api.condense.chat"
+RELEASE_URL="https://github.com/condense-chat/dense"
 AUTH_REQUIRED="1"
 
 # Colours, only when stderr is a terminal.
@@ -37,7 +37,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=aarch64 ;;
   *)
     echo "dense ships ${os} binaries for x86_64 and aarch64; detected $(uname -m)." >&2
-    echo "build from source: ${CLI_URL}" >&2
+    echo "build from source: ${RELEASE_URL}" >&2
     exit 1
     ;;
 esac
@@ -48,7 +48,7 @@ mkdir -p "$bindir"
 
 # Version we'd install (from the manifest), and what's already installed.
 target_version=""
-if manifest="$(curl -fsSL "${CLI_URL}/${platform}/dense/manifest.json" 2>/dev/null)"; then
+if manifest="$(curl -fsSL "${RELEASE_URL}/releases/latest/download/manifest-${platform}.json" 2>/dev/null)"; then
   target_version="$(printf '%s' "$manifest" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
 fi
 
@@ -56,7 +56,9 @@ updating=
 existing="$(command -v dense 2>/dev/null || true)"
 if [ -n "$existing" ]; then
   installed_version="$("$existing" --version 2>/dev/null | awk '{print $NF}')"
-  if [ -n "$target_version" ] && [ "$installed_version" = "$target_version" ]; then
+  # "dev" builds carry no orderable version — always offer the refresh.
+  if [ -n "$target_version" ] && [ "$target_version" != "dev" ] \
+    && [ "$installed_version" = "$target_version" ]; then
     printf '%s %s\n' "$arrow" "${GREEN}dense ${target_version} is already installed.${R} Run ${B}dense -h${R} for more info." >&2
     exit 0
   fi
@@ -74,7 +76,7 @@ if [ -n "$existing" ]; then
   updating=1
 fi
 
-url="${CLI_URL}/${platform}/dense/stable"
+url="${RELEASE_URL}/releases/latest/download/dense-${platform}"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 printf '%s %s\n' "$arrow" "downloading dense from ${DIM}${url}${R}" >&2
@@ -92,6 +94,7 @@ fi
 
 export PATH="${bindir}:${PATH}"
 export CONDENSE_URL="${CONDENSE_URL:-$API_URL}"
+export CONDENSE_RELEASE_URL="${CONDENSE_RELEASE_URL:-$RELEASE_URL}"
 export CONDENSE_AUTH_REQUIRED="$AUTH_REQUIRED"
 
 # `curl … | sh` leaves stdin attached to the pipe, not the terminal, so the

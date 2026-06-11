@@ -36,12 +36,14 @@ clarification only; no narrative or historical paragraphs.
 Releases are cut from `main` with [git-cliff](https://git-cliff.org),
 through a PR (main is branch-protected):
 
-1. Actions → **cut-release** → Run workflow (leave `version` empty to
+1. Actions → **begin-release** → Run workflow (leave `version` empty to
    compute it from the commit log). It runs `scripts/release.sh --no-tag`
-   on a `release/vX.Y.Z` branch and opens the release PR.
+   on a `release/vX.Y.Z` branch and opens the release PR as the releaser
+   app, so checks run on it normally.
 2. **Merge the release PR** — that review is the release authorization.
-3. **tag-release** fires on the merge, tags the merged commit `vX.Y.Z`,
-   and dispatches the build; the GitHub Release publishes automatically.
+3. **tag-release** fires on the merge and tags the merged commit `vX.Y.Z`
+   (with the app token, so the tag event runs the release build); the
+   GitHub Release publishes automatically.
 
 The cut also works locally on a branch:
 

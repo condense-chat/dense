@@ -17,6 +17,7 @@ use crate::error::{Context, Error};
 use crate::profile::Profile;
 
 pub const DEFAULT_API_URL: &str = "https://api.condense.chat";
+pub const DEFAULT_RELEASE_URL: &str = "https://github.com/condense-chat/dense";
 
 pub struct Config {
     /// Condense api base, e.g. `https://api.condense.chat`.
@@ -34,6 +35,9 @@ pub struct Config {
     profile_name: String,
     /// `$DENSE_PROFILE_URL` — overrides where `dense profile` fetches from.
     profile_url: Option<String>,
+    /// Release-asset base — `$CONDENSE_RELEASE_URL` if set, else the
+    /// profile's declared value (`None` = the baked GitHub default).
+    release_url: Option<String>,
     /// `$CONDENSE_UPSTREAM_URL` — routes the proxy to a non-default upstream.
     upstream: Option<String>,
 }
@@ -45,6 +49,7 @@ impl Config {
             name: self.profile_name.clone(),
             api_url: self.api_base_url.clone(),
             auth_required: self.auth_required,
+            release_url: self.release_url.clone(),
         }
     }
 
@@ -128,6 +133,12 @@ impl Config {
         self.profile_url.as_deref()
     }
 
+    /// Base URL release assets (binaries + manifests) are fetched from —
+    /// GitHub releases unless the profile serves its own builds (dev).
+    pub fn release_base(&self) -> &str {
+        self.release_url.as_deref().unwrap_or(DEFAULT_RELEASE_URL)
+    }
+
     /// Persist the active profile so future bare runs target the same api:
     /// `prod` clears the target, anything else caches + records it.
     pub fn remember_profile(&self) -> Result<()> {
@@ -161,6 +172,7 @@ impl Config {
             open_links: !env_flag("CONDENSE_NO_OPEN"),
             profile_name: profile.name,
             profile_url: env_value("DENSE_PROFILE_URL"),
+            release_url: env_value("CONDENSE_RELEASE_URL").or(profile.release_url),
             upstream: env_value("CONDENSE_UPSTREAM_URL"),
         })
     }
@@ -312,6 +324,7 @@ fn profile_for_url(config_dir: &Path, url: &str) -> Profile {
         name: host_label(&url),
         api_url: url,
         auth_required: None,
+        release_url: None,
     }
 }
 
@@ -400,6 +413,39 @@ mod tests {
         assert_eq!(p.name, "api.condense.evil.com");
         let p = profile_for_url(dir.path(), "http://api.dev.condense.localhost:8080");
         assert_eq!(p.name, "api.dev.condense.localhost-8080");
+    }
+
+    // Old profile.toml files predate release_url; they must keep parsing,
+    // and a declared release_url must survive the cache round-trip.
+    #[test]
+    fn release_url_is_optional_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("stage")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("stage/profile.toml"),
+            "name = \"stage\"\napi_url = \"https://api.stage.condense.chat\"\n",
+        )
+        .expect("write profile");
+        let p = read_cached_profile(dir.path(), "stage").expect("parse");
+        assert_eq!(p.release_url, None);
+
+        std::fs::create_dir_all(dir.path().join("dev")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("dev/profile.toml"),
+            toml::to_string_pretty(&Profile {
+                name: "dev".into(),
+                api_url: "http://api.dev.condense.localhost".into(),
+                auth_required: None,
+                release_url: Some("http://cli.dev.condense.localhost".into()),
+            })
+            .expect("serialize"),
+        )
+        .expect("write profile");
+        let p = read_cached_profile(dir.path(), "dev").expect("parse");
+        assert_eq!(
+            p.release_url.as_deref(),
+            Some("http://cli.dev.condense.localhost")
+        );
     }
 
     #[test]

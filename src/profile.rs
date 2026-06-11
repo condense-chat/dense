@@ -16,6 +16,10 @@ pub struct Profile {
     #[serde(default)]
     pub auth_required: Option<bool>,
     pub name: String,
+    /// Where release assets come from; `None` means the baked GitHub
+    /// releases default. Dev sets it to serve its own local builds.
+    #[serde(default)]
+    pub release_url: Option<String>,
 }
 
 impl Profile {
@@ -25,6 +29,7 @@ impl Profile {
             name: "prod".to_string(),
             api_url: DEFAULT_API_URL.to_string(),
             auth_required: Some(true),
+            release_url: None,
         }
     }
 }
@@ -89,6 +94,7 @@ async fn from_source(name: &str, source: &str) -> Result<Profile> {
             name: name.to_string(),
             api_url: source.trim_end_matches('/').to_string(),
             auth_required: None,
+            release_url: None,
         });
     }
     let zone = source.trim_matches('/');
@@ -102,6 +108,7 @@ async fn from_source(name: &str, source: &str) -> Result<Profile> {
             name: name.to_string(),
             api_url: format!("{scheme}://api.{zone}"),
             auth_required: None,
+            release_url: None,
         }),
     }
 }

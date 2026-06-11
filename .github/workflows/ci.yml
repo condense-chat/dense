@@ -13,6 +13,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Every PR commit lands verbatim on main (rebase-only merges), and
+  # git-cliff silently drops unconventional messages from the changelog —
+  # so each commit must parse, not just the PR title.
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Conventional Commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='^(feat|fix|docs|chore|refactor|perf|test|ci)(\([a-z0-9_./-]+\))?!?: .+'
+          bad=0
+          while IFS= read -r line; do
+            sha="${line%% *}"; subject="${line#* }"
+            if ! grep -qE "$pattern" <<<"$subject"; then
+              echo "::error::not a conventional commit: ${sha:0:8} \"${subject}\""
+              bad=1
+            fi
+          done < <(git log --no-merges --format="%H %s" "${BASE}..${HEAD}")
+          if [ "$bad" = 0 ]; then echo "all commits conventional"; fi
+          exit "$bad"
+
   check:
     strategy:
       fail-fast: false
@@ -66,3 +93,5 @@ jobs:
           name: dense-linux-x86_64
           path: target/x86_64-unknown-linux-musl/release/dense
           if-no-files-found: error
+          # smoke byproduct, not a deliverable — releases build their own
+          retention-days: 3

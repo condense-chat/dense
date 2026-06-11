@@ -1,10 +1,16 @@
 version: 2
 updates:
+  # the prefix keeps dependabot commits conventional — parsed by git-cliff
+  # and accepted by the ci commits job
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "chore(deps)"

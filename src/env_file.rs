@@ -16,10 +16,12 @@ const END: &str = "# <<< dense <<<";
 #[cfg(not(windows))]
 const PROFILES: &[&str] = &[".profile", ".bashrc", ".zshrc", ".bash_profile"];
 
-/// Outcome of wiring the dirs into PATH.
+/// Outcome of wiring the dirs into PATH. No printing happens here — the
+/// caller renders the notes in whatever UI it is running (cliclack frame
+/// in setup, plain lines for `dense persist`).
 pub enum PathWiring {
-    /// Something was unwritable; the user must add the dirs themselves.
-    Manual,
+    /// Something was unwritable; the notes say what to finish by hand.
+    Manual(Vec<String>),
     /// `--no-modify-path`: PATH was left untouched by request.
     Skipped,
     /// Wired with no failures.
@@ -33,10 +35,11 @@ pub fn ensure_env(cfg: &Config, modify_path: bool) -> Result<PathWiring> {
     if !modify_path {
         return Ok(PathWiring::Skipped);
     }
-    if ensure_sourced(cfg)? {
+    let notes = ensure_sourced(cfg)?;
+    if notes.is_empty() {
         Ok(PathWiring::Wired)
     } else {
-        Ok(PathWiring::Manual)
+        Ok(PathWiring::Manual(notes))
     }
 }
 
@@ -50,14 +53,14 @@ pub fn ensure_env(cfg: &Config, modify_path: bool) -> Result<PathWiring> {
     let dirs = [cfg.bin_dir(), cfg.shim_dir()];
     match set_user_path(&dirs, true) {
         Ok(()) => Ok(PathWiring::Wired),
-        Err(e) => {
-            eprintln!("note: could not update your PATH ({e}).");
-            eprintln!("add these directories to your PATH yourself:");
-            for dir in &dirs {
-                eprintln!("  {}", dir.display());
-            }
-            Ok(PathWiring::Manual)
-        }
+        Err(e) => Ok(PathWiring::Manual(vec![
+            format!("could not update your PATH ({e})"),
+            format!(
+                "add these directories to your PATH yourself:\n  {}\n  {}",
+                dirs[0].display(),
+                dirs[1].display()
+            ),
+        ])),
     }
 }
 
@@ -138,10 +141,10 @@ fn add_block(path: &std::path::Path, block: &str) -> std::io::Result<()> {
     std::fs::write(path, next)
 }
 
-/// Returns `true` if the env file is now sourced from every targeted profile,
-/// `false` if any was unwritable (a note + the manual line are printed then).
+/// Returns the manual-action notes for anything that couldn't be wired —
+/// empty means the env file is sourced from every targeted profile.
 #[cfg(not(windows))]
-fn ensure_sourced(cfg: &Config) -> Result<bool> {
+fn ensure_sourced(cfg: &Config) -> Result<Vec<String>> {
     let line = format!(". \"{}\"", cfg.sh_path(&cfg.env_file()));
     let block = format!("{BEGIN}\n{line}\n{END}\n");
 
@@ -156,25 +159,23 @@ fn ensure_sourced(cfg: &Config) -> Result<bool> {
 
     // A read-only profile is the user's to fix — note it and move on rather
     // than aborting persist; the shims are already installed.
-    let mut unwritable = Vec::new();
+    let mut notes = Vec::new();
+    let mut unwritable = false;
     for path in targets {
         if let Err(e) = add_block(&path, &block) {
-            unwritable.push((path, e));
+            unwritable = true;
+            notes.push(format!("{} is not writable ({e})", path.display()));
         }
     }
     if let Err(e) = write_fish_conf(cfg) {
-        eprintln!("note: could not write the fish PATH config ({e}).");
+        notes.push(format!("could not write the fish PATH config ({e})"));
     }
-
-    if unwritable.is_empty() {
-        return Ok(true);
+    if unwritable {
+        notes.push(format!(
+            "add this line to your shell profile yourself:\n  {line}"
+        ));
     }
-    eprintln!();
-    for (path, e) in &unwritable {
-        eprintln!("note: {} is not writable ({e}).", path.display());
-    }
-    eprintln!("add this line to your shell profile yourself:\n  {line}");
-    Ok(false)
+    Ok(notes)
 }
 
 /// `conf.d/dense.fish` under an existing fish config — `None` when the user

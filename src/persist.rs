@@ -31,19 +31,33 @@ pub struct Record {
     pub tools: BTreeMap<String, String>,
 }
 
+/// What [`install_shims`] did — the caller renders it in whatever UI it is
+/// running (cliclack frame in setup, plain lines for `dense persist`).
+#[derive(Default)]
+pub struct ShimReport {
+    /// `(tool, shim path)` for every shim written.
+    pub persisted: Vec<(String, PathBuf)>,
+    /// Tools selected but not yet supported.
+    pub skipped: Vec<String>,
+    /// Shims written for tools that aren't installed yet.
+    pub warnings: Vec<String>,
+}
+
 struct ToolSpec {
     available: bool,
     install_hint: &'static str,
     name: &'static str,
 }
 
-/// Install shims for the targets and record them. Does not touch PATH.
-pub fn install_shims(cfg: &Config, targets: &[String]) -> Result<()> {
+/// Install shims for the targets and record them. Does not touch PATH and
+/// prints nothing — outcomes come back in the [`ShimReport`].
+pub fn install_shims(cfg: &Config, targets: &[String]) -> Result<ShimReport> {
     let selected = select(targets)?;
     let mut rec = load_record(cfg);
+    let mut report = ShimReport::default();
     for spec in selected {
         if !spec.available {
-            println!("{}: coming soon — skipped.", spec.name);
+            report.skipped.push(spec.name.to_string());
             continue;
         }
         match tool::resolve_real(cfg, spec.name) {
@@ -53,20 +67,19 @@ pub fn install_shims(cfg: &Config, targets: &[String]) -> Result<()> {
             }
             Err(_) => {
                 rec.tools.insert(spec.name.to_string(), String::new());
-                eprintln!(
-                    "warning: `{}` is not on PATH yet — shim installed; install it: {}",
+                report.warnings.push(format!(
+                    "`{}` is not on PATH yet — shim installed; install it: {}",
                     spec.name, spec.install_hint
-                );
+                ));
             }
         }
         write_shim(cfg, spec.name)?;
-        println!(
-            "persisted {} -> {}",
-            spec.name,
-            shim_path(cfg, spec.name).display()
-        );
+        report
+            .persisted
+            .push((spec.name.to_string(), shim_path(cfg, spec.name)));
     }
-    save_record(cfg, &rec)
+    save_record(cfg, &rec)?;
+    Ok(report)
 }
 
 pub fn load_record(cfg: &Config) -> Record {
@@ -78,7 +91,16 @@ pub fn load_record(cfg: &Config) -> Record {
 
 pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()> {
     let wiring = env_file::ensure_env(cfg, modify_path)?;
-    install_shims(cfg, targets)?;
+    let report = install_shims(cfg, targets)?;
+    for (name, shim) in &report.persisted {
+        println!("persisted {name} -> {}", shim.display());
+    }
+    for name in &report.skipped {
+        println!("{name}: coming soon — skipped.");
+    }
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
     report_wiring(cfg, &wiring);
     Ok(())
 }
@@ -92,9 +114,12 @@ pub fn report_wiring(cfg: &Config, wiring: &env_file::PathWiring) {
         env_file::PathWiring::Skipped => {
             println!("PATH left unchanged (--no-modify-path).");
         }
-        env_file::PathWiring::Manual => {
+        env_file::PathWiring::Manual(notes) => {
+            for note in notes {
+                println!("note: {note}");
+            }
             println!(
-                "PATH not wired — add the dirs noted above, then {}.",
+                "PATH not wired — after the steps above, {}.",
                 env_file::reload_hint(cfg)
             );
         }

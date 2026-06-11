@@ -32,7 +32,7 @@ condense monorepo as a git submodule, but versions and ships on its own.
   hold that.
 - **Before committing:** `cargo fmt --check`, `cargo clippy --all-targets -D
   warnings`, `cargo test` all green.
-- **Releasing.** PR-based (main is branch-protected): the cut-release action
+- **Releasing.** PR-based (main is branch-protected): the begin-release action
   (or `./scripts/release.sh --no-tag` on a branch — same script) computes the
   next `vX.Y.Z` from the commit log (git-cliff), bumps `Cargo.toml`,
   regenerates `CHANGELOG.md`, and opens a release PR; merging it triggers

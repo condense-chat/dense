@@ -1,0 +1,69 @@
+name: begin-release
+
+# Begin a release from the Actions tab: computes the next vX.Y.Z from
+# Conventional Commits (git-cliff), bumps Cargo.toml, regenerates
+# CHANGELOG.md, and opens the release PR as the releaser app — app-token
+# PRs fire pull_request checks (GITHUB_TOKEN ones don't). Merging the PR
+# triggers tag-release.yml, which tags the merged commit and the tag event
+# runs the release build.
+#
+# Needs the releaser app wired in: RELEASER_APP_ID variable +
+# RELEASER_APP_KEY secret (Contents + Pull requests, read/write).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z); empty computes it from the commit log"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency: begin-release
+
+jobs:
+  begin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+      - name: Cut the release commit on a release branch
+        env:
+          VERSION: ${{ inputs.version }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          ver="${VERSION:-$(git-cliff --bumped-version)}"
+          ver="${ver#v}"
+          if git ls-remote --exit-code origin "refs/heads/release/v${ver}" >/dev/null 2>&1; then
+            echo "release/v${ver} already exists — close its PR and delete the branch first"
+            exit 1
+          fi
+          git checkout -b "release/v${ver}"
+          ./scripts/release.sh --no-tag "$ver"
+          echo "ver=${ver}" >> "$GITHUB_ENV"
+      - name: Open the release PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          git push origin "release/v${ver}"
+          body="Release v${ver}: version bump + changelog (cut by begin-release).
+          Merging this PR tags the merged commit as v${ver} and publishes the release."
+          gh pr create \
+            --base main --head "release/v${ver}" \
+            --title "chore(release): v${ver}" \
+            --body "$body"
+          echo "release PR for v${ver} opened — merge it to tag + publish" >> "$GITHUB_STEP_SUMMARY"

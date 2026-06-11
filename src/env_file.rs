@@ -28,6 +28,20 @@ pub enum PathWiring {
     Wired,
 }
 
+/// How to make the dirs visible when no shell profile sources the env file
+/// (wiring skipped or failed) — restarting a shell would not help there.
+pub fn activate_hint(cfg: &Config) -> String {
+    #[cfg(windows)]
+    {
+        let _ = cfg;
+        "add the dense directories to your PATH, then open a new terminal".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        format!("run `. \"{}\"`", cfg.sh_path(&cfg.env_file()))
+    }
+}
+
 #[cfg(not(windows))]
 pub fn ensure_env(cfg: &Config, modify_path: bool) -> Result<PathWiring> {
     std::fs::create_dir_all(cfg.shim_dir()).ctx("creating dense shim dir")?;

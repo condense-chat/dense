@@ -52,17 +52,24 @@ fn on_path(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Warnings for wired dirs that aren't visible to this shell yet.
-fn path_warnings(cfg: &Config, persisted: bool) -> Vec<String> {
-    let reload = env_file::reload_hint(cfg);
+/// Warnings for dirs that aren't visible to this shell yet. A restart only
+/// helps once the profile wiring exists; otherwise point at the immediate
+/// activation instead.
+fn path_warnings(cfg: &Config, persisted: bool, wiring: &env_file::PathWiring) -> Vec<String> {
+    let hint = match wiring {
+        env_file::PathWiring::Wired => env_file::reload_hint(cfg),
+        env_file::PathWiring::Manual(_) | env_file::PathWiring::Skipped => {
+            env_file::activate_hint(cfg)
+        }
+    };
     let mut out = Vec::new();
     if !on_path(&cfg.bin_dir()) {
         out.push(format!(
-            "{} isn't on your PATH yet; {reload}.",
+            "{} isn't on your PATH yet; {hint}.",
             cfg.bin_dir().display()
         ));
     } else if persisted && !on_path(&cfg.shim_dir()) {
-        out.push(format!("{reload} so `claude` routes through dense."));
+        out.push(format!("{hint} so `claude` routes through dense."));
     }
     out
 }
@@ -117,9 +124,9 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
         return cancelled(interactive);
     };
 
-    match env_file::ensure_env(cfg, modify_path)? {
-        env_file::PathWiring::Manual(notes) => warn(interactive, &notes.join("\n")),
-        env_file::PathWiring::Skipped | env_file::PathWiring::Wired => {}
+    let wiring = env_file::ensure_env(cfg, modify_path)?;
+    if let env_file::PathWiring::Manual(notes) = &wiring {
+        warn(interactive, &notes.join("\n"));
     }
     if do_persist {
         let report = persist::install_shims(cfg, &["claude".to_string()])?;
@@ -127,7 +134,7 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
             warn(interactive, warning);
         }
     }
-    for warning in path_warnings(cfg, do_persist) {
+    for warning in path_warnings(cfg, do_persist, &wiring) {
         warn(interactive, &warning);
     }
 

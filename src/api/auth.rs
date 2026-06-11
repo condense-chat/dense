@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::api::Api;
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{Result, hosts};
+use crate::{Result, hosts, ui};
 
 const EXPIRES_FALLBACK_SECS: u64 = 600;
 const POLL_FALLBACK_SECS: u64 = 2;
@@ -137,9 +137,27 @@ pub fn resolve_mode(api_host: &str, auth_required: Option<bool>) -> AuthMode {
     }
 }
 
+// The frame wrapper — every exit path closes the cliclack frame.
 async fn device_flow(cfg: &Config) -> Result<()> {
+    let _ = cliclack::intro(ui::cyan("condense login"));
+    let result = device_flow_inner(cfg).await;
+    match &result {
+        Ok(()) => {
+            let _ = cliclack::outro(format!("logged in to {}.", cfg.api_host));
+        }
+        Err(_) => {
+            let _ = cliclack::outro_cancel(ui::yellow("login did not finish."));
+        }
+    }
+    result
+}
+
+async fn device_flow_inner(cfg: &Config) -> Result<()> {
     let api = Api::anonymous(&cfg.api_base_url)?;
-    eprintln!("starting authorization with {} ...", cfg.api_base_url);
+    let _ = cliclack::log::remark(ui::dim(&format!(
+        "starting authorization with {}",
+        cfg.api_base_url
+    )));
     let start: DeviceStart = api
         .post_json("/v1/device/start", &serde_json::json!({}))
         .await?;
@@ -147,9 +165,9 @@ async fn device_flow(cfg: &Config) -> Result<()> {
     let scheme = hosts::default_scheme_for(&cfg.api_host);
     let login_base = hosts::sibling(&cfg.api_host, "login", scheme);
     let link = format!("{login_base}/cli?code={}", start.user_code);
-    eprintln!(
-        "\nOpen this URL in your browser to authorise this terminal:\n\n  {link}\n\nCode: {}\n",
-        start.user_code
+    let _ = cliclack::note(
+        "Open this URL in your browser to authorize this terminal",
+        format!("{link}\n\nCode: {}", start.user_code),
     );
     maybe_open(cfg, &link);
 
@@ -243,15 +261,23 @@ fn read_cred(path: &std::path::Path) -> Option<String> {
 
 async fn register(cfg: &Config) -> Result<()> {
     let api = Api::anonymous(&cfg.api_base_url)?;
-    eprintln!("registering with {} ...", cfg.api_base_url);
+    let spinner = cliclack::spinner();
+    spinner.start(format!("registering with {} ...", cfg.api_base_url));
+    let result = register_request(&api, cfg).await;
+    match &result {
+        Ok(()) => spinner.stop("registered."),
+        Err(e) => spinner.error(format!("{e}")),
+    }
+    result
+}
+
+async fn register_request(api: &Api, cfg: &Config) -> Result<()> {
     let body = api.post_text("/v1/register").await?;
     let uuid = body.trim();
     if uuid.is_empty() {
         return Err(Error::Auth("register returned an empty user id".into()));
     }
-    write_secret(&cfg.user_file(), uuid)?;
-    eprintln!("registered.");
-    Ok(())
+    write_secret(&cfg.user_file(), uuid)
 }
 
 fn write_secret(path: &std::path::Path, value: &str) -> Result<()> {

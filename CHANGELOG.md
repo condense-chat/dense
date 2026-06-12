@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.3.1] - 2026-06-12
+
+### Bug Fixes
+- Keep the base URL path when building request URLs
+
 ## [0.3.0] - 2026-06-12
 
 ### Features

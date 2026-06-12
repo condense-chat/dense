@@ -9,6 +9,7 @@ mod env_file;
 mod error;
 mod harness;
 mod hosts;
+mod migrate;
 mod persist;
 mod profile;
 mod selfupdate;
@@ -47,6 +48,9 @@ async fn main() -> EyreResult<()> {
     init_tracing(cli.verbose);
 
     let cfg = Config::resolve(cli.url.clone(), cli.environment.clone())?;
+    if let Err(e) = migrate::run(&cfg) {
+        eprintln!("warning: could not finish moving dense files to their new dirs: {e}");
+    }
 
     let result: Result<()> = match cli.command {
         Command::Status => {

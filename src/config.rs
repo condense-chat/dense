@@ -4,9 +4,9 @@
 //! config dir; every other profile nests under `<config>/<profile>/`. The
 //! active profile is `prod` unless a `<config>/target` pointer (written by
 //! `dense profile <name>`) says otherwise. Config files are TOML. The config
-//! and data directories are the platform-native ones (via the `directories`
-//! crate): on Linux `~/.config/dense` + `~/.local/share/dense`, on Windows
-//! `%APPDATA%\dense` + `%LOCALAPPDATA%\dense`.
+//! and data directories are XDG-style on every unix (macOS included):
+//! `~/.config/dense` + `~/.local/share/dense`, honoring `$XDG_CONFIG_HOME` /
+//! `$XDG_DATA_HOME`; on Windows `%APPDATA%\dense` + `%LOCALAPPDATA%\dense`.
 
 use std::path::{Path, PathBuf};
 
@@ -156,9 +156,17 @@ impl Config {
     /// binary won't guess a non-prod host.
     pub fn resolve(url_override: Option<String>, env_override: Option<String>) -> Result<Self> {
         let dirs = BaseDirs::new().ok_or_else(|| Error::msg("cannot determine home directory"))?;
-        let config_dir = dirs.config_dir().join("dense");
-        let data_dir = dirs.data_local_dir().join("dense");
         let home = dirs.home_dir().to_path_buf();
+        #[cfg(windows)]
+        let (config_dir, data_dir) = (
+            dirs.config_dir().join("dense"),
+            dirs.data_local_dir().join("dense"),
+        );
+        #[cfg(not(windows))]
+        let (config_dir, data_dir) = (
+            xdg_dir("XDG_CONFIG_HOME", &home, ".config").join("dense"),
+            xdg_dir("XDG_DATA_HOME", &home, ".local/share").join("dense"),
+        );
         let profile = resolve_profile(&config_dir, url_override, env_override)?;
         let api_base_url = profile.api_url.trim_end_matches('/').to_string();
         let api_host = crate::hosts::host_of(&api_base_url);
@@ -366,6 +374,17 @@ fn resolve_profile(
         eprintln!("warning: target profile `{target}` is not registered; using prod.");
     }
     Ok(Profile::prod())
+}
+
+/// `$<var>` if set to an absolute path, else `<home>/<default>` — the XDG
+/// base-dir rule, applied on every unix so macOS doesn't drift into
+/// `~/Library/Application Support`.
+#[cfg(not(windows))]
+fn xdg_dir(var: &str, home: &Path, default: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(default))
 }
 
 #[cfg(test)]

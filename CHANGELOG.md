@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.3.0] - 2026-06-12
+
+### Features
+- XDG-style config and data dirs on macOS
+
 ## [0.2.0] - 2026-06-11
 
 ### Bug Fixes

@@ -23,10 +23,13 @@ use crate::error::{Context, Error};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A client bound to one condense host. Cheap to clone (the inner pool is
-/// shared); paths join onto the base, absolute URLs pass through.
+/// shared); paths append to the base, absolute URLs pass through. The base
+/// may carry a path of its own (a GitHub `releases` root), so paths are
+/// concatenated, never `Url::join`ed — join would resolve a leading `/`
+/// against the host and drop the base path.
 #[derive(Clone)]
 pub struct Api {
-    base: reqwest::Url,
+    base: String,
     client: reqwest::Client,
 }
 
@@ -140,21 +143,26 @@ impl Api {
     }
 
     fn build(base: &str, headers: HeaderMap) -> Result<Self> {
-        let base = reqwest::Url::parse(base.trim_end_matches('/')).ctx("invalid api url")?;
+        let base = base.trim_end_matches('/');
+        reqwest::Url::parse(base).ctx("invalid api url")?;
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(DEFAULT_TIMEOUT)
             .user_agent(concat!("dense/", env!("CARGO_PKG_VERSION")))
             .build()
             .ctx("building http client")?;
-        Ok(Self { base, client })
+        Ok(Self {
+            base: base.to_string(),
+            client,
+        })
     }
 
     fn url(&self, path: &str) -> Result<reqwest::Url> {
         if path.contains("://") {
             return reqwest::Url::parse(path).ctx(format!("invalid url {path}"));
         }
-        self.base.join(path).ctx(format!("invalid path {path}"))
+        let path = path.strip_prefix('/').unwrap_or(path);
+        reqwest::Url::parse(&format!("{}/{path}", self.base)).ctx(format!("invalid path {path}"))
     }
 }
 
@@ -173,4 +181,33 @@ fn creds_headers(creds: &Creds) -> Result<HeaderMap> {
         );
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_keeps_base_path() {
+        let api = Api::anonymous("https://github.com/condense-chat/dense").expect("client");
+        assert_eq!(
+            api.url("/releases/latest/download/manifest-linux-x86_64.json")
+                .expect("url")
+                .as_str(),
+            "https://github.com/condense-chat/dense/releases/latest/download/manifest-linux-x86_64.json"
+        );
+    }
+
+    #[test]
+    fn url_passes_absolute_through_and_trims_base_slash() {
+        let api = Api::anonymous("https://api.condense.chat/").expect("client");
+        assert_eq!(
+            api.url("/v1/me").expect("url").as_str(),
+            "https://api.condense.chat/v1/me"
+        );
+        assert_eq!(
+            api.url("https://elsewhere.io/asset").expect("url").as_str(),
+            "https://elsewhere.io/asset"
+        );
+    }
 }

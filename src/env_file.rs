@@ -78,6 +78,16 @@ pub fn ensure_env(cfg: &Config, modify_path: bool) -> Result<PathWiring> {
     }
 }
 
+/// Whether any shell profile currently sources the dense env file (the
+/// signal that the user accepted PATH wiring, vs `--no-modify-path`).
+#[cfg(target_os = "macos")]
+pub fn is_wired(cfg: &Config) -> bool {
+    PROFILES
+        .iter()
+        .any(|n| std::fs::read_to_string(cfg.home().join(n)).is_ok_and(|s| s.contains(BEGIN)))
+        || fish_conf_path(cfg).is_some_and(|p| p.is_file())
+}
+
 /// One-line description of the PATH change `ensure_env` would make, for the
 /// setup prompt.
 pub fn path_change_summary(cfg: &Config) -> String {

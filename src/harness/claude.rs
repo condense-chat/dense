@@ -10,7 +10,11 @@ pub struct Claude;
 impl Tool<Anthropic> for Claude {
     fn apply(&self, cmd: &mut tokio::process::Command, target: &ProxyTarget) {
         cmd.env("ANTHROPIC_BASE_URL", &target.base_url)
-            .env("ANTHROPIC_CUSTOM_HEADERS", custom_headers(&target.headers));
+            .env("ANTHROPIC_CUSTOM_HEADERS", custom_headers(&target.headers))
+            // Claude Code disables the 1M context window when the base URL is
+            // not api.anthropic.com, silently falling back to 200K (compacts
+            // ~140K). Assert first-party so the 1M window stays on through us.
+            .env("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "1");
     }
 
     fn binary(&self) -> &str {

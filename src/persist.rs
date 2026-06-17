@@ -21,7 +21,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "codex",
-        available: false,
+        available: true,
         install_hint: "",
     },
 ];

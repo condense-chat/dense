@@ -57,10 +57,7 @@ async fn main() -> EyreResult<()> {
             status(&cfg);
             Ok(())
         }
-        Command::Codex { .. } => {
-            println!("Codex support is coming soon.");
-            Ok(())
-        }
+        Command::Codex { args } => harness::codex::run(&cfg, &args).await,
         Command::Login => auth::login(&cfg).await,
         Command::Logout => auth::logout(&cfg),
         Command::Claude { args } => harness::claude::run(&cfg, &args).await,

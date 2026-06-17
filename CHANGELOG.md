@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.3.2] - 2026-06-17
+
+### Bug Fixes
+- Assert first-party base url to keep 1M context window
+
 ## [0.3.1] - 2026-06-12
 
 ### Bug Fixes

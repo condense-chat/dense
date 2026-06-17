@@ -16,8 +16,16 @@ pub trait Dialect {
 
 pub struct Anthropic;
 
+pub struct OpenAi;
+
 impl Dialect for Anthropic {
     fn route(&self) -> &'static str {
         "anthropic"
+    }
+}
+
+impl Dialect for OpenAi {
+    fn route(&self) -> &'static str {
+        "openai"
     }
 }

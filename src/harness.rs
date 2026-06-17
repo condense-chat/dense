@@ -6,6 +6,7 @@
 //! same for every tool and dialect.
 
 pub mod claude;
+pub mod codex;
 
 use std::process::Stdio;
 

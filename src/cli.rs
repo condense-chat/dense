@@ -34,7 +34,7 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
-    /// Codex support (coming soon).
+    /// Launch Codex routed through condense.
     #[command(disable_help_flag = true)]
     Codex {
         #[arg(

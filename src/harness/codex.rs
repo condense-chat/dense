@@ -5,7 +5,6 @@ use crate::api::dialect::OpenAi;
 use crate::config::Config;
 use crate::harness::{self, ProxyTarget, Tool};
 
-const KEY_ENV_VAR: &str = "CONDENSE_CODEX_KEY";
 const PROVIDER_ID: &str = "condense";
 
 pub struct Codex;
@@ -28,18 +27,16 @@ impl Tool<OpenAi> for Codex {
         }
         let env_http_headers = format!("{{ {} }}", header_entries.join(", "));
 
-        // Real auth rides in x-condense-auth-token; the bearer is a placeholder
-        // the proxy replaces with the upstream key. requires_openai_auth=false
-        // drops Codex's `sk-` prefix assumption for the placeholder.
-        cmd.env(KEY_ENV_VAR, "condense");
-
+        // BYO upstream auth: requires_openai_auth=true makes Codex attach its own
+        // login (ChatGPT OAuth or an sk- key) as the bearer + chatgpt-account-id.
+        // The proxy forwards that to OpenAI (api.openai.com or, for OAuth, the
+        // codex backend); condense identity rides in the x-condense-* headers.
         let overrides = [
             format!(r#"model_provider="{PROVIDER_ID}""#),
             format!(r#"model_providers.{PROVIDER_ID}.name="condense""#),
             format!(r#"model_providers.{PROVIDER_ID}.base_url="{base_url}""#),
             format!(r#"model_providers.{PROVIDER_ID}.wire_api="responses""#),
-            format!("model_providers.{PROVIDER_ID}.requires_openai_auth=false"),
-            format!(r#"model_providers.{PROVIDER_ID}.env_key="{KEY_ENV_VAR}""#),
+            format!("model_providers.{PROVIDER_ID}.requires_openai_auth=true"),
             format!("model_providers.{PROVIDER_ID}.env_http_headers={env_http_headers}"),
         ];
         for o in overrides {
@@ -116,7 +113,7 @@ mod tests {
         ));
         assert!(argv.contains(r#"model_provider="condense""#));
         assert!(argv.contains(r#"model_providers.condense.wire_api="responses""#));
-        assert!(argv.contains("model_providers.condense.requires_openai_auth=false"));
+        assert!(argv.contains("model_providers.condense.requires_openai_auth=true"));
         // The header value rides in an env var referenced by env_http_headers —
         // never in argv.
         assert!(argv.contains("CONDENSE_HDR_X_CONDENSE_AUTH_TOKEN"));

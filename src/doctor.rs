@@ -7,8 +7,9 @@ use crate::api::auth;
 use crate::config::Config;
 use crate::{Result, persist, tool, ui};
 
-/// A check's outcome. `Warn`/`Fail` both count as issues a caller (e.g. setup's
-/// offer-to-fix) may act on; only the rendered mark differs.
+/// A check's outcome. `Fail` is a critical wiring problem an agent could repair;
+/// `Warn` is a transient/environmental note (PATH not reloaded, not logged in)
+/// that shouldn't block. Only the rendered mark differs.
 pub enum Health {
     Fail,
     Ok,
@@ -24,8 +25,8 @@ pub struct Check {
 }
 
 impl Check {
-    pub fn is_issue(&self) -> bool {
-        !matches!(self.health, Health::Ok)
+    pub fn is_critical(&self) -> bool {
+        matches!(self.health, Health::Fail)
     }
 }
 
@@ -33,8 +34,8 @@ impl Check {
 /// view [`run`] and setup share.
 pub async fn diagnose(cfg: &Config) -> Vec<Check> {
     let mut checks = vec![
-        check(on_path("dense"), "dense on PATH", ""),
-        check(
+        soft(on_path("dense"), "dense on PATH", ""),
+        soft(
             path_contains(&cfg.shim_dir()),
             "override dir on PATH",
             &cfg.shim_dir().display().to_string(),
@@ -55,14 +56,14 @@ pub async fn diagnose(cfg: &Config) -> Vec<Check> {
     }
 
     let creds = auth::load_creds(cfg);
-    checks.push(check(
+    checks.push(soft(
         creds.is_authenticated(),
         "authenticated",
         &cfg.cred_dir().display().to_string(),
     ));
     if let Some(token) = creds.token.as_deref() {
         let status = auth::probe_token(cfg, token).await;
-        checks.push(check(
+        checks.push(soft(
             status == 200,
             "token valid (/v1/me)",
             &format!("status {status}"),
@@ -133,6 +134,15 @@ fn print_row(mark: &str, label: &str, detail: &str) {
         println!("  {mark} {label}");
     } else {
         println!("  {mark} {label}  {}", ui::dim(&format!("({detail})")));
+    }
+}
+
+/// A non-critical check: green when satisfied, a yellow warn otherwise.
+fn soft(ok: bool, label: &str, detail: &str) -> Check {
+    Check {
+        detail: detail.to_string(),
+        health: if ok { Health::Ok } else { Health::Warn },
+        label: label.to_string(),
     }
 }
 

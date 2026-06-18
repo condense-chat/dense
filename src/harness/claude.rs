@@ -14,13 +14,16 @@ impl Tool<Anthropic> for Claude {
             // Claude Code disables the 1M context window when the base URL is
             // not api.anthropic.com, silently falling back to 200K (compacts
             // ~140K). Assert first-party so the 1M window stays on through us.
-            // Also re-enables Tool Search, so MCP tool defs stay deferred out
-            // of context instead of loading eagerly every turn.
             .env("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "1")
             // Pin the auto-compact window to the full 1M. Read via parseInt, so
             // "1m" would parse to 1 — pass the literal token count. Overrides a
             // lower settings/experiment/model-default so we don't compact early.
-            .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000");
+            .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000")
+            // Force Tool Search on so MCP tool defs stay deferred out of context
+            // (lazy-loaded via tool_reference) instead of loading eagerly every
+            // turn. Claude Code disables it behind a non-first-party base URL;
+            // condense forwards tool_reference blocks verbatim, so this is safe.
+            .env("ENABLE_TOOL_SEARCH", "true");
     }
 
     fn binary(&self) -> &str {

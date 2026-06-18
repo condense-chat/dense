@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.3.3] - 2026-06-18
+
+### Bug Fixes
+- Pin auto-compact window to the full 1M- Force-enable Tool Search behind the proxy
+
 ## [0.3.2] - 2026-06-17
 
 ### Bug Fixes

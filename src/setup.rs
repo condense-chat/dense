@@ -8,15 +8,105 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::{Result, env_file, persist, ui};
+use crate::error::Error;
+use crate::{Result, doctor, env_file, harness, persist, tool, ui};
+
+/// Coding agents `dense` can launch to repair a broken install. Only those with
+/// a harness run path belong here; setup offers the ones actually installed.
+const FIX_AGENTS: &[&str] = &["claude"];
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     let res = wizard(cfg, interactive);
-    if res.is_err() && interactive {
-        let _ = cliclack::outro_cancel(ui::yellow("setup did not finish."));
+    if res.is_err() {
+        if interactive {
+            let _ = cliclack::outro_cancel(ui::yellow("setup did not finish."));
+        }
+        return res;
     }
-    res
+    offer_fix(cfg, interactive).await
+}
+
+fn available_agents(cfg: &Config) -> Vec<&'static str> {
+    FIX_AGENTS
+        .iter()
+        .copied()
+        .filter(|name| tool::resolve_real(cfg, name).is_ok())
+        .collect()
+}
+
+/// Ask which installed agent (if any) should fix the issues. One agent is a
+/// yes/no; several is a pick-or-skip select. `None` = leave it alone.
+fn choose_agent(agents: &[&'static str]) -> Option<&'static str> {
+    match agents {
+        [] => None,
+        [only] => {
+            let _ = cliclack::log::warning("dense found setup issues above.");
+            cliclack::confirm(format!("Launch {only} to fix them?"))
+                .initial_value(true)
+                .interact()
+                .ok()
+                .filter(|yes| *yes)
+                .map(|_| *only)
+        }
+        many => {
+            let mut select = cliclack::select("Launch an agent to fix the setup issues above?")
+                .item(None, "skip", "");
+            for name in many {
+                select = select.item(Some(*name), *name, "");
+            }
+            select.interact().ok().flatten()
+        }
+    }
+}
+
+/// Seed an agent with the failing checks and the commands that repair them, so
+/// it can pick up the fix without the user restating anything.
+fn fix_prompt(issues: &[&doctor::Check]) -> String {
+    let lines: Vec<String> = issues
+        .iter()
+        .map(|c| {
+            if c.detail.is_empty() {
+                format!("- {}", c.label)
+            } else {
+                format!("- {} ({})", c.label, c.detail)
+            }
+        })
+        .collect();
+    format!(
+        "My `dense` CLI install isn't fully wired. `dense doctor` reports these \
+         issues:\n{}\n\ndense routes Claude Code through the condense proxy. \
+         Relevant commands: `dense doctor` (re-check), `dense persist` (install \
+         PATH shims), `dense login` (authenticate). Please diagnose and fix the \
+         wiring, then run `dense doctor` to confirm everything passes.",
+        lines.join("\n")
+    )
+}
+
+async fn launch_agent(cfg: &Config, name: &str, prompt: &str) -> Result<()> {
+    let args = [prompt.to_string()];
+    match name {
+        "claude" => harness::claude::run(cfg, &args).await,
+        other => Err(Error::msg(format!("don't know how to launch {other}"))),
+    }
+}
+
+/// Close setup by running `dense doctor`; if anything is amiss and an agent is
+/// installed, offer to launch one (seeded with the failing checks) to fix the
+/// wiring. Non-interactive runs only print the report.
+async fn offer_fix(cfg: &Config, interactive: bool) -> Result<()> {
+    println!();
+    let checks = doctor::diagnose(cfg).await;
+    doctor::print_report(cfg, &checks);
+
+    let issues: Vec<&doctor::Check> = checks.iter().filter(|c| c.is_issue()).collect();
+    if issues.is_empty() || !interactive {
+        return Ok(());
+    }
+    let Some(agent) = choose_agent(&available_agents(cfg)) else {
+        return Ok(());
+    };
+    launch_agent(cfg, agent, &fix_prompt(&issues)).await
 }
 
 /// Ask a yes/no question with a dim one-line explainer. Interactive: a

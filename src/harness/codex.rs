@@ -5,7 +5,9 @@ use crate::api::dialect::OpenAi;
 use crate::config::Config;
 use crate::harness::{self, ProxyTarget, Tool};
 
-const PROVIDER_ID: &str = "condense";
+// Dense-owned provider id, distinct from a hand-authored `[model_providers.condense]`:
+// `-c` overlays merge (can't delete) a stale block's keys, so we own a private id.
+const PROVIDER_ID: &str = "condense_cli";
 
 pub struct Codex;
 
@@ -109,11 +111,11 @@ mod tests {
         // Codex appends /responses to the provider base_url, so /v1 lands on
         // /openai/v1/responses.
         assert!(argv.contains(
-            r#"model_providers.condense.base_url="https://api.condense.chat/openai/v1""#
+            r#"model_providers.condense_cli.base_url="https://api.condense.chat/openai/v1""#
         ));
-        assert!(argv.contains(r#"model_provider="condense""#));
-        assert!(argv.contains(r#"model_providers.condense.wire_api="responses""#));
-        assert!(argv.contains("model_providers.condense.requires_openai_auth=true"));
+        assert!(argv.contains(r#"model_provider="condense_cli""#));
+        assert!(argv.contains(r#"model_providers.condense_cli.wire_api="responses""#));
+        assert!(argv.contains("model_providers.condense_cli.requires_openai_auth=true"));
         // The header value rides in an env var referenced by env_http_headers —
         // never in argv.
         assert!(argv.contains("CONDENSE_HDR_X_CONDENSE_AUTH_TOKEN"));

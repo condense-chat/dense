@@ -26,6 +26,13 @@ pub trait Tool<D: Dialect> {
 
     fn binary(&self) -> &str;
     fn label(&self) -> &str;
+
+    /// Optionally rewrite the child's argv given `target` — e.g. weave the route
+    /// into a flag so sessions the tool itself dispatches inherit it. Default:
+    /// argv unchanged.
+    fn rewrite_args(&self, args: &[String], _target: &ProxyTarget) -> Vec<String> {
+        args.to_vec()
+    }
 }
 
 /// A resolved proxy target a tool wires itself to.
@@ -57,7 +64,8 @@ where
 
     let mut cmd = tokio::process::Command::new(&bin);
     tool.apply(&mut cmd, &target);
-    cmd.args(args)
+    let args = tool.rewrite_args(args, &target);
+    cmd.args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

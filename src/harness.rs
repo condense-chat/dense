@@ -33,6 +33,13 @@ pub trait Tool<D: Dialect> {
     fn rewrite_args(&self, args: &[String], _target: &ProxyTarget) -> Vec<String> {
         args.to_vec()
     }
+
+    /// An upstream the proxy should route to, read from the tool's own
+    /// passthrough env (e.g. a pre-set `ANTHROPIC_BASE_URL`). Lower precedence
+    /// than the explicit `CONDENSE_UPSTREAM_URL`. Default: none.
+    fn upstream_override(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A resolved proxy target a tool wires itself to.
@@ -57,9 +64,13 @@ where
         announce(cfg, tool.label());
     }
 
+    let upstream = cfg
+        .upstream()
+        .map(str::to_string)
+        .or_else(|| tool.upstream_override());
     let target = ProxyTarget {
         base_url: dialect.base_url(cfg),
-        headers: condense_headers(cfg, &creds, &session.id),
+        headers: condense_headers(&creds, &session.id, upstream.as_deref()),
     };
 
     let mut cmd = tokio::process::Command::new(&bin);
@@ -100,8 +111,13 @@ fn announce(cfg: &Config, label: &str) {
 }
 
 /// The `x-condense-*` headers on every request — auth/user/session, plus the
-/// optional upstream override. Universal; the upstream comes from [`Config`].
-fn condense_headers(cfg: &Config, creds: &Creds, session_id: &str) -> Vec<(String, String)> {
+/// optional upstream override (explicit `CONDENSE_UPSTREAM_URL`, else a tool's
+/// inherited base URL). Universal across tools and dialects.
+fn condense_headers(
+    creds: &Creds,
+    session_id: &str,
+    upstream: Option<&str>,
+) -> Vec<(String, String)> {
     let mut h = Vec::new();
     if let Some(token) = &creds.token {
         h.push(("x-condense-auth-token".to_string(), token.clone()));
@@ -110,7 +126,7 @@ fn condense_headers(cfg: &Config, creds: &Creds, session_id: &str) -> Vec<(Strin
         h.push(("x-condense-user-id".to_string(), user.clone()));
     }
     h.push(("x-condense-session-id".to_string(), session_id.to_string()));
-    if let Some(upstream) = cfg.upstream() {
+    if let Some(upstream) = upstream {
         h.push(("x-condense-upstream-url".to_string(), upstream.to_string()));
     }
     h
@@ -140,4 +156,25 @@ fn swallow_interrupts() -> tokio::task::JoinHandle<()> {
             let _ = tokio::signal::ctrl_c().await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_header_present_only_when_set() {
+        let creds = Creds {
+            token: None,
+            user_id: None,
+        };
+        let with = condense_headers(&creds, "sid", Some("https://up"));
+        assert!(
+            with.iter()
+                .any(|(k, v)| k == "x-condense-upstream-url" && v == "https://up")
+        );
+
+        let without = condense_headers(&creds, "sid", None);
+        assert!(without.iter().all(|(k, _)| k != "x-condense-upstream-url"));
+    }
 }

@@ -62,6 +62,16 @@ impl Tool<Anthropic> for Claude {
             }
         }
     }
+
+    /// A base URL the user set before launching points the proxy at their own
+    /// upstream — we overwrite `ANTHROPIC_BASE_URL` with the condense route, so
+    /// forward the original as the upstream override.
+    fn upstream_override(&self) -> Option<String> {
+        std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+    }
 }
 
 /// `dense claude` — Claude Code through the Anthropic proxy. The dialect is the

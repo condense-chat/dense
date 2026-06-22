@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.4.0] - 2026-06-22
+
+### Bug Fixes
+- BYO upstream auth — let codex attach its own credential- Use collision-proof provider id `condense_cli`
+
+### Features
+- Route Codex through condense
+
 ## [0.3.3] - 2026-06-18
 
 ### Bug Fixes

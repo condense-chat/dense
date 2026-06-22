@@ -27,6 +27,8 @@ pub struct Config {
     /// Whether the api gates auth — `$CONDENSE_AUTH_REQUIRED` if set, else the
     /// profile's declared value (`None` = unknown).
     pub auth_required: Option<bool>,
+    /// `$CONDENSE_CODEX_WEBSOCKET` — codex Responses transport; WS unless set to `0` (→ HTTP).
+    pub codex_websocket: bool,
     config_dir: PathBuf,
     data_dir: PathBuf,
     home: PathBuf,
@@ -174,6 +176,7 @@ impl Config {
             api_base_url,
             api_host,
             auth_required: env_auth_required().or(profile.auth_required),
+            codex_websocket: env_flag_or("CONDENSE_CODEX_WEBSOCKET", true),
             config_dir,
             data_dir,
             home,
@@ -266,6 +269,11 @@ fn env_auth_required() -> Option<bool> {
 /// Whether `key` is set to a truthy value (`1`/`true`).
 fn env_flag(key: &str) -> bool {
     std::env::var(key).ok().is_some_and(|v| env_truthy(&v))
+}
+
+/// Whether `key` is truthy, or `default` when unset.
+fn env_flag_or(key: &str, default: bool) -> bool {
+    std::env::var(key).ok().map_or(default, |v| env_truthy(&v))
 }
 
 fn env_truthy(v: &str) -> bool {

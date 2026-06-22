@@ -9,7 +9,9 @@ use crate::harness::{self, ProxyTarget, Tool};
 // `-c` overlays merge (can't delete) a stale block's keys, so we own a private id.
 const PROVIDER_ID: &str = "condense_cli";
 
-pub struct Codex;
+pub struct Codex {
+    websocket: bool,
+}
 
 impl Tool<OpenAi> for Codex {
     /// Codex has no single custom-headers env var, so the provider is defined
@@ -33,13 +35,19 @@ impl Tool<OpenAi> for Codex {
         // login (ChatGPT OAuth or an sk- key) as the bearer + chatgpt-account-id.
         // The proxy forwards that to OpenAI (api.openai.com or, for OAuth, the
         // codex backend); condense identity rides in the x-condense-* headers.
-        let overrides = [
+        // Pin the transport so condense decides it, not codex's per-provider
+        // default. WS by default (codex's native mode); CONDENSE_CODEX_WEBSOCKET=0 → HTTP.
+        let overrides = vec![
             format!(r#"model_provider="{PROVIDER_ID}""#),
             format!(r#"model_providers.{PROVIDER_ID}.name="condense""#),
             format!(r#"model_providers.{PROVIDER_ID}.base_url="{base_url}""#),
             format!(r#"model_providers.{PROVIDER_ID}.wire_api="responses""#),
             format!("model_providers.{PROVIDER_ID}.requires_openai_auth=true"),
             format!("model_providers.{PROVIDER_ID}.env_http_headers={env_http_headers}"),
+            format!(
+                "model_providers.{PROVIDER_ID}.supports_websockets={}",
+                self.websocket
+            ),
         ];
         for o in overrides {
             cmd.arg("-c").arg(o);
@@ -58,7 +66,15 @@ impl Tool<OpenAi> for Codex {
 /// `dense codex` — Codex through the OpenAI Responses proxy. The dialect is the
 /// concrete `OpenAi`, so no proxy flag is threaded through the run path.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
-    harness::launch(cfg, Codex, OpenAi, args).await
+    harness::launch(
+        cfg,
+        Codex {
+            websocket: cfg.codex_websocket,
+        },
+        OpenAi,
+        args,
+    )
+    .await
 }
 
 /// Per-header env var name holding the secret value; the `env_http_headers` map
@@ -99,7 +115,7 @@ mod tests {
             )],
         };
         let mut cmd = tokio::process::Command::new("codex");
-        Codex.apply(&mut cmd, &target);
+        Codex { websocket: true }.apply(&mut cmd, &target);
 
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -116,8 +132,8 @@ mod tests {
         assert!(argv.contains(r#"model_provider="condense_cli""#));
         assert!(argv.contains(r#"model_providers.condense_cli.wire_api="responses""#));
         assert!(argv.contains("model_providers.condense_cli.requires_openai_auth=true"));
-        // The header value rides in an env var referenced by env_http_headers —
-        // never in argv.
+        // Transport pinned explicitly; WS is the default.
+        assert!(argv.contains("model_providers.condense_cli.supports_websockets=true"));
         assert!(argv.contains("CONDENSE_HDR_X_CONDENSE_AUTH_TOKEN"));
         assert!(!argv.contains("secret-token"));
 
@@ -125,5 +141,22 @@ mod tests {
             k == "CONDENSE_HDR_X_CONDENSE_AUTH_TOKEN" && v == Some("secret-token".as_ref())
         });
         assert!(has_secret_env);
+    }
+
+    #[test]
+    fn apply_pins_http_when_websockets_disabled() {
+        let target = ProxyTarget {
+            base_url: "https://api.condense.chat/openai".to_string(),
+            headers: vec![],
+        };
+        let mut cmd = tokio::process::Command::new("codex");
+        Codex { websocket: false }.apply(&mut cmd, &target);
+        let argv: String = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(argv.contains("model_providers.condense_cli.supports_websockets=false"));
     }
 }

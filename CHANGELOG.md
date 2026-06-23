@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.5.0] - 2026-06-23
+
+### Features
+- Pin codex's Responses transport (WS default, CONDENSE_CODEX_WEBSOCKET=0 for HTTP)
+
 ## [0.4.0] - 2026-06-22
 
 ### Bug Fixes

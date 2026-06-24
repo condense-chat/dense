@@ -8,15 +8,131 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::{Result, env_file, persist, ui};
+use crate::error::Error;
+use crate::{Result, doctor, env_file, harness, persist, tool, ui};
+
+/// Coding agents `dense` can launch through its harness. Only those with a
+/// harness run path belong here; setup offers the ones actually installed.
+const LAUNCH_AGENTS: &[&str] = &["claude"];
+
+/// Why we're offering to launch an agent at the end of setup: to repair
+/// critical wiring issues, or just to start using the tool now.
+#[derive(Clone, Copy)]
+enum LaunchKind {
+    Fix,
+    Now,
+}
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     let res = wizard(cfg, interactive);
-    if res.is_err() && interactive {
-        let _ = cliclack::outro_cancel(ui::yellow("setup did not finish."));
+    if res.is_err() {
+        if interactive {
+            let _ = cliclack::outro_cancel(ui::yellow("setup did not finish."));
+        }
+        return res;
     }
-    res
+    offer_launch(cfg, interactive).await
+}
+
+fn available_agents(cfg: &Config) -> Vec<&'static str> {
+    LAUNCH_AGENTS
+        .iter()
+        .copied()
+        .filter(|name| tool::resolve_real(cfg, name).is_ok())
+        .collect()
+}
+
+/// Ask which installed agent (if any) to launch. One agent is a yes/no; several
+/// is a pick-or-skip select. The wording follows `kind`. `None` = leave it.
+fn choose_agent(agents: &[&'static str], kind: LaunchKind) -> Option<&'static str> {
+    match agents {
+        [] => None,
+        [only] => {
+            let question = match kind {
+                LaunchKind::Fix => format!("Launch {only} to fix the issues above?"),
+                LaunchKind::Now => format!("Launch {only} now?"),
+            };
+            cliclack::confirm(question)
+                .initial_value(true)
+                .interact()
+                .ok()
+                .filter(|yes| *yes)
+                .map(|_| *only)
+        }
+        many => {
+            let prompt = match kind {
+                LaunchKind::Fix => "Launch an agent to fix the issues above?",
+                LaunchKind::Now => "Launch an agent now?",
+            };
+            let mut select = cliclack::select(prompt).item(None, "skip", "");
+            for name in many {
+                select = select.item(Some(*name), *name, "");
+            }
+            select.interact().ok().flatten()
+        }
+    }
+}
+
+/// Seed an agent with the critical checks and the commands that repair them, so
+/// it can pick up the fix without the user restating anything.
+fn fix_prompt(issues: &[&doctor::Check]) -> String {
+    let lines: Vec<String> = issues
+        .iter()
+        .map(|c| {
+            if c.detail.is_empty() {
+                format!("- {}", c.label)
+            } else {
+                format!("- {} ({})", c.label, c.detail)
+            }
+        })
+        .collect();
+    format!(
+        "My `dense` CLI install isn't fully wired. `dense doctor` reports these \
+         issues:\n{}\n\ndense routes Claude Code through the condense proxy. \
+         Relevant commands: `dense doctor` (re-check), `dense persist` (install \
+         PATH shims), `dense login` (authenticate). Please diagnose and fix the \
+         wiring, then run `dense doctor` to confirm everything passes.",
+        lines.join("\n")
+    )
+}
+
+async fn launch_agent(cfg: &Config, name: &str, args: &[String]) -> Result<()> {
+    match name {
+        "claude" => harness::claude::run(cfg, args).await,
+        other => Err(Error::msg(format!("don't know how to launch {other}"))),
+    }
+}
+
+/// Close setup by running `dense doctor`. With critical wiring issues, offer to
+/// launch an installed agent (seeded with them) to fix; otherwise just offer to
+/// launch one now. Non-interactive runs only print the report.
+async fn offer_launch(cfg: &Config, interactive: bool) -> Result<()> {
+    println!();
+    let checks = doctor::diagnose(cfg).await;
+    doctor::print_report(cfg, &checks);
+    if !interactive {
+        return Ok(());
+    }
+    let agents = available_agents(cfg);
+    if agents.is_empty() {
+        return Ok(());
+    }
+
+    let critical: Vec<&doctor::Check> = checks.iter().filter(|c| c.is_critical()).collect();
+    let kind = if critical.is_empty() {
+        LaunchKind::Now
+    } else {
+        LaunchKind::Fix
+    };
+    let Some(agent) = choose_agent(&agents, kind) else {
+        return Ok(());
+    };
+    let args = match kind {
+        LaunchKind::Fix => vec![fix_prompt(&critical)],
+        LaunchKind::Now => Vec::new(),
+    };
+    launch_agent(cfg, agent, &args).await
 }
 
 /// Ask a yes/no question with a dim one-line explainer. Interactive: a

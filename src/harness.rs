@@ -62,7 +62,7 @@ where
     tool.apply(&mut cmd, &target);
     cmd.args(args);
 
-    spawn_and_wait(&api, &session, &bin, cmd).await
+    spawn_and_wait(&api, &session, &bin, cmd, || {}).await
 }
 
 /// Run an already-configured child to completion under a condense.
@@ -71,6 +71,7 @@ pub(crate) async fn spawn_and_wait(
     session: &Session,
     bin: &Path,
     mut cmd: tokio::process::Command,
+    on_exit: impl FnOnce(),
 ) -> Result<()> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -82,6 +83,7 @@ pub(crate) async fn spawn_and_wait(
     interrupts.abort();
     heartbeat.abort();
     session.end(api).await;
+    on_exit();
 
     match status {
         Ok(s) => std::process::exit(exit_code(&s)),

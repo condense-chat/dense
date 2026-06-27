@@ -61,6 +61,7 @@ async fn main() -> EyreResult<()> {
         Command::Login => auth::login(&cfg).await,
         Command::Logout => auth::logout(&cfg),
         Command::Claude { args } => harness::claude::run(&cfg, &args).await,
+        Command::Opencode { args } => harness::opencode::run(&cfg, &args).await,
         Command::Persist {
             targets,
             no_modify_path,

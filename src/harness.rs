@@ -7,7 +7,9 @@
 
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
+use std::path::Path;
 use std::process::Stdio;
 
 use crate::api::Api;
@@ -58,17 +60,28 @@ where
 
     let mut cmd = tokio::process::Command::new(&bin);
     tool.apply(&mut cmd, &target);
-    cmd.args(args)
-        .stdin(Stdio::inherit())
+    cmd.args(args);
+
+    spawn_and_wait(&api, &session, &bin, cmd).await
+}
+
+/// Run an already-configured child to completion under a condense.
+pub(crate) async fn spawn_and_wait(
+    api: &Api,
+    session: &Session,
+    bin: &Path,
+    mut cmd: tokio::process::Command,
+) -> Result<()> {
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let heartbeat = session.start_heartbeat(&api);
+    let heartbeat = session.start_heartbeat(api);
     let interrupts = swallow_interrupts();
     let status = cmd.status().await;
     interrupts.abort();
     heartbeat.abort();
-    session.end(&api).await;
+    session.end(api).await;
 
     match status {
         Ok(s) => std::process::exit(exit_code(&s)),
@@ -79,7 +92,7 @@ where
     }
 }
 
-fn announce(cfg: &Config, label: &str) {
+pub(crate) fn announce(cfg: &Config, label: &str) {
     let scheme = hosts::default_scheme_for(&cfg.api_host);
     eprintln!(
         "● condense activated — {label} is routing through {}",
@@ -94,7 +107,11 @@ fn announce(cfg: &Config, label: &str) {
 
 /// The `x-condense-*` headers on every request — auth/user/session, plus the
 /// optional upstream override. Universal; the upstream comes from [`Config`].
-fn condense_headers(cfg: &Config, creds: &Creds, session_id: &str) -> Vec<(String, String)> {
+pub(crate) fn condense_headers(
+    cfg: &Config,
+    creds: &Creds,
+    session_id: &str,
+) -> Vec<(String, String)> {
     let mut h = Vec::new();
     if let Some(token) = &creds.token {
         h.push(("x-condense-auth-token".to_string(), token.clone()));

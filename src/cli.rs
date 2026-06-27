@@ -50,6 +50,16 @@ pub enum Command {
     Login,
     /// Clear stored credentials.
     Logout,
+
+    #[command(disable_help_flag = true)]
+    Opencode {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
     /// Install shims so the named tools route through dense (no args: all).
     Persist {
         /// Write the env file but don't edit shell profiles.

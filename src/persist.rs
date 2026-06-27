@@ -20,6 +20,11 @@ const TOOLS: &[ToolSpec] = &[
         install_hint: "https://docs.claude.com/en/docs/claude-code",
     },
     ToolSpec {
+        name: "opencode",
+        available: true,
+        install_hint: "https://opencode.ai",
+    },
+    ToolSpec {
         name: "codex",
         available: true,
         install_hint: "",
@@ -168,7 +173,7 @@ fn select(targets: &[String]) -> Result<Vec<&'static ToolSpec>> {
             Some(s) => out.push(s),
             None => {
                 return Err(Error::Tool(format!(
-                    "unknown tool `{t}` (known: claude, codex)"
+                    "unknown tool `{t}` (known: claude, opencode, codex)"
                 )));
             }
         }

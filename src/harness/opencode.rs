@@ -22,7 +22,6 @@ impl MultiTool for OpenCode {
         routes: &[DialectRoute],
         headers: &[(String, String)],
     ) {
-        note_active_providers();
         cmd.env(
             "OPENCODE_CONFIG_CONTENT",
             build_config(routes, headers, self.model.as_ref()),
@@ -45,6 +44,7 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     if let Err(e) = ensure_plugin(cfg) {
         eprintln!("  warning: could not install thought_signature plugin: {e}");
     }
+    note_active_providers();
     let tool = OpenCode {
         model: parse_model_arg(args),
     };
@@ -107,6 +107,10 @@ fn add_provider(
     model: Option<&(String, String)>,
 ) {
     let Some((id, npm, name, key_env)) = provider_meta(dialect.route) else {
+        eprintln!(
+            "  warning: no OpenCode provider mapping for dialect route {:?}; skipping",
+            dialect.route
+        );
         return;
     };
     let mut models = Map::new();
@@ -119,7 +123,7 @@ fn add_provider(
         "npm": npm,
         "name": name,
         "options": provider_options(
-            format!("{}/v1", dialect.base_url.trim_end_matches('/')),
+            harness::with_v1(&dialect.base_url),
             headers,
             std::env::var(key_env).ok(),
         ),

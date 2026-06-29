@@ -21,7 +21,7 @@ impl Tool<OpenAi> for Codex {
     fn apply(&self, cmd: &mut tokio::process::Command, target: &ProxyTarget) {
         // The dialect base is `<api>/openai`; Codex appends `/responses` to the
         // provider base_url, so the `/v1` lands us on `/openai/v1/responses`.
-        let base_url = format!("{}/v1", target.base_url);
+        let base_url = harness::with_v1(&target.base_url);
 
         let mut header_entries: Vec<String> = Vec::new();
         for (name, value) in &target.headers {

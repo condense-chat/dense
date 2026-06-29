@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 
@@ -13,27 +12,13 @@ struct OpenCode {
     model: Option<(String, String)>,
 }
 
-struct PluginInstall {
-    created_root: Option<PathBuf>,
-    file: Option<PathBuf>,
-}
-
 impl MultiTool for OpenCode {
-    fn apply(
-        &self,
-        cmd: &mut tokio::process::Command,
-        targets: &[DialectTarget],
-    ) -> Box<dyn FnOnce() + Send> {
+    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[DialectTarget]) {
         note_active_providers();
         cmd.env(
             "OPENCODE_CONFIG_CONTENT",
             build_config(targets, self.model.as_ref()),
         );
-        let plugin = install_plugin().unwrap_or_else(|e| {
-            eprintln!("  warning: could not install thought_signature plugin: {e}");
-            PluginInstall::noop()
-        });
-        Box::new(move || plugin.cleanup())
     }
 
     fn binary(&self) -> &str {
@@ -45,59 +30,33 @@ impl MultiTool for OpenCode {
     }
 }
 
-impl PluginInstall {
-    fn noop() -> Self {
-        Self {
-            created_root: None,
-            file: None,
-        }
-    }
-
-    fn cleanup(self) {
-        if let Some(root) = self.created_root {
-            let _ = fs::remove_dir_all(root);
-        } else if let Some(f) = self.file {
-            let _ = fs::remove_file(f);
-        }
-    }
-}
-
 /// `dense opencode` — OpenCode routed through condense (Anthropic + OpenAI in
 /// one config). Multi-provider, so it rides [`harness::launch_multi`] rather
 /// than the single-dialect `Tool` path.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
+    if let Err(e) = ensure_plugin(cfg) {
+        eprintln!("  warning: could not install thought_signature plugin: {e}");
+    }
     let tool = OpenCode {
         model: parse_model_arg(args),
     };
     harness::launch_multi(cfg, tool, args).await
 }
 
-/// Install the session-scoped thought_signature plugin into
-/// `<cwd>/.opencode/plugins/`, tracking only what we create so cleanup never
-/// touches a pre-existing file or dir.
-fn install_plugin() -> Result<PluginInstall> {
-    let cwd = std::env::current_dir()?;
-    let opencode = cwd.join(".opencode");
-    let plugins = opencode.join("plugins");
+/// Write the replay plugin into OpenCode's global plugin dir, idempotently.
+fn ensure_plugin(cfg: &Config) -> Result<()> {
+    let config_root = cfg
+        .config_dir()
+        .parent()
+        .ok_or_else(|| crate::error::Error::msg("cannot locate config root"))?;
+    let plugins = config_root.join("opencode").join("plugins");
     let file = plugins.join("condense-thought-sig.js");
-    if file.exists() {
-        return Ok(PluginInstall::noop());
+    if fs::read_to_string(&file).ok().as_deref() == Some(THOUGHT_SIG_PLUGIN) {
+        return Ok(());
     }
-    let made_opencode = !opencode.exists();
-    let made_plugins = !plugins.exists();
     fs::create_dir_all(&plugins)?;
     fs::write(&file, THOUGHT_SIG_PLUGIN)?;
-    let created_root = if made_opencode {
-        Some(opencode)
-    } else if made_plugins {
-        Some(plugins)
-    } else {
-        None
-    };
-    Ok(PluginInstall {
-        created_root,
-        file: Some(file),
-    })
+    Ok(())
 }
 
 /// Pull `-m/--model <provider>/<model>` out of the passthrough args. Splits on

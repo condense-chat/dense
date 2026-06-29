@@ -21,14 +21,9 @@ use crate::error::Error;
 use crate::{Result, hosts, tool};
 
 /// Like [`Tool`], but fans out to several dialects in one launch — OpenCode
-/// declares one provider per dialect in a single config. `apply` returns a
-/// teardown closure run after the child exits (e.g. plugin cleanup).
+/// declares one provider per dialect in a single config.
 pub trait MultiTool {
-    fn apply(
-        &self,
-        cmd: &mut tokio::process::Command,
-        targets: &[DialectTarget],
-    ) -> Box<dyn FnOnce() + Send>;
+    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[DialectTarget]);
 
     fn binary(&self) -> &str;
     fn label(&self) -> &str;
@@ -83,12 +78,11 @@ where
     tool.apply(&mut cmd, &target);
     cmd.args(args);
 
-    spawn_and_wait(&api, &session, &bin, cmd, || {}).await
+    spawn_and_wait(&api, &session, &bin, cmd).await
 }
 
 /// Run a multi-provider `tool`, wiring one [`DialectTarget`] per dialect (the
-/// full set condense speaks). Same lifecycle as [`launch`]; the tool's `apply`
-/// hands back a teardown closure run after the child exits.
+/// full set condense speaks). Same lifecycle as [`launch`].
 pub async fn launch_multi<T: MultiTool>(cfg: &Config, tool: T, args: &[String]) -> Result<()> {
     let creds = auth::ensure_auth(cfg).await?;
     let api = Api::authed(cfg, &creds)?;
@@ -118,10 +112,10 @@ pub async fn launch_multi<T: MultiTool>(cfg: &Config, tool: T, args: &[String]) 
     ];
 
     let mut cmd = tokio::process::Command::new(&bin);
-    let teardown = tool.apply(&mut cmd, &targets);
+    tool.apply(&mut cmd, &targets);
     cmd.args(args);
 
-    spawn_and_wait(&api, &session, &bin, cmd, teardown).await
+    spawn_and_wait(&api, &session, &bin, cmd).await
 }
 
 /// Run an already-configured child to completion under a condense.
@@ -130,7 +124,6 @@ pub(crate) async fn spawn_and_wait(
     session: &Session,
     bin: &Path,
     mut cmd: tokio::process::Command,
-    on_exit: impl FnOnce(),
 ) -> Result<()> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -142,7 +135,6 @@ pub(crate) async fn spawn_and_wait(
     interrupts.abort();
     heartbeat.abort();
     session.end(api).await;
-    on_exit();
 
     match status {
         Ok(s) => std::process::exit(exit_code(&s)),

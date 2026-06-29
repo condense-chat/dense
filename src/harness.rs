@@ -14,20 +14,11 @@ use std::process::Stdio;
 
 use crate::api::Api;
 use crate::api::auth::{self, Creds};
-use crate::api::dialect::{Anthropic, Dialect, OpenAi};
+use crate::api::dialect::Dialect;
 use crate::api::session::Session;
 use crate::config::Config;
 use crate::error::Error;
 use crate::{Result, hosts, tool};
-
-/// Like [`Tool`], but fans out to several dialects in one launch — OpenCode
-/// declares one provider per dialect in a single config.
-pub trait MultiTool {
-    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[DialectTarget]);
-
-    fn binary(&self) -> &str;
-    fn label(&self) -> &str;
-}
 
 /// An agent CLI, parameterised by a dialect it speaks. A tool implements
 /// `Tool<D>` once per dialect it supports (Claude only Anthropic).
@@ -38,13 +29,6 @@ pub trait Tool<D: Dialect> {
 
     fn binary(&self) -> &str;
     fn label(&self) -> &str;
-}
-
-/// A [`ProxyTarget`] tagged with the dialect route that produced it, so a
-/// multi-provider tool can map each provider to its condense route.
-pub struct DialectTarget {
-    pub route: &'static str,
-    pub target: ProxyTarget,
 }
 
 /// A resolved proxy target a tool wires itself to.
@@ -76,43 +60,6 @@ where
 
     let mut cmd = tokio::process::Command::new(&bin);
     tool.apply(&mut cmd, &target);
-    cmd.args(args);
-
-    spawn_and_wait(&api, &session, &bin, cmd).await
-}
-
-/// Run a multi-provider `tool`, wiring one [`DialectTarget`] per dialect (the
-/// full set condense speaks). Same lifecycle as [`launch`].
-pub async fn launch_multi<T: MultiTool>(cfg: &Config, tool: T, args: &[String]) -> Result<()> {
-    let creds = auth::ensure_auth(cfg).await?;
-    let api = Api::authed(cfg, &creds)?;
-    let session = Session::new();
-    let bin = tool::resolve_real(cfg, tool.binary())?;
-
-    if args.is_empty() {
-        announce(cfg, tool.label());
-    }
-
-    let headers = condense_headers(cfg, &creds, &session.id);
-    let targets = vec![
-        DialectTarget {
-            route: Anthropic.route(),
-            target: ProxyTarget {
-                base_url: Anthropic.base_url(cfg),
-                headers: headers.clone(),
-            },
-        },
-        DialectTarget {
-            route: OpenAi.route(),
-            target: ProxyTarget {
-                base_url: OpenAi.base_url(cfg),
-                headers: headers.clone(),
-            },
-        },
-    ];
-
-    let mut cmd = tokio::process::Command::new(&bin);
-    tool.apply(&mut cmd, &targets);
     cmd.args(args);
 
     spawn_and_wait(&api, &session, &bin, cmd).await

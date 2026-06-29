@@ -3,9 +3,9 @@ use std::fs;
 use serde_json::{Map, Value, json};
 
 use crate::Result;
-use crate::api::dialect::{AllDialects, DialectRoute};
+use crate::api::dialect::Dialect;
 use crate::config::Config;
-use crate::harness::{self, MultiTool};
+use crate::harness::{self, Target, Tool};
 
 const THOUGHT_SIG_PLUGIN: &str = include_str!("../../assets/opencode/condense-thought-sig.js");
 
@@ -13,18 +13,17 @@ pub struct OpenCode {
     model: Option<(String, String)>,
 }
 
-impl MultiTool for OpenCode {
+impl Tool for OpenCode {
+    fn dialects(&self) -> &'static [Dialect] {
+        &[Dialect::Anthropic, Dialect::OpenAi]
+    }
+
     /// OpenCode takes its whole provider config via `OPENCODE_CONFIG_CONTENT`,
-    /// so this declares one provider per dialect route in that env payload.
-    fn apply(
-        &self,
-        cmd: &mut tokio::process::Command,
-        routes: &[DialectRoute],
-        headers: &[(String, String)],
-    ) {
+    /// so this declares one provider per dialect target in that env payload.
+    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[Target]) {
         cmd.env(
             "OPENCODE_CONFIG_CONTENT",
-            build_config(routes, headers, self.model.as_ref()),
+            build_config(targets, self.model.as_ref()),
         );
     }
 
@@ -38,8 +37,8 @@ impl MultiTool for OpenCode {
 }
 
 /// `dense opencode` — OpenCode through condense, one provider per dialect
-/// (Anthropic + OpenAI). The thought_signature replay plugin is installed
-/// up front; the dialect set comes from [`AllDialects`].
+/// (Anthropic + OpenAI). The thought_signature replay plugin is installed up
+/// front.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     if let Err(e) = ensure_plugin(cfg) {
         eprintln!("  warning: could not install thought_signature plugin: {e}");
@@ -48,7 +47,7 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     let tool = OpenCode {
         model: parse_model_arg(args),
     };
-    harness::launch_multi(cfg, tool, AllDialects, args).await
+    harness::launch(cfg, tool, args).await
 }
 
 /// Write the replay plugin into OpenCode's global plugin dir, idempotently.
@@ -87,14 +86,10 @@ fn parse_model_arg(args: &[String]) -> Option<(String, String)> {
 /// Two condense providers as an `OPENCODE_CONFIG_CONTENT` env payload, one per
 /// dialect condense speaks. Only the caller's `-m` model is declared; OpenCode
 /// rejects models absent from the map.
-fn build_config(
-    dialects: &[DialectRoute],
-    headers: &[(String, String)],
-    model: Option<&(String, String)>,
-) -> String {
+fn build_config(dialects: &[Target], model: Option<&(String, String)>) -> String {
     let mut providers = Map::new();
     for dr in dialects {
-        add_provider(&mut providers, dr, headers, model);
+        add_provider(&mut providers, dr, model);
     }
     json!({ "provider": Value::Object(providers) }).to_string()
 }
@@ -102,8 +97,7 @@ fn build_config(
 /// Add one dialect's OpenCode provider entry, keyed by its route.
 fn add_provider(
     providers: &mut Map<String, Value>,
-    dialect: &DialectRoute,
-    headers: &[(String, String)],
+    dialect: &Target,
     model: Option<&(String, String)>,
 ) {
     let Some((id, npm, name, key_env)) = provider_meta(dialect.route) else {
@@ -124,7 +118,7 @@ fn add_provider(
         "name": name,
         "options": provider_options(
             harness::with_v1(&dialect.base_url),
-            headers,
+            &dialect.headers,
             std::env::var(key_env).ok(),
         ),
         "models": Value::Object(models),
@@ -192,12 +186,13 @@ fn note_active_providers() {
 mod tests {
     use super::*;
 
-    fn dialects(base: &str) -> Vec<DialectRoute> {
+    fn dialects(base: &str, headers: &[(String, String)]) -> Vec<Target> {
         ["anthropic", "openai"]
             .into_iter()
-            .map(|route| DialectRoute {
+            .map(|route| Target {
                 route,
                 base_url: format!("{base}/{route}"),
+                headers: headers.to_vec(),
             })
             .collect()
     }
@@ -205,7 +200,7 @@ mod tests {
     #[test]
     fn config_has_both_providers_and_routes() {
         let headers = vec![("x-condense-session-id".to_string(), "s".to_string())];
-        let raw = build_config(&dialects("https://api.example.com"), &headers, None);
+        let raw = build_config(&dialects("https://api.example.com", &headers), None);
         let v: Value = serde_json::from_str(&raw).unwrap();
         let p = &v["provider"];
         assert_eq!(
@@ -228,7 +223,7 @@ mod tests {
             "condense-openai".to_string(),
             "openai/gpt-5.4-nano".to_string(),
         );
-        let raw = build_config(&dialects("https://x"), &[], Some(&extra));
+        let raw = build_config(&dialects("https://x", &[]), Some(&extra));
         let v: Value = serde_json::from_str(&raw).unwrap();
         let openai = &v["provider"]["condense-openai"]["models"];
         // exactly the requested model, nothing hardcoded

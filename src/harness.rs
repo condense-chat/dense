@@ -1,9 +1,8 @@
 //! The interceptor: launch an agent CLI with its traffic routed through
-//! condense. `launch` is generic over the tool and the dialect it speaks
-//! (static dispatch, no trait objects) — invalid tool×dialect pairings don't
-//! type-check — and owns the universal lifecycle: ensure auth, open a session,
-//! spawn, heartbeat, end. The `x-condense-*` headers ride here too; they're the
-//! same for every tool and dialect.
+//! condense. `launch` owns the universal lifecycle (ensure auth, open a
+//! session, spawn, heartbeat, end) and resolves one [`Target`] per dialect the
+//! tool declares — one for Claude/Codex, several for OpenCode. The
+//! `x-condense-*` headers ride here too; they're the same for every tool.
 
 pub mod claude;
 pub mod codex;
@@ -14,42 +13,34 @@ use std::process::Stdio;
 
 use crate::api::Api;
 use crate::api::auth::{self, Creds};
-use crate::api::dialect::{Dialect, DialectRoute, MultiDialect};
+use crate::api::dialect::Dialect;
 use crate::api::session::Session;
 use crate::config::Config;
 use crate::error::Error;
 use crate::{Result, hosts, tool};
 
-/// An agent CLI, parameterised by a dialect it speaks. A tool implements
-/// `Tool<D>` once per dialect it supports (Claude only Anthropic).
-pub trait Tool<D: Dialect> {
-    /// Point `cmd` at `target` — set the tool's base-URL/header env. The one
-    /// tool-and-dialect-specific step.
-    fn apply(&self, cmd: &mut tokio::process::Command, target: &ProxyTarget);
+/// An agent CLI routed through condense. A tool declares which dialects it
+/// wires — one (Claude/Codex) or several (OpenCode) — and configures the child
+/// command from the resolved [`Target`]s.
+pub trait Tool {
+    /// Point `cmd` at the resolved targets — set the tool's base-URL/header
+    /// env. The one tool-specific step.
+    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[Target]);
 
     fn binary(&self) -> &str;
+
+    /// The dialects this tool speaks; `apply` gets one [`Target`] per entry.
+    fn dialects(&self) -> &'static [Dialect];
+
     fn label(&self) -> &str;
 }
 
-/// Like [`Tool`], but speaks several dialects in one launch — one condense
-/// provider per dialect (OpenCode). The dialect set is resolved from a
-/// [`MultiDialect`]; `apply` receives every route plus the shared headers.
-pub trait MultiTool {
-    fn apply(
-        &self,
-        cmd: &mut tokio::process::Command,
-        routes: &[DialectRoute],
-        headers: &[(String, String)],
-    );
-
-    fn binary(&self) -> &str;
-    fn label(&self) -> &str;
-}
-
-/// A resolved proxy target a tool wires itself to.
-pub struct ProxyTarget {
+/// One resolved dialect a tool wires itself to: its route, the condense base
+/// URL, and the shared `x-condense-*` headers.
+pub struct Target {
     pub base_url: String,
     pub headers: Vec<(String, String)>,
+    pub route: &'static str,
 }
 
 /// Append the `/v1` API segment to a dialect base, tolerating a trailing slash.
@@ -57,13 +48,9 @@ pub(crate) fn with_v1(base: &str) -> String {
     format!("{}/v1", base.trim_end_matches('/'))
 }
 
-/// Run `tool` through condense speaking `dialect`. Exits with the child's
-/// status; only a launch failure returns.
-pub async fn launch<D, T>(cfg: &Config, tool: T, dialect: D, args: &[String]) -> Result<()>
-where
-    D: Dialect,
-    T: Tool<D>,
-{
+/// Run `tool` through condense, resolving one [`Target`] per declared dialect.
+/// Exits with the child's status; only a launch failure returns.
+pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<()> {
     let creds = auth::ensure_auth(cfg).await?;
     let api = Api::authed(cfg, &creds)?;
     let session = Session::new();
@@ -73,40 +60,19 @@ where
         announce(cfg, tool.label());
     }
 
-    let target = ProxyTarget {
-        base_url: dialect.base_url(cfg),
-        headers: condense_headers(cfg, &creds, &session.id),
-    };
-
-    let mut cmd = tokio::process::Command::new(&bin);
-    tool.apply(&mut cmd, &target);
-    cmd.args(args);
-
-    spawn_and_wait(&api, &session, &bin, cmd).await
-}
-
-/// Run a multi-dialect `tool` through condense, wiring every dialect of
-/// `dialects` into one launch. The twin of [`launch`] for tools (OpenCode) that
-/// declare one provider per dialect in a single config.
-pub async fn launch_multi<M, T>(cfg: &Config, tool: T, dialects: M, args: &[String]) -> Result<()>
-where
-    M: MultiDialect,
-    T: MultiTool,
-{
-    let creds = auth::ensure_auth(cfg).await?;
-    let api = Api::authed(cfg, &creds)?;
-    let session = Session::new();
-    let bin = tool::resolve_real(cfg, tool.binary())?;
-
-    if args.is_empty() {
-        announce(cfg, tool.label());
-    }
-
-    let routes = dialects.dialects(cfg);
     let headers = condense_headers(cfg, &creds, &session.id);
+    let targets: Vec<Target> = tool
+        .dialects()
+        .iter()
+        .map(|&d| Target {
+            route: d.route(),
+            base_url: d.base_url(cfg),
+            headers: headers.clone(),
+        })
+        .collect();
 
     let mut cmd = tokio::process::Command::new(&bin);
-    tool.apply(&mut cmd, &routes, &headers);
+    tool.apply(&mut cmd, &targets);
     cmd.args(args);
 
     spawn_and_wait(&api, &session, &bin, cmd).await

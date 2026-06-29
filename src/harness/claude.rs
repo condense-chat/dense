@@ -1,14 +1,19 @@
-//! Claude Code through condense — `Claude<Anthropic>`.
+//! Claude Code through condense (Anthropic dialect).
 
 use crate::Result;
-use crate::api::dialect::Anthropic;
+use crate::api::dialect::Dialect;
 use crate::config::Config;
-use crate::harness::{self, ProxyTarget, Tool};
+use crate::harness::{self, Target, Tool};
 
 pub struct Claude;
 
-impl Tool<Anthropic> for Claude {
-    fn apply(&self, cmd: &mut tokio::process::Command, target: &ProxyTarget) {
+impl Tool for Claude {
+    fn dialects(&self) -> &'static [Dialect] {
+        &[Dialect::Anthropic]
+    }
+
+    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[Target]) {
+        let target = &targets[0];
         cmd.env("ANTHROPIC_BASE_URL", &target.base_url)
             .env("ANTHROPIC_CUSTOM_HEADERS", custom_headers(&target.headers))
             // Claude Code disables the 1M context window when the base URL is
@@ -35,10 +40,9 @@ impl Tool<Anthropic> for Claude {
     }
 }
 
-/// `dense claude` — Claude Code through the Anthropic proxy. The dialect is the
-/// concrete `Anthropic`, so no proxy flag is threaded through the run path.
+/// `dense claude` — Claude Code through the Anthropic proxy.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
-    harness::launch(cfg, Claude, Anthropic, args).await
+    harness::launch(cfg, Claude, args).await
 }
 
 fn custom_headers(headers: &[(String, String)]) -> String {

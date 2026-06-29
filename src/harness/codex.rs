@@ -1,9 +1,9 @@
-//! Codex through condense — `Codex<OpenAi>`.
+//! Codex through condense (OpenAI Responses dialect).
 
 use crate::Result;
-use crate::api::dialect::OpenAi;
+use crate::api::dialect::Dialect;
 use crate::config::Config;
-use crate::harness::{self, ProxyTarget, Tool};
+use crate::harness::{self, Target, Tool};
 
 // Dense-owned provider id, distinct from a hand-authored `[model_providers.condense]`:
 // `-c` overlays merge (can't delete) a stale block's keys, so we own a private id.
@@ -13,12 +13,17 @@ pub struct Codex {
     websocket: bool,
 }
 
-impl Tool<OpenAi> for Codex {
+impl Tool for Codex {
+    fn dialects(&self) -> &'static [Dialect] {
+        &[Dialect::OpenAi]
+    }
+
     /// Codex has no single custom-headers env var, so the provider is defined
     /// inline via `-c` overrides (top of the precedence stack, untouched by the
     /// project-config security boundary). Secret header values ride in env vars
     /// referenced by `env_http_headers`, never in argv.
-    fn apply(&self, cmd: &mut tokio::process::Command, target: &ProxyTarget) {
+    fn apply(&self, cmd: &mut tokio::process::Command, targets: &[Target]) {
+        let target = &targets[0];
         // The dialect base is `<api>/openai`; Codex appends `/responses` to the
         // provider base_url, so the `/v1` lands us on `/openai/v1/responses`.
         let base_url = harness::with_v1(&target.base_url);
@@ -63,15 +68,13 @@ impl Tool<OpenAi> for Codex {
     }
 }
 
-/// `dense codex` — Codex through the OpenAI Responses proxy. The dialect is the
-/// concrete `OpenAi`, so no proxy flag is threaded through the run path.
+/// `dense codex` — Codex through the OpenAI Responses proxy.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     harness::launch(
         cfg,
         Codex {
             websocket: cfg.codex_websocket,
         },
-        OpenAi,
         args,
     )
     .await
@@ -107,7 +110,8 @@ mod tests {
 
     #[test]
     fn apply_builds_provider_overrides_and_keeps_secrets_out_of_argv() {
-        let target = ProxyTarget {
+        let target = Target {
+            route: "openai",
             base_url: "https://api.condense.chat/openai".to_string(),
             headers: vec![(
                 "x-condense-auth-token".to_string(),
@@ -115,7 +119,7 @@ mod tests {
             )],
         };
         let mut cmd = tokio::process::Command::new("codex");
-        Codex { websocket: true }.apply(&mut cmd, &target);
+        Codex { websocket: true }.apply(&mut cmd, &[target]);
 
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -145,12 +149,13 @@ mod tests {
 
     #[test]
     fn apply_pins_http_when_websockets_disabled() {
-        let target = ProxyTarget {
+        let target = Target {
+            route: "openai",
             base_url: "https://api.condense.chat/openai".to_string(),
             headers: vec![],
         };
         let mut cmd = tokio::process::Command::new("codex");
-        Codex { websocket: false }.apply(&mut cmd, &target);
+        Codex { websocket: false }.apply(&mut cmd, &[target]);
         let argv: String = cmd
             .as_std()
             .get_args()

@@ -52,6 +52,11 @@ pub struct ProxyTarget {
     pub headers: Vec<(String, String)>,
 }
 
+/// Append the `/v1` API segment to a dialect base, tolerating a trailing slash.
+pub(crate) fn with_v1(base: &str) -> String {
+    format!("{}/v1", base.trim_end_matches('/'))
+}
+
 /// Run `tool` through condense speaking `dialect`. Exits with the child's
 /// status; only a launch failure returns.
 pub async fn launch<D, T>(cfg: &Config, tool: T, dialect: D, args: &[String]) -> Result<()>

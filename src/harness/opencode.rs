@@ -4,17 +4,45 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use crate::Result;
-use crate::api::Api;
-use crate::api::auth;
-use crate::api::session::Session;
 use crate::config::Config;
-use crate::{harness, tool};
+use crate::harness::{self, DialectTarget, MultiTool};
 
 const THOUGHT_SIG_PLUGIN: &str = include_str!("../../assets/opencode/condense-thought-sig.js");
+
+struct OpenCode {
+    model: Option<(String, String)>,
+}
 
 struct PluginInstall {
     created_root: Option<PathBuf>,
     file: Option<PathBuf>,
+}
+
+impl MultiTool for OpenCode {
+    fn apply(
+        &self,
+        cmd: &mut tokio::process::Command,
+        targets: &[DialectTarget],
+    ) -> Box<dyn FnOnce() + Send> {
+        note_active_providers();
+        cmd.env(
+            "OPENCODE_CONFIG_CONTENT",
+            build_config(targets, self.model.as_ref()),
+        );
+        let plugin = install_plugin().unwrap_or_else(|e| {
+            eprintln!("  warning: could not install thought_signature plugin: {e}");
+            PluginInstall::noop()
+        });
+        Box::new(move || plugin.cleanup())
+    }
+
+    fn binary(&self) -> &str {
+        "opencode"
+    }
+
+    fn label(&self) -> &str {
+        "OpenCode"
+    }
 }
 
 impl PluginInstall {
@@ -34,32 +62,14 @@ impl PluginInstall {
     }
 }
 
-/// `dense opencode` — OpenCode routed through condense.
+/// `dense opencode` — OpenCode routed through condense (Anthropic + OpenAI in
+/// one config). Multi-provider, so it rides [`harness::launch_multi`] rather
+/// than the single-dialect `Tool` path.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
-    let creds = auth::ensure_auth(cfg).await?;
-    let api = Api::authed(cfg, &creds)?;
-    let session = Session::new();
-    let bin = tool::resolve_real(cfg, "opencode")?;
-
-    if args.is_empty() {
-        harness::announce(cfg, "OpenCode");
-    }
-
-    let headers = harness::condense_headers(cfg, &creds, &session.id);
-    note_active_providers();
-    let plugin = install_plugin().unwrap_or_else(|e| {
-        eprintln!("  warning: could not install thought_signature plugin: {e}");
-        PluginInstall::noop()
-    });
-
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.env(
-        "OPENCODE_CONFIG_CONTENT",
-        build_config(&cfg.api_base_url, &headers, parse_model_arg(args).as_ref()),
-    );
-    cmd.args(args);
-
-    harness::spawn_and_wait(&api, &session, &bin, cmd, move || plugin.cleanup()).await
+    let tool = OpenCode {
+        model: parse_model_arg(args),
+    };
+    harness::launch_multi(cfg, tool, args).await
 }
 
 /// Install the session-scoped thought_signature plugin into
@@ -107,46 +117,55 @@ fn parse_model_arg(args: &[String]) -> Option<(String, String)> {
     None
 }
 
-/// Two condense providers as an `OPENCODE_CONFIG_CONTENT` env payload. Only the
-/// caller's `-m` model is declared — OpenCode rejects models absent from the map.
-fn build_config(
-    api_base_url: &str,
-    headers: &[(String, String)],
-    extra_model: Option<&(String, String)>,
-) -> String {
-    let base = api_base_url.trim_end_matches('/');
-    let mut anthropic_models = Map::new();
-    let mut openai_models = Map::new();
-    if let Some((provider, model)) = extra_model {
-        match provider.as_str() {
-            "condense-anthropic" => anthropic_models.insert(model.clone(), json!({})),
-            "condense-openai" => openai_models.insert(model.clone(), json!({})),
-            _ => None,
+/// Two condense providers as an `OPENCODE_CONFIG_CONTENT` env payload, one per
+/// dialect target — provider id and route come from [`DialectTarget`], not
+/// hardcoded here. Only the caller's `-m` model is declared; OpenCode rejects
+/// models absent from the map.
+fn build_config(targets: &[DialectTarget], model: Option<&(String, String)>) -> String {
+    let mut providers = Map::new();
+    for dt in targets {
+        let Some((id, npm, name, key_env)) = provider_meta(dt.route) else {
+            continue;
         };
+        let mut models = Map::new();
+        if let Some((provider, requested)) = model {
+            if provider == id {
+                models.insert(requested.clone(), json!({}));
+            }
+        }
+        let entry = json!({
+            "npm": npm,
+            "name": name,
+            "options": provider_options(
+                format!("{}/v1", dt.target.base_url.trim_end_matches('/')),
+                &dt.target.headers,
+                std::env::var(key_env).ok(),
+            ),
+            "models": Value::Object(models),
+        });
+        providers.insert(id.to_string(), entry);
     }
-    let provider = json!({
-        "condense-anthropic": {
-            "npm": "@ai-sdk/anthropic",
-            "name": "Condense (Anthropic)",
-            "options": provider_options(
-                format!("{base}/anthropic/v1"),
-                headers,
-                std::env::var("ANTHROPIC_API_KEY").ok(),
-            ),
-            "models": Value::Object(anthropic_models),
-        },
-        "condense-openai": {
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "Condense (OpenAI)",
-            "options": provider_options(
-                format!("{base}/openai/v1"),
-                headers,
-                std::env::var("OPENAI_API_KEY").ok(),
-            ),
-            "models": Value::Object(openai_models),
-        },
-    });
-    json!({ "provider": provider }).to_string()
+    json!({ "provider": Value::Object(providers) }).to_string()
+}
+
+/// A condense dialect route → its OpenCode provider metadata:
+/// (provider id, npm package, display name, upstream-key env var).
+fn provider_meta(route: &str) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    match route {
+        "anthropic" => Some((
+            "condense-anthropic",
+            "@ai-sdk/anthropic",
+            "Condense (Anthropic)",
+            "ANTHROPIC_API_KEY",
+        )),
+        "openai" => Some((
+            "condense-openai",
+            "@ai-sdk/openai-compatible",
+            "Condense (OpenAI)",
+            "OPENAI_API_KEY",
+        )),
+        _ => None,
+    }
 }
 
 fn provider_options(
@@ -188,11 +207,25 @@ fn note_active_providers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::ProxyTarget;
+
+    fn targets(base: &str, headers: &[(String, String)]) -> Vec<DialectTarget> {
+        ["anthropic", "openai"]
+            .into_iter()
+            .map(|route| DialectTarget {
+                route,
+                target: ProxyTarget {
+                    base_url: format!("{base}/{route}"),
+                    headers: headers.to_vec(),
+                },
+            })
+            .collect()
+    }
 
     #[test]
     fn config_has_both_providers_and_routes() {
         let headers = vec![("x-condense-session-id".to_string(), "s".to_string())];
-        let raw = build_config("https://api.example.com/", &headers, None);
+        let raw = build_config(&targets("https://api.example.com", &headers), None);
         let v: Value = serde_json::from_str(&raw).unwrap();
         let p = &v["provider"];
         assert_eq!(
@@ -215,7 +248,7 @@ mod tests {
             "condense-openai".to_string(),
             "openai/gpt-5.4-nano".to_string(),
         );
-        let raw = build_config("https://x", &[], Some(&extra));
+        let raw = build_config(&targets("https://x", &[]), Some(&extra));
         let v: Value = serde_json::from_str(&raw).unwrap();
         let openai = &v["provider"]["condense-openai"]["models"];
         // exactly the requested model, nothing hardcoded

@@ -113,7 +113,7 @@ where
 }
 
 /// Run an already-configured child to completion under a condense session.
-pub(crate) async fn spawn_and_wait(
+async fn spawn_and_wait(
     api: &Api,
     session: &Session,
     bin: &Path,
@@ -139,7 +139,7 @@ pub(crate) async fn spawn_and_wait(
     }
 }
 
-pub(crate) fn announce(cfg: &Config, label: &str) {
+fn announce(cfg: &Config, label: &str) {
     let scheme = hosts::default_scheme_for(&cfg.api_host);
     eprintln!(
         "● condense activated — {label} is routing through {}",
@@ -154,11 +154,7 @@ pub(crate) fn announce(cfg: &Config, label: &str) {
 
 /// The `x-condense-*` headers on every request — auth/user/session, plus the
 /// optional upstream override. Universal; the upstream comes from [`Config`].
-pub(crate) fn condense_headers(
-    cfg: &Config,
-    creds: &Creds,
-    session_id: &str,
-) -> Vec<(String, String)> {
+fn condense_headers(cfg: &Config, creds: &Creds, session_id: &str) -> Vec<(String, String)> {
     let mut h = Vec::new();
     if let Some(token) = &creds.token {
         h.push(("x-condense-auth-token".to_string(), token.clone()));

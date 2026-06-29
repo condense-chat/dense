@@ -14,7 +14,7 @@ use std::process::Stdio;
 
 use crate::api::Api;
 use crate::api::auth::{self, Creds};
-use crate::api::dialect::Dialect;
+use crate::api::dialect::{Dialect, DialectRoute, MultiDialect};
 use crate::api::session::Session;
 use crate::config::Config;
 use crate::error::Error;
@@ -26,6 +26,21 @@ pub trait Tool<D: Dialect> {
     /// Point `cmd` at `target` — set the tool's base-URL/header env. The one
     /// tool-and-dialect-specific step.
     fn apply(&self, cmd: &mut tokio::process::Command, target: &ProxyTarget);
+
+    fn binary(&self) -> &str;
+    fn label(&self) -> &str;
+}
+
+/// Like [`Tool`], but speaks several dialects in one launch — one condense
+/// provider per dialect (OpenCode). The dialect set is resolved from a
+/// [`MultiDialect`]; `apply` receives every route plus the shared headers.
+pub trait MultiTool {
+    fn apply(
+        &self,
+        cmd: &mut tokio::process::Command,
+        routes: &[DialectRoute],
+        headers: &[(String, String)],
+    );
 
     fn binary(&self) -> &str;
     fn label(&self) -> &str;
@@ -65,7 +80,34 @@ where
     spawn_and_wait(&api, &session, &bin, cmd).await
 }
 
-/// Run an already-configured child to completion under a condense.
+/// Run a multi-dialect `tool` through condense, wiring every dialect of
+/// `dialects` into one launch. The twin of [`launch`] for tools (OpenCode) that
+/// declare one provider per dialect in a single config.
+pub async fn launch_multi<M, T>(cfg: &Config, tool: T, dialects: M, args: &[String]) -> Result<()>
+where
+    M: MultiDialect,
+    T: MultiTool,
+{
+    let creds = auth::ensure_auth(cfg).await?;
+    let api = Api::authed(cfg, &creds)?;
+    let session = Session::new();
+    let bin = tool::resolve_real(cfg, tool.binary())?;
+
+    if args.is_empty() {
+        announce(cfg, tool.label());
+    }
+
+    let routes = dialects.dialects(cfg);
+    let headers = condense_headers(cfg, &creds, &session.id);
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    tool.apply(&mut cmd, &routes, &headers);
+    cmd.args(args);
+
+    spawn_and_wait(&api, &session, &bin, cmd).await
+}
+
+/// Run an already-configured child to completion under a condense session.
 pub(crate) async fn spawn_and_wait(
     api: &Api,
     session: &Session,

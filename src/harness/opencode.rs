@@ -3,45 +3,52 @@ use std::fs;
 use serde_json::{Map, Value, json};
 
 use crate::Result;
-use crate::api::Api;
-use crate::api::auth;
-use crate::api::dialect::{AllDialects, DialectRoute, MultiDialect};
-use crate::api::session::Session;
+use crate::api::dialect::{AllDialects, DialectRoute};
 use crate::config::Config;
-use crate::{harness, tool};
+use crate::harness::{self, MultiTool};
 
 const THOUGHT_SIG_PLUGIN: &str = include_str!("../../assets/opencode/condense-thought-sig.js");
 
-/// `dense opencode` — OpenCode routed through condense. Declares one provider
-/// per dialect condense speaks (Anthropic + OpenAI) in one config, then runs
-/// the shared lifecycle.
+pub struct OpenCode {
+    model: Option<(String, String)>,
+}
+
+impl MultiTool for OpenCode {
+    /// OpenCode takes its whole provider config via `OPENCODE_CONFIG_CONTENT`,
+    /// so this declares one provider per dialect route in that env payload.
+    fn apply(
+        &self,
+        cmd: &mut tokio::process::Command,
+        routes: &[DialectRoute],
+        headers: &[(String, String)],
+    ) {
+        note_active_providers();
+        cmd.env(
+            "OPENCODE_CONFIG_CONTENT",
+            build_config(routes, headers, self.model.as_ref()),
+        );
+    }
+
+    fn binary(&self) -> &str {
+        "opencode"
+    }
+
+    fn label(&self) -> &str {
+        "OpenCode"
+    }
+}
+
+/// `dense opencode` — OpenCode through condense, one provider per dialect
+/// (Anthropic + OpenAI). The thought_signature replay plugin is installed
+/// up front; the dialect set comes from [`AllDialects`].
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     if let Err(e) = ensure_plugin(cfg) {
         eprintln!("  warning: could not install thought_signature plugin: {e}");
     }
-    let creds = auth::ensure_auth(cfg).await?;
-    let api = Api::authed(cfg, &creds)?;
-    let session = Session::new();
-    let bin = tool::resolve_real(cfg, "opencode")?;
-
-    if args.is_empty() {
-        harness::announce(cfg, "OpenCode");
-    }
-    note_active_providers();
-
-    let headers = harness::condense_headers(cfg, &creds, &session.id);
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.env(
-        "OPENCODE_CONFIG_CONTENT",
-        build_config(
-            &AllDialects.dialects(cfg),
-            &headers,
-            parse_model_arg(args).as_ref(),
-        ),
-    );
-    cmd.args(args);
-
-    harness::spawn_and_wait(&api, &session, &bin, cmd).await
+    let tool = OpenCode {
+        model: parse_model_arg(args),
+    };
+    harness::launch_multi(cfg, tool, AllDialects, args).await
 }
 
 /// Write the replay plugin into OpenCode's global plugin dir, idempotently.

@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.6.0] - 2026-06-29
+
+### Features
+- Route OpenCode through condense via `dense opencode`- Dynamic model resolution + client-side Gemini signature replay- Implement MultiTool trait for OpenCode and enhance run function
+
+### Refactor
+- Ride the shared harness via MultiTool- Install thought_signature plugin globally, write-once- Express providers via Dialect types (MultiDialect)- Address review nits — purer apply, no silent drops- Tighten vestigial pub(crate) to private- Collapse Tool/MultiTool + Dialect/MultiDialect into one
+
 ## [0.5.0] - 2026-06-23
 
 ### Features

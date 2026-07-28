@@ -180,6 +180,13 @@ fn creds_headers(creds: &Creds) -> Result<HeaderMap> {
             HeaderValue::from_str(user).map_err(|_| Error::Auth("malformed user id".into()))?,
         );
     }
+    // Set by `launch` for the session's children; best-effort passthrough.
+    if let Ok(sid) = std::env::var("CONDENSE_SESSION_ID")
+        && !sid.is_empty()
+        && let Ok(v) = HeaderValue::from_str(&sid)
+    {
+        headers.insert("x-condense-session-id", v);
+    }
     Ok(headers)
 }
 

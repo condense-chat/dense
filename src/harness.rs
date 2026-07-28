@@ -73,6 +73,9 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
 
     let mut cmd = tokio::process::Command::new(&bin);
     tool.apply(&mut cmd, &targets);
+    // Nested dense invocations (the agent running `dense recover`) read this
+    // so their audit events join to the session.
+    cmd.env("CONDENSE_SESSION_ID", &session.id);
     cmd.args(args);
 
     spawn_and_wait(&api, &session, &bin, cmd).await

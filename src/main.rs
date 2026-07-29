@@ -12,6 +12,7 @@ mod hosts;
 mod migrate;
 mod persist;
 mod profile;
+mod recover;
 mod selfupdate;
 mod setup;
 mod tool;
@@ -79,6 +80,7 @@ async fn main() -> EyreResult<()> {
                 Ok(())
             }
         }
+        Command::Recover { id, critical } => recover::run(&cfg, &id, critical).await,
         Command::SelfCmd(SelfCommand::Update) => selfupdate::update(&cfg).await,
         Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg),
     };

@@ -33,7 +33,7 @@ fn help_smoke() {
     let out = dense().arg("--help").output().expect("run");
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["claude", "login", "persist", "doctor"] {
+    for cmd in ["claude", "login", "persist", "doctor", "recover"] {
         assert!(help.contains(cmd), "help should mention `{cmd}`");
     }
 }

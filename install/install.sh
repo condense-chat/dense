@@ -1,12 +1,14 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Install the `dense` CLI, then hand off to its first-run setup.
 #
 # Usage:
 #   curl -fsSL https://cli.condense.chat/unix | sh
 #
 # Honours CONDENSE_URL (override the proxy/api base the install targets).
+#
+# POSIX sh only — `sh` is dash/ash on many distros (no pipefail, no $'…').
 
-set -euo pipefail
+set -eu
 
 # Environment endpoints — the serving cli host rewrites these three
 # assignments (and only these) for non-prod zones.
@@ -16,7 +18,8 @@ AUTH_REQUIRED="1"
 
 # Colours, only when stderr is a terminal.
 if [ -t 2 ]; then
-  B=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[1;36m'; GREEN=$'\033[32m'; R=$'\033[0m'
+  esc="$(printf '\033')"
+  B="${esc}[1m"; DIM="${esc}[2m"; CYAN="${esc}[1;36m"; GREEN="${esc}[32m"; R="${esc}[0m"
 else
   B=; DIM=; CYAN=; GREEN=; R=
 fi
@@ -66,7 +69,7 @@ if [ -n "$existing" ]; then
   [ -n "$target_version" ] && avail="; ${target_version} available"
   printf '%s %s\n' "$arrow" "dense ${installed_version} is installed${avail}." >&2
   ans=y
-  if [ -r /dev/tty ]; then
+  if (exec < /dev/tty) 2>/dev/null; then
     printf 'update? [Y/n] ' >&2
     read -r ans < /dev/tty || ans=y
   fi
@@ -100,7 +103,9 @@ export CONDENSE_AUTH_REQUIRED="$AUTH_REQUIRED"
 # `curl … | sh` leaves stdin attached to the pipe, not the terminal, so the
 # setup wizard can't prompt. Reconnect stdin to the controlling tty when we
 # have one (this is what rustup does); without a tty, setup uses defaults.
-if [ -r /dev/tty ]; then
+# Probe with a real open — `[ -r /dev/tty ]` is true even with no
+# controlling terminal (CI, containers), where the redirect would fail.
+if (exec < /dev/tty) 2>/dev/null; then
   exec "${bindir}/dense" setup < /dev/tty
 else
   exec "${bindir}/dense" setup

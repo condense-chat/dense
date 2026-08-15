@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.7.0] - 2026-08-15
+
+### Bug Fixes
+- POSIX sh compatibility for install.sh- Bump webbrowser for RUSTSEC-2026-0257
+
+### Features
+- Proper opencode support
+
 ## [0.6.0] - 2026-06-29
 
 ### Features

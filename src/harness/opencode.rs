@@ -287,11 +287,13 @@ mod tests {
                 route: "anthropic",
                 base_url: "https://api.example.com/anthropic".into(),
                 headers: vec![("x-condense-session-id".into(), "s".into())],
+                upstream: None,
             },
             Target {
                 route: "openai",
                 base_url: "https://api.example.com/openai".into(),
                 headers: vec![("x-condense-session-id".into(), "s".into())],
+                upstream: None,
             },
         ]
     }

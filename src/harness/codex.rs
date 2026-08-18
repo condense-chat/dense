@@ -117,6 +117,7 @@ mod tests {
                 "x-condense-auth-token".to_string(),
                 "secret-token".to_string(),
             )],
+            upstream: None,
         };
         let mut cmd = tokio::process::Command::new("codex");
         Codex { websocket: true }.apply(&mut cmd, &[target]);
@@ -153,6 +154,7 @@ mod tests {
             route: "openai",
             base_url: "https://api.condense.chat/openai".to_string(),
             headers: vec![],
+            upstream: None,
         };
         let mut cmd = tokio::process::Command::new("codex");
         Codex { websocket: false }.apply(&mut cmd, &[target]);

@@ -23,12 +23,22 @@ impl Tool for Claude {
             // Pin the auto-compact window to the full 1M. Read via parseInt, so
             // "1m" would parse to 1 — pass the literal token count. Overrides a
             // lower settings/experiment/model-default so we don't compact early.
-            .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000")
-            // Force Tool Search on so MCP tool defs stay deferred out of context
-            // (lazy-loaded via tool_reference) instead of loading eagerly every
-            // turn. Claude Code disables it behind a non-first-party base URL;
-            // condense forwards tool_reference blocks verbatim, so this is safe.
-            .env("ENABLE_TOOL_SEARCH", "true");
+            .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000");
+        // Tool Search (deferred MCP tool defs via tool_reference) is an
+        // Anthropic feature; behind an upstream override, respect how that
+        // provider already works. Off must be explicit: the first-party
+        // assert above makes Claude Code enable it by itself. A caller's
+        // own value wins.
+        if std::env::var_os("ENABLE_TOOL_SEARCH").is_none() {
+            cmd.env(
+                "ENABLE_TOOL_SEARCH",
+                if target.upstream.is_some() {
+                    "false"
+                } else {
+                    "true"
+                },
+            );
+        }
     }
 
     fn binary(&self) -> &str {
@@ -92,5 +102,32 @@ mod tests {
     fn merge_without_existing_is_just_ours() {
         let ours = vec![("x-condense-user-id".to_string(), "u".to_string())];
         assert_eq!(merge_headers(None, &ours), "x-condense-user-id: u");
+    }
+
+    #[test]
+    fn tool_search_follows_upstream_override() {
+        assert_eq!(tool_search_env(&target(None)), Some("true".to_string()));
+        assert_eq!(
+            tool_search_env(&target(Some("https://router.example"))),
+            Some("false".to_string())
+        );
+    }
+
+    fn target(upstream: Option<&str>) -> Target {
+        Target {
+            route: "anthropic",
+            base_url: "https://api.condense.chat/anthropic".to_string(),
+            headers: vec![],
+            upstream: upstream.map(str::to_string),
+        }
+    }
+
+    fn tool_search_env(target: &Target) -> Option<String> {
+        let mut cmd = tokio::process::Command::new("claude");
+        Claude.apply(&mut cmd, std::slice::from_ref(target));
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| *name == "ENABLE_TOOL_SEARCH")
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
     }
 }

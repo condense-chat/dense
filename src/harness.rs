@@ -41,6 +41,9 @@ pub struct Target {
     pub base_url: String,
     pub headers: Vec<(String, String)>,
     pub route: &'static str,
+    /// `$CONDENSE_UPSTREAM_URL` — set when the proxy forwards to a
+    /// non-default upstream (also sent as `x-condense-upstream-url`).
+    pub upstream: Option<String>,
 }
 
 /// Append the `/v1` API segment to a dialect base, tolerating a trailing slash.
@@ -68,6 +71,7 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
             route: d.route(),
             base_url: d.base_url(cfg),
             headers: headers.clone(),
+            upstream: cfg.upstream().map(str::to_string),
         })
         .collect();
 

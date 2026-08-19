@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.7.1] - 2026-08-19
+
+### Bug Fixes
+- Force Tool Search off behind an upstream override
+
 ## [0.7.0] - 2026-08-15
 
 ### Bug Fixes

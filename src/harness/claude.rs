@@ -16,14 +16,24 @@ impl Tool for Claude {
         let target = &targets[0];
         cmd.env("ANTHROPIC_BASE_URL", &target.base_url)
             .env("ANTHROPIC_CUSTOM_HEADERS", custom_headers(&target.headers))
-            // Claude Code disables the 1M context window when the base URL is
-            // not api.anthropic.com, silently falling back to 200K (compacts
-            // ~140K). Assert first-party so the 1M window stays on through us.
-            .env("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "1")
             // Pin the auto-compact window to the full 1M. Read via parseInt, so
             // "1m" would parse to 1 — pass the literal token count. Overrides a
             // lower settings/experiment/model-default so we don't compact early.
             .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000");
+        // Claude Code disables the 1M context window when the base URL is not
+        // api.anthropic.com, silently falling back to 200K (compacts ~140K).
+        // Assert first-party so the 1M window stays on through us — but only
+        // when we forward to Anthropic. Behind an upstream override the base
+        // URL genuinely is not first-party, and asserting it makes Claude Code
+        // prepend an `x-anthropic-billing-header:` system block whose `cch=`
+        // token is a per-request nonce: Anthropic's edge lifts it back out, a
+        // gateway reads it as prompt text that differs every turn, and the
+        // whole prefix cache is forfeit (measured 0% cache read on
+        // gpt-5.6-luna and grok via Requesty, restored to ~99.5% without it).
+        // That provider's own window governs there anyway.
+        if target.upstream.is_none() {
+            cmd.env("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "1");
+        }
         // Tool Search (deferred MCP tool defs via tool_reference) is an
         // Anthropic feature; behind an upstream override, respect how that
         // provider already works. Off must be explicit: the first-party
@@ -105,6 +115,21 @@ mod tests {
     }
 
     #[test]
+    fn first_party_assert_is_dropped_behind_an_upstream_override() {
+        const KEY: &str = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL";
+        assert_eq!(env_of(&target(None), KEY), Some("1".to_string()));
+        assert_eq!(env_of(&target(Some("https://router.example")), KEY), None);
+    }
+
+    #[test]
+    fn auto_compact_window_is_pinned_either_way() {
+        const KEY: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+        for t in [target(None), target(Some("https://router.example"))] {
+            assert_eq!(env_of(&t, KEY), Some("1000000".to_string()));
+        }
+    }
+
+    #[test]
     fn tool_search_follows_upstream_override() {
         assert_eq!(tool_search_env(&target(None)), Some("true".to_string()));
         assert_eq!(
@@ -122,12 +147,16 @@ mod tests {
         }
     }
 
-    fn tool_search_env(target: &Target) -> Option<String> {
+    fn env_of(target: &Target, name: &str) -> Option<String> {
         let mut cmd = tokio::process::Command::new("claude");
         Claude.apply(&mut cmd, std::slice::from_ref(target));
         cmd.as_std()
             .get_envs()
-            .find(|(name, _)| *name == "ENABLE_TOOL_SEARCH")
+            .find(|(key, _)| *key == name)
             .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn tool_search_env(target: &Target) -> Option<String> {
+        env_of(target, "ENABLE_TOOL_SEARCH")
     }
 }

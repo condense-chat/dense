@@ -20,35 +20,23 @@ impl Tool for Claude {
             // "1m" would parse to 1 — pass the literal token count. Overrides a
             // lower settings/experiment/model-default so we don't compact early.
             .env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000");
-        // Claude Code disables the 1M context window when the base URL is not
-        // api.anthropic.com, silently falling back to 200K (compacts ~140K).
-        // Assert first-party so the 1M window stays on through us — but only
-        // when we forward to Anthropic. Behind an upstream override the base
-        // URL genuinely is not first-party, and asserting it makes Claude Code
-        // prepend an `x-anthropic-billing-header:` system block whose `cch=`
-        // token is a per-request nonce: Anthropic's edge lifts it back out, a
-        // gateway reads it as prompt text that differs every turn, and the
-        // whole prefix cache is forfeit (measured 0% cache read on
-        // gpt-5.6-luna and grok via Requesty, restored to ~99.5% without it).
-        // That provider's own window governs there anyway.
-        if target.upstream.is_none() {
-            cmd.env("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "1");
-        }
-        // Tool Search (deferred MCP tool defs via tool_reference) is an
-        // Anthropic feature; behind an upstream override, respect how that
-        // provider already works. Off must be explicit: the first-party
-        // assert above makes Claude Code enable it by itself. A caller's
-        // own value wins.
-        if std::env::var_os("ENABLE_TOOL_SEARCH").is_none() {
-            cmd.env(
-                "ENABLE_TOOL_SEARCH",
-                if target.upstream.is_some() {
-                    "false"
-                } else {
-                    "true"
-                },
-            );
-        }
+        // Anthropic-only knobs, both keyed on the same fact. The first-party
+        // assert keeps the 1M window on (Claude Code silently drops to 200K off
+        // api.anthropic.com) but also makes it prepend an
+        // `x-anthropic-billing-header:` system block whose `cch=` is a
+        // per-request nonce: Anthropic's edge lifts it back out, a gateway reads
+        // it as prompt text and forfeits the whole prefix cache (0% cache read
+        // on gpt-5.6-luna and grok via Requesty, ~99.5% without it). Tool Search
+        // is likewise Anthropic-only, and off must be explicit since a
+        // first-party Claude Code turns it on by itself.
+        anthropic_only(
+            cmd,
+            target,
+            "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+            "1",
+            None,
+        );
+        anthropic_only(cmd, target, "ENABLE_TOOL_SEARCH", "true", Some("false"));
     }
 
     fn binary(&self) -> &str {
@@ -63,6 +51,29 @@ impl Tool for Claude {
 /// `dense claude` — Claude Code through the Anthropic proxy.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     harness::launch(cfg, Claude, args).await
+}
+
+/// An Anthropic-only knob: `on` when we forward to Anthropic itself, `off`
+/// behind an upstream override where that provider's own behaviour governs
+/// (`None` leaves it unset). A caller's own value always wins.
+fn anthropic_only(
+    cmd: &mut tokio::process::Command,
+    target: &Target,
+    key: &str,
+    on: &str,
+    off: Option<&str>,
+) {
+    if std::env::var_os(key).is_some() {
+        return;
+    }
+    let value = if target.upstream.is_some() {
+        off
+    } else {
+        Some(on)
+    };
+    if let Some(value) = value {
+        cmd.env(key, value);
+    }
 }
 
 fn custom_headers(headers: &[(String, String)]) -> String {

@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.7.2] - 2026-08-20
+
+### Bug Fixes
+- Don't assert first-party behind an upstream override
+
+### Refactor
+- One rule for the Anthropic-only knobs
+
 ## [0.7.1] - 2026-08-19
 
 ### Bug Fixes

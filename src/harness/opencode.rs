@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 
@@ -17,12 +17,29 @@ const OPENAI_NPM: &[&str] = &[
     "@ai-sdk/openai-compatible",
     "@openrouter/ai-sdk-provider",
 ];
-const THOUGHT_SIG_PLUGIN: &str = include_str!("../../assets/opencode/condense-thought-sig.js");
+/// Staged file name → source. Each does one thing: replay Gemini's
+/// thought_signature, and undo OpenCode's ChatGPT-OAuth URL rewrite.
+const PLUGINS: &[(&str, &str)] = &[
+    (
+        "condense-thought-sig.js",
+        include_str!("../../assets/opencode/condense-thought-sig.js"),
+    ),
+    (
+        "condense-codex-reroute.js",
+        include_str!("../../assets/opencode/condense-codex-reroute.js"),
+    ),
+];
 const UPSTREAM_HEADER: &str = "x-condense-upstream-url";
+/// Off for this child: on the websocket transport the provider never reaches
+/// `fetch`, so the reroute plugin cannot see the request and it leaves for
+/// ChatGPT unmetered.
+const DISABLE_WEBSOCKETS_ENV: &str = "OPENCODE_EXPERIMENTAL_WEBSOCKETS";
+/// Read by the reroute plugin, which sends OpenCode's ChatGPT-OAuth rewrite back here.
+const RESPONSES_URL_ENV: &str = "CONDENSE_OPENAI_RESPONSES_URL";
 
 pub struct OpenCode {
     catalog: Vec<Provider>,
-    plugin: Option<PathBuf>,
+    plugins: Vec<PathBuf>,
 }
 
 /// One provider OpenCode has credentials for, rewritten for condense: its id,
@@ -45,9 +62,13 @@ impl Tool for OpenCode {
     /// OpenCode takes provider config via `OPENCODE_CONFIG_CONTENT`, which
     /// merges last and so wins over its own config files.
     fn apply(&self, cmd: &mut tokio::process::Command, targets: &[Target]) {
+        cmd.env(DISABLE_WEBSOCKETS_ENV, "false");
+        if let Some(openai) = targets.iter().find(|t| t.route == Dialect::OpenAi.route()) {
+            cmd.env(RESPONSES_URL_ENV, responses_url(&openai.base_url));
+        }
         cmd.env(
             "OPENCODE_CONFIG_CONTENT",
-            build_config(targets, &self.catalog, self.plugin.as_deref()),
+            build_config(targets, &self.catalog, &self.plugins),
         );
     }
 
@@ -65,13 +86,10 @@ impl Tool for OpenCode {
 /// in the upstream-url header. Everything we set rides the child's environment,
 /// so an OpenCode launched any other way still goes straight to its vendor.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
-    let plugin = match stage_plugin(cfg) {
-        Ok(path) => Some(path),
-        Err(e) => {
-            eprintln!("  warning: could not stage thought_signature plugin: {e}");
-            None
-        }
-    };
+    let plugins = stage_plugins(cfg).unwrap_or_else(|e| {
+        eprintln!("  warning: could not stage OpenCode plugins: {e}");
+        Vec::new()
+    });
     let catalog = load_catalog();
     if catalog.is_empty() {
         eprintln!(
@@ -81,13 +99,13 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     } else {
         eprintln!("  routing {} providers through condense", catalog.len());
     }
-    harness::launch(cfg, OpenCode { catalog, plugin }, args).await
+    harness::launch(cfg, OpenCode { catalog, plugins }, args).await
 }
 
 /// The reroutable providers as an `OPENCODE_CONFIG_CONTENT` payload. Only
 /// `options` is set — npm, name, models and the api key stay whatever OpenCode
 /// already resolved, so the model picker looks exactly as it did.
-fn build_config(dialects: &[Target], catalog: &[Provider], plugin: Option<&Path>) -> String {
+fn build_config(dialects: &[Target], catalog: &[Provider], plugins: &[PathBuf]) -> String {
     let mut providers = Map::new();
     for provider in catalog {
         let Some(target) = dialects.iter().find(|t| t.route == provider.route) else {
@@ -106,17 +124,18 @@ fn build_config(dialects: &[Target], catalog: &[Provider], plugin: Option<&Path>
     }
     let mut cfg = Map::new();
     cfg.insert("provider".into(), Value::Object(providers));
-    if let Some(plugin) = plugin {
-        cfg.insert("plugin".into(), json!([plugin.to_string_lossy()]));
+    if !plugins.is_empty() {
+        let paths: Vec<String> = plugins.iter().map(|p| p.to_string_lossy().into()).collect();
+        cfg.insert("plugin".into(), json!(paths));
     }
     Value::Object(cfg).to_string()
 }
 
-/// Stage the replay plugin under dense's own data dir and hand back its path
-/// for the config payload, so only the OpenCode we launch loads it. Earlier
-/// releases dropped it in OpenCode's global plugin dir, where it ran on every
+/// Stage the plugins under dense's own data dir and hand back their paths
+/// for the config payload, so only the OpenCode we launch loads them. Earlier
+/// releases dropped one in OpenCode's global plugin dir, where it ran on every
 /// launch; clear that copy out.
-fn stage_plugin(cfg: &Config) -> Result<PathBuf> {
+fn stage_plugins(cfg: &Config) -> Result<Vec<PathBuf>> {
     if let Some(root) = cfg.config_dir().parent() {
         let _ = fs::remove_file(
             root.join("opencode")
@@ -125,12 +144,16 @@ fn stage_plugin(cfg: &Config) -> Result<PathBuf> {
         );
     }
     let dir = cfg.data_dir().join("opencode");
-    let file = dir.join("condense-thought-sig.js");
-    if fs::read_to_string(&file).ok().as_deref() != Some(THOUGHT_SIG_PLUGIN) {
-        fs::create_dir_all(&dir)?;
-        fs::write(&file, THOUGHT_SIG_PLUGIN)?;
+    fs::create_dir_all(&dir)?;
+    let mut staged = Vec::with_capacity(PLUGINS.len());
+    for (name, source) in PLUGINS {
+        let file = dir.join(name);
+        if fs::read_to_string(&file).ok().as_deref() != Some(*source) {
+            fs::write(&file, source)?;
+        }
+        staged.push(file);
     }
-    Ok(file)
+    Ok(staged)
 }
 
 /// Whether any of a provider's API-key env vars is set in our environment —
@@ -163,6 +186,10 @@ fn opencode_path(xdg: &str, fallback: &str, file: &str) -> Option<PathBuf> {
         _ => PathBuf::from(std::env::var("HOME").ok()?).join(fallback),
     };
     Some(base.join("opencode").join(file))
+}
+
+fn responses_url(base: &str) -> String {
+    format!("{}/responses", harness::with_v1(base))
 }
 
 fn provider_options(
@@ -362,16 +389,17 @@ mod tests {
     /// so an OpenCode started any other way is untouched.
     #[test]
     fn the_plugin_rides_the_launch_payload_not_opencodes_plugin_dir() {
-        let cfg: Value = serde_json::from_str(&build_config(
-            &targets(),
-            &[],
-            Some(Path::new("/d/opencode/condense-thought-sig.js")),
-        ))
-        .unwrap_or_default();
+        let staged: Vec<PathBuf> = PLUGINS
+            .iter()
+            .map(|(name, _)| PathBuf::from(format!("/d/opencode/{name}")))
+            .collect();
+        let cfg: Value =
+            serde_json::from_str(&build_config(&targets(), &[], &staged)).unwrap_or_default();
         assert_eq!(cfg["plugin"][0], "/d/opencode/condense-thought-sig.js");
+        assert_eq!(cfg["plugin"][1], "/d/opencode/condense-codex-reroute.js");
 
         let bare: Value =
-            serde_json::from_str(&build_config(&targets(), &[], None)).unwrap_or_default();
+            serde_json::from_str(&build_config(&targets(), &[], &[])).unwrap_or_default();
         assert!(bare["plugin"].is_null());
     }
 
@@ -383,7 +411,7 @@ mod tests {
             &map(r#"{"openrouter": {}, "anthropic": {}, "groq": {}}"#),
         );
         let cfg: Value =
-            serde_json::from_str(&build_config(&targets(), &picked, None)).unwrap_or_default();
+            serde_json::from_str(&build_config(&targets(), &picked, &[])).unwrap_or_default();
         let p = &cfg["provider"];
 
         assert_eq!(
@@ -411,6 +439,20 @@ mod tests {
         assert!(p["anthropic"]["options"]["headers"][UPSTREAM_HEADER].is_null());
 
         assert!(p["groq"].is_null());
+    }
+
+    #[test]
+    fn the_reroute_plugin_is_pointed_at_the_endpoint_opencode_rewrites_away() {
+        let picked = reroutable(&map(CATALOG), &Map::new(), &map(r#"{"openai": {}}"#));
+        let cfg: Value =
+            serde_json::from_str(&build_config(&targets(), &picked, &[])).unwrap_or_default();
+        let base = cfg["provider"]["openai"]["options"]["baseURL"].as_str();
+
+        assert_eq!(base, Some("https://api.example.com/openai/v1"));
+        assert_eq!(
+            responses_url(&targets()[1].base_url),
+            format!("{}/responses", base.unwrap()),
+        );
     }
 
     #[test]

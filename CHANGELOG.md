@@ -3,7 +3,12 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
-## [0.7.2] - 2026-08-20
+## [0.7.3] - 2026-08-31
+
+### Bug Fixes
+- Send the ChatGPT-OAuth rewrite back to condense
+
+## [0.7.2] - 2026-08-31
 
 ### Bug Fixes
 - Don't assert first-party behind an upstream override

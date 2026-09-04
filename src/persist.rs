@@ -27,7 +27,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "codex",
         available: true,
-        install_hint: "",
+        install_hint: "https://github.com/openai/codex",
     },
 ];
 
@@ -92,6 +92,11 @@ pub fn load_record(cfg: &Config) -> Record {
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Names of the tools dense can shim today.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    TOOLS.iter().filter(|s| s.available).map(|s| s.name)
 }
 
 pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()> {

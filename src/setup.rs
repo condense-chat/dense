@@ -78,8 +78,9 @@ fn path_warnings(cfg: &Config, tools: &[String], wiring: &env_file::PathWiring) 
 /// the installed ones pre-checked (`None` = cancelled); otherwise echo the
 /// installed set.
 fn pick_tools(cfg: &Config, interactive: bool) -> Option<Vec<String>> {
-    let question = "Route which tools through condense?";
-    let explain = "the bare command (e.g. `claude`) will point at the dense wrapper.";
+    let question = "Which tools should always go through condense?";
+    let explain = "\"persisting\" a tool makes its bare command (e.g. `claude`) route through \
+                   condense every time. Unchecked tools still work on demand via `dense <tool>`.";
     let installed: Vec<String> = persist::names()
         .filter(|name| tool::resolve_real(cfg, name).is_ok())
         .map(str::to_string)
@@ -109,6 +110,24 @@ fn pick_tools(cfg: &Config, interactive: bool) -> Option<Vec<String>> {
         prompt = prompt.item(name.to_string(), name, hint);
     }
     prompt.interact().ok()
+}
+
+/// What got persisted and how to flip it later.
+fn persist_summary(tools: &[String]) -> String {
+    let persist = ui::cyan("dense persist <tool>");
+    let unpersist = ui::cyan("dense unpersist <tool>");
+    if tools.is_empty() {
+        return format!(
+            "Nothing persisted — tools go through condense only when run as `{}`.\n\
+             Make one always-on later with `{persist}`.",
+            ui::cyan("dense <tool>")
+        );
+    }
+    format!(
+        "Persisted: {} — the bare command now always goes through condense.\n\
+         Add more with `{persist}`; go back to on-demand with `{unpersist}`.",
+        ui::bold(&tools.join(", "))
+    )
 }
 
 fn start_hint(tools: &[String]) -> String {
@@ -170,16 +189,12 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
         warn(interactive, &warning);
     }
 
-    let later = format!(
-        "Change this anytime: `{}` / `{}`.",
-        ui::cyan("dense persist <tool>"),
-        ui::cyan("dense unpersist <tool>")
-    );
+    let later = persist_summary(&tools);
     if interactive {
-        let _ = cliclack::log::remark(ui::dim(&later));
+        let _ = cliclack::log::info(&later);
         let _ = cliclack::outro(start_hint(&tools));
     } else {
-        println!("\n{}\n{}", ui::dim(&later), start_hint(&tools));
+        println!("\n{later}\n{}", start_hint(&tools));
     }
     Ok(())
 }

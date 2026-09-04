@@ -1,5 +1,5 @@
 //! `dense setup` — the first-run wizard the installer hands off to. Asks
-//! whether to route claude through condense and whether to wire PATH, then
+//! which tools to route through condense and whether to wire PATH, then
 //! tells the user how to start. Run via `curl … | sh`, the installer
 //! reconnects stdin to the tty so the prompts work; with no tty it explains
 //! and uses defaults.
@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::{Result, env_file, persist, ui};
+use crate::{Result, env_file, persist, tool, ui};
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
@@ -55,7 +55,7 @@ fn on_path(dir: &Path) -> bool {
 /// Warnings for dirs that aren't visible to this shell yet. A restart only
 /// helps once the profile wiring exists; otherwise point at the immediate
 /// activation instead.
-fn path_warnings(cfg: &Config, persisted: bool, wiring: &env_file::PathWiring) -> Vec<String> {
+fn path_warnings(cfg: &Config, tools: &[String], wiring: &env_file::PathWiring) -> Vec<String> {
     let hint = match wiring {
         env_file::PathWiring::Wired => env_file::reload_hint(cfg),
         env_file::PathWiring::Manual(_) | env_file::PathWiring::Skipped => {
@@ -68,14 +68,51 @@ fn path_warnings(cfg: &Config, persisted: bool, wiring: &env_file::PathWiring) -
             "{} isn't on your PATH yet; {hint}.",
             cfg.bin_dir().display()
         ));
-    } else if persisted && !on_path(&cfg.shim_dir()) {
-        out.push(format!("{hint} so `claude` routes through dense."));
+    } else if let Some(first) = tools.first().filter(|_| !on_path(&cfg.shim_dir())) {
+        out.push(format!("{hint} so `{first}` routes through dense."));
     }
     out
 }
 
-fn start_hint(persisted: bool) -> String {
-    let start = if persisted { "claude" } else { "dense claude" };
+/// Pick which supported tools get a shim. Interactive: a multiselect with
+/// the installed ones pre-checked (`None` = cancelled); otherwise echo the
+/// installed set.
+fn pick_tools(cfg: &Config, interactive: bool) -> Option<Vec<String>> {
+    let question = "Route which tools through condense?";
+    let explain = "the bare command (e.g. `claude`) will point at the dense wrapper.";
+    let installed: Vec<String> = persist::names()
+        .filter(|name| tool::resolve_real(cfg, name).is_ok())
+        .map(str::to_string)
+        .collect();
+    if !interactive {
+        let default = if installed.is_empty() {
+            "none".to_string()
+        } else {
+            installed.join(", ")
+        };
+        println!("{question}");
+        println!("{}", ui::dim(explain));
+        println!("{}", ui::dim(&format!("[no tty — default: {default}]")));
+        println!();
+        return Some(installed);
+    }
+    let _ = cliclack::log::remark(ui::dim(explain));
+    let mut prompt = cliclack::multiselect(question)
+        .initial_values(installed.clone())
+        .required(false);
+    for name in persist::names() {
+        let hint = if installed.iter().any(|i| i == name) {
+            "installed"
+        } else {
+            "not installed"
+        };
+        prompt = prompt.item(name.to_string(), name, hint);
+    }
+    prompt.interact().ok()
+}
+
+fn start_hint(tools: &[String]) -> String {
+    let start = tools.first().map_or("dense claude", String::as_str);
     format!(
         "Run `{}` to start saving, or `{}` for help.",
         ui::cyan(start),
@@ -106,12 +143,7 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
         println!("{}\n", ui::dim(&note));
     }
 
-    let Some(do_persist) = ask(
-        interactive,
-        "Use condense for all claude sessions?",
-        "the bare `claude` command will point at the dense claude wrapper.",
-        true,
-    ) else {
+    let Some(tools) = pick_tools(cfg, interactive) else {
         return cancelled(interactive);
     };
 
@@ -128,20 +160,26 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
     if let env_file::PathWiring::Manual(notes) = &wiring {
         warn(interactive, &notes.join("\n"));
     }
-    if do_persist {
-        let report = persist::install_shims(cfg, &["claude".to_string()])?;
+    if !tools.is_empty() {
+        let report = persist::install_shims(cfg, &tools)?;
         for warning in &report.warnings {
             warn(interactive, warning);
         }
     }
-    for warning in path_warnings(cfg, do_persist, &wiring) {
+    for warning in path_warnings(cfg, &tools, &wiring) {
         warn(interactive, &warning);
     }
 
+    let later = format!(
+        "Change this anytime: `{}` / `{}`.",
+        ui::cyan("dense persist <tool>"),
+        ui::cyan("dense unpersist <tool>")
+    );
     if interactive {
-        let _ = cliclack::outro(start_hint(do_persist));
+        let _ = cliclack::log::remark(ui::dim(&later));
+        let _ = cliclack::outro(start_hint(&tools));
     } else {
-        println!("\n{}", start_hint(do_persist));
+        println!("\n{}\n{}", ui::dim(&later), start_hint(&tools));
     }
     Ok(())
 }

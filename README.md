@@ -18,8 +18,10 @@ irm https://cli.condense.chat/nt | iex                # Windows (PowerShell)
 ```
 
 The installer drops the `dense` binary on your PATH and hands off to
-`dense setup`, which offers to route the bare `claude` command through dense —
-so you keep typing `claude` and it just goes through condense.
+`dense setup`, which asks which of the supported tools (`claude`, `opencode`,
+`codex`) to route through dense — so you keep typing `claude` and it just goes
+through condense. Change the choice later with `dense persist <tool>` /
+`dense unpersist <tool>`.
 
 Both install scripts are vendored in [`install/`](install/) — real, runnable
 scripts pointing at prod, byte-identical to what `https://cli.condense.chat`

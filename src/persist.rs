@@ -94,6 +94,11 @@ pub fn load_record(cfg: &Config) -> Record {
         .unwrap_or_default()
 }
 
+/// Names of the tools dense can shim today.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    TOOLS.iter().filter(|s| s.available).map(|s| s.name)
+}
+
 pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()> {
     let wiring = env_file::ensure_env(cfg, modify_path)?;
     let report = install_shims(cfg, targets)?;

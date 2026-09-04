@@ -27,7 +27,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "codex",
         available: true,
-        install_hint: "",
+        install_hint: "https://github.com/openai/codex",
     },
 ];
 

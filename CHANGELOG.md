@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.8.1] - 2026-09-16
+
+### Bug Fixes
+- Lead the login note with the code, link as fallback
+
 ## [0.8.0] - 2026-09-16
 
 ### Features

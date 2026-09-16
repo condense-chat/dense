@@ -165,14 +165,31 @@ async fn device_flow_inner(cfg: &Config) -> Result<()> {
     let scheme = hosts::default_scheme_for(&cfg.api_host);
     let login_base = hosts::sibling(&cfg.api_host, "login", scheme);
     let link = format!("{login_base}/cli?code={}", start.user_code);
+    // With auto-open off (the onboarding page sets CONDENSE_NO_OPEN) the page
+    // the user is already on takes the code; the link is only a fallback.
+    let (title, fallback) = if cfg.open_links() {
+        (
+            "Approve this terminal in the browser tab that just opened",
+            format!("didn't open? {link}"),
+        )
+    } else {
+        (
+            "Enter this code on the condense setup page to authorize this terminal",
+            format!("lost the page? open {link}"),
+        )
+    };
     let _ = cliclack::note(
-        "Open this URL in your browser to authorize this terminal",
-        format!("{link}\n\nCode: {}", start.user_code),
+        title,
+        format!(
+            "Code: {}\n\n{}",
+            ui::bold(&start.user_code),
+            ui::dim(&fallback)
+        ),
     );
     maybe_open(cfg, &link);
 
     let spinner = cliclack::spinner();
-    spinner.start("waiting for browser authorization...");
+    spinner.start("waiting for authorization...");
     let result = poll_device(cfg, &api, &start).await;
     match &result {
         Ok(()) => spinner.stop("authorized."),

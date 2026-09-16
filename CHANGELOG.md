@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.8.0] - 2026-09-16
+
+### Features
+- Sign in first and ask which agent to route- Multiselect which tools to route through condense
+
+### Miscellaneous
+- Bump rustls to 0.23.45 for RUSTSEC-2026-0285
+
 ## [0.7.3] - 2026-08-31
 
 ### Bug Fixes

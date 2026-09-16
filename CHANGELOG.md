@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.8.2] - 2026-09-16
+
+### Bug Fixes
+- Spell out the keys on every prompt
+
 ## [0.8.1] - 2026-09-16
 
 ### Bug Fixes

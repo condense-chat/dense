@@ -80,6 +80,15 @@ pub enum Command {
         #[arg(long, value_name = "ZONE_OR_URL")]
         url: Option<String>,
     },
+    /// Fetch an original tool call/result by a recovery id from a condensed summary.
+    Recover {
+        /// The id: c:/r:/pack: prefixed or a bare hex prefix (8-64 chars).
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Pin the returned copy so it stays in context for the session.
+        #[arg(long)]
+        critical: bool,
+    },
     /// Manage the dense binary itself.
     #[command(subcommand, name = "self")]
     SelfCmd(SelfCommand),

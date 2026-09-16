@@ -36,7 +36,9 @@ fn ask(interactive: bool, question: &str, explain: &str, default_yes: bool) -> O
         println!();
         return Some(default_yes);
     }
-    let _ = cliclack::log::remark(ui::dim(explain));
+    let _ = cliclack::log::remark(ui::dim(&format!(
+        "{explain}\ny / n · enter keeps the default"
+    )));
     cliclack::confirm(question)
         .initial_value(default_yes)
         .interact()
@@ -102,7 +104,9 @@ fn pick_tools(cfg: &Config, interactive: bool) -> Option<Vec<String>> {
         println!();
         return Some(installed);
     }
-    let _ = cliclack::log::remark(ui::dim(explain));
+    let _ = cliclack::log::remark(ui::dim(&format!(
+        "{explain}\n↑↓ move · space toggles · enter confirms"
+    )));
     let mut prompt = cliclack::multiselect(question)
         .initial_values(installed.clone())
         .required(false);

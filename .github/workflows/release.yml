@@ -98,6 +98,15 @@ jobs:
         env:
           OUTPUT: NOTES.md
       - uses: softprops/action-gh-release@v2
+        id: publish
+        continue-on-error: true
+        with:
+          body_path: ${{ steps.notes.outputs.changelog }}
+          files: dist/*
+          fail_on_unmatched_files: true
+      - name: Retry the upload GitHub failed on its own side
+        if: steps.publish.outcome == 'failure'
+        uses: softprops/action-gh-release@v2
         with:
           body_path: ${{ steps.notes.outputs.changelog }}
           files: dist/*

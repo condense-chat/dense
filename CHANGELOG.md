@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.9.0] - 2026-09-17
+
+### Bug Fixes
+- Keep shipped assets LF on windows checkouts
+
+### Features
+- Report account, savings, and session context- /dense:info in every harness, scoped to the run
+
 ## [0.8.2] - 2026-09-16
 
 ### Bug Fixes

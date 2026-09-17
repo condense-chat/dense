@@ -6,6 +6,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod commands;
 pub mod opencode;
 
 use std::path::Path;

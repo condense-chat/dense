@@ -33,6 +33,8 @@ rewritten to their own zone.)
 ```
 dense login                  authenticate this machine
 dense claude <args>          run Claude Code through the proxy (args pass through)
+dense codex <args>           run Codex through the proxy
+dense opencode <args>        run OpenCode through the proxy
 dense persist [tools...]     shim the named tools (no args: all) so the bare
                              `claude` routes through dense; non-destructive
 dense unpersist [tools...]   remove the shims
@@ -49,7 +51,15 @@ dense self update            update the binary in place
 dense self uninstall         remove dense, its shims, and PATH wiring
 ```
 
-`dense codex` is reserved — it prints a coming-soon notice for now.
+Inside a `dense`-launched tool, `/dense:info` runs `dense info` for the
+current session and renders the result in place. It is scoped to that
+process: Claude Code loads it from a plugin dir under dense's data dir,
+OpenCode gets it inline in its config, and Codex gets a plugin dense stages
+in its cache and enables for that one run. Codex releases old enough to still
+read `$CODEX_HOME/prompts/` also get `/prompts:dense` from a file dense
+writes there only when nothing else owns it. Everything dense wrote outside
+its own data dir goes on `dense self uninstall`; your own commands, skills,
+and plugins are never touched.
 
 ## Zero data retention
 

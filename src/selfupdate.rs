@@ -28,6 +28,7 @@ pub fn uninstall(cfg: &Config) -> Result<()> {
         let _ = std::fs::remove_file(persist::shim_path(cfg, name));
     }
     env_file::unwire(cfg)?;
+    crate::harness::commands::cleanup(cfg);
     let _ = std::fs::remove_dir_all(cfg.data_dir());
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(&exe);

@@ -33,7 +33,7 @@ fn help_smoke() {
     let out = dense().arg("--help").output().expect("run");
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["claude", "login", "persist", "doctor"] {
+    for cmd in ["claude", "login", "persist", "doctor", "info"] {
         assert!(help.contains(cmd), "help should mention `{cmd}`");
     }
 }
@@ -70,4 +70,55 @@ fn unknown_env_profile_refuses_to_guess() {
         .expect("run");
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown profile"));
+}
+
+#[cfg(unix)]
+#[test]
+fn info_without_creds_fails_before_needing_a_session() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let out = dense()
+        .env("HOME", home.path())
+        .env_remove("CONDENSE_SESSION_ID")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("CONDENSE_URL")
+        .arg("info")
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not logged in"), "got: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn info_with_session_without_creds_fails() {
+    const SID: &str = "6f1d2c3b-4a5e-4f60-8b7c-9d0e1f2a3b4c";
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let out = dense()
+        .env("HOME", home.path())
+        .env_remove("CONDENSE_SESSION_ID")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("CONDENSE_URL")
+        .args(["info", SID])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not logged in"), "got: {err}");
+
+    let out = dense()
+        .env("HOME", home.path())
+        .env("CONDENSE_SESSION_ID", SID)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("CONDENSE_URL")
+        .args(["info", "--json"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not logged in"), "got: {err}");
 }

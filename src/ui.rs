@@ -3,6 +3,14 @@
 
 use owo_colors::{OwoColorize, Stream};
 
+// Landing palette: --cta, --ok, --accent.
+pub fn blue(s: &str) -> String {
+    format!(
+        "{}",
+        s.if_supports_color(Stream::Stdout, |t| t.truecolor(0x2f, 0x6f, 0xeb))
+    )
+}
+
 pub fn bold(s: &str) -> String {
     format!("{}", s.if_supports_color(Stream::Stdout, |t| t.bold()))
 }
@@ -19,7 +27,17 @@ pub fn dim(s: &str) -> String {
 }
 
 pub fn green(s: &str) -> String {
-    format!("{}", s.if_supports_color(Stream::Stdout, |t| t.green()))
+    format!(
+        "{}",
+        s.if_supports_color(Stream::Stdout, |t| t.truecolor(0x1b, 0x8a, 0x3a))
+    )
+}
+
+pub fn orange(s: &str) -> String {
+    format!(
+        "{}",
+        s.if_supports_color(Stream::Stdout, |t| t.truecolor(0xe8, 0x87, 0x3a))
+    )
 }
 
 pub fn red(s: &str) -> String {

@@ -9,6 +9,7 @@ mod env_file;
 mod error;
 mod harness;
 mod hosts;
+mod info;
 mod migrate;
 mod persist;
 mod profile;
@@ -81,6 +82,19 @@ async fn main() -> EyreResult<()> {
         }
         Command::SelfCmd(SelfCommand::Update) => selfupdate::update(&cfg).await,
         Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg),
+        Command::Info {
+            bar,
+            json,
+            matrix,
+            session,
+        } => {
+            let layout = match (bar, matrix) {
+                (true, _) => Some(info::Style::Bar),
+                (_, true) => Some(info::Style::Matrix),
+                _ => None,
+            };
+            info::run(&cfg, json, layout, session.as_deref()).await
+        }
     };
     result.map_err(Into::into)
 }

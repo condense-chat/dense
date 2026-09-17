@@ -40,6 +40,8 @@ pub struct Config {
     /// Release-asset base — `$CONDENSE_RELEASE_URL` if set, else the
     /// profile's declared value (`None` = the baked GitHub default).
     release_url: Option<String>,
+    /// `$CONDENSE_SESSION_ID` — the live session `dense <tool>` exports to its child.
+    session_id: Option<String>,
     /// `$CONDENSE_UPSTREAM_URL` — routes the proxy to a non-default upstream.
     upstream: Option<String>,
 }
@@ -98,8 +100,6 @@ impl Config {
         self.data_dir.join("env")
     }
 
-    /// Only unix callers need the raw home dir (shell-profile paths); on
-    /// Windows it would be dead code.
     #[cfg(not(windows))]
     pub fn home(&self) -> &Path {
         &self.home
@@ -184,6 +184,7 @@ impl Config {
             profile_name: profile.name,
             profile_url: env_value("DENSE_PROFILE_URL"),
             release_url: env_value("CONDENSE_RELEASE_URL").or(profile.release_url),
+            session_id: env_value(crate::harness::SESSION_ENV),
             upstream: env_value("CONDENSE_UPSTREAM_URL"),
         })
     }
@@ -194,6 +195,11 @@ impl Config {
         std::fs::create_dir_all(&dir).ctx("creating profile dir")?;
         let body = toml::to_string_pretty(p).ctx("serializing profile")?;
         std::fs::write(dir.join("profile.toml"), body).ctx("writing profile.toml")
+    }
+
+    /// `$CONDENSE_SESSION_ID` — set for the child of `dense <tool>`.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Render `path` for a POSIX shell, using `$HOME` when it lives under the

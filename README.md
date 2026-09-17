@@ -36,6 +36,12 @@ dense claude <args>          run Claude Code through the proxy (args pass throug
 dense persist [tools...]     shim the named tools (no args: all) so the bare
                              `claude` routes through dense; non-destructive
 dense unpersist [tools...]   remove the shims
+dense info [--bar|--matrix|--json] [SESSION]
+                             account + lifetime savings; with a session id
+                             (or inside a dense-launched tool) also that
+                             session's context sizes and spend.
+                             --matrix is the coloured glyph grid (terminal
+                             default), --bar the emoji bars (piped default)
 dense status                 current login + endpoint
 dense doctor                 verify the install is wired correctly
 dense setup                  first-run wizard (the installer hands off to this)

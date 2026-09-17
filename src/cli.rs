@@ -46,6 +46,21 @@ pub enum Command {
     },
     /// Verify the install is wired correctly.
     Doctor,
+    /// Account, lifetime savings, and — given a session — that session's context and spend.
+    Info {
+        /// Emoji bars (default when piped, e.g. from a slash command).
+        #[arg(long, conflicts_with_all = ["json", "matrix"])]
+        bar: bool,
+        /// Print JSON instead of the summary.
+        #[arg(long)]
+        json: bool,
+        /// Glyph grid like Claude Code's /context (default on a terminal).
+        #[arg(long, conflicts_with = "json")]
+        matrix: bool,
+        /// Defaults to $CONDENSE_SESSION_ID, which `dense <tool>` sets for its child.
+        #[arg(value_name = "SESSION_ID")]
+        session: Option<String>,
+    },
     /// Authenticate this machine (device-flow or register).
     Login,
     /// Clear stored credentials.

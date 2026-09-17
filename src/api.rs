@@ -70,6 +70,16 @@ impl Api {
             .ctx(format!("{path} returned malformed JSON"))
     }
 
+    /// GET returning the raw response — for callers that read the body of a
+    /// non-2xx reply (the server's `detail`).
+    pub async fn get_response(&self, path: &str) -> Result<reqwest::Response> {
+        self.client
+            .get(self.url(path)?)
+            .send()
+            .await
+            .ctx(format!("GET {path}"))
+    }
+
     /// POST and ignore the outcome entirely — for fire-and-forget signals
     /// (heartbeats) that must never disturb the caller.
     pub async fn post_forget(&self, path: &str, body: &impl Serialize) {

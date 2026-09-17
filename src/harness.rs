@@ -19,6 +19,8 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::{Result, hosts, tool};
 
+pub const SESSION_ENV: &str = "CONDENSE_SESSION_ID";
+
 /// An agent CLI routed through condense. A tool declares which dialects it
 /// wires — one (Claude/Codex) or several (OpenCode) — and configures the child
 /// command from the resolved [`Target`]s.
@@ -77,6 +79,9 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
 
     let mut cmd = tokio::process::Command::new(&bin);
     tool.apply(&mut cmd, &targets);
+    cmd.env(SESSION_ENV, &session.id);
+    // The child's `dense usage` must land on the same api as this session.
+    cmd.env("CONDENSE_URL", &cfg.api_base_url);
     cmd.args(args);
 
     spawn_and_wait(&api, &session, &bin, cmd).await

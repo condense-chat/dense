@@ -3,9 +3,14 @@
 use crate::Result;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
+use crate::harness::commands;
 use crate::harness::{self, Target, Tool};
 
-pub struct Claude;
+pub struct Claude {
+    /// Plugin dir carrying `/dense`; `None` when staging failed and the
+    /// launch should proceed without the command.
+    plugin_dir: Option<std::path::PathBuf>,
+}
 
 impl Tool for Claude {
     fn dialects(&self) -> &'static [Dialect] {
@@ -37,6 +42,11 @@ impl Tool for Claude {
             None,
         );
         anthropic_only(cmd, target, "ENABLE_TOOL_SEARCH", "true", Some("false"));
+        // Session-scoped: loads in place for this process only, never
+        // recorded in settings or the plugin cache.
+        if let Some(dir) = &self.plugin_dir {
+            cmd.arg("--plugin-dir").arg(dir);
+        }
     }
 
     fn binary(&self) -> &str {
@@ -50,7 +60,11 @@ impl Tool for Claude {
 
 /// `dense claude` — Claude Code through the Anthropic proxy.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
-    harness::launch(cfg, Claude, args).await
+    commands::sweep_legacy(cfg);
+    let plugin_dir = commands::claude_plugin_dir(cfg)
+        .map_err(|e| eprintln!("  warning: could not stage the /dense command: {e}"))
+        .ok();
+    harness::launch(cfg, Claude { plugin_dir }, args).await
 }
 
 /// An Anthropic-only knob: `on` when we forward to Anthropic itself, `off`
@@ -160,7 +174,7 @@ mod tests {
 
     fn env_of(target: &Target, name: &str) -> Option<String> {
         let mut cmd = tokio::process::Command::new("claude");
-        Claude.apply(&mut cmd, std::slice::from_ref(target));
+        Claude { plugin_dir: None }.apply(&mut cmd, std::slice::from_ref(target));
         cmd.as_std()
             .get_envs()
             .find(|(key, _)| *key == name)
@@ -169,5 +183,33 @@ mod tests {
 
     fn tool_search_env(target: &Target) -> Option<String> {
         env_of(target, "ENABLE_TOOL_SEARCH")
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_dir_rides_the_argv_ahead_of_user_args() {
+        let mut cmd = tokio::process::Command::new("claude");
+        let claude = Claude {
+            plugin_dir: Some(std::path::PathBuf::from("/d/harness/claude")),
+        };
+        claude.apply(
+            &mut cmd,
+            &[Target {
+                route: "anthropic",
+                base_url: "https://api.condense.chat/anthropic".to_string(),
+                headers: vec![],
+                upstream: None,
+            }],
+        );
+        let argv: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, ["--plugin-dir", "/d/harness/claude"]);
     }
 }

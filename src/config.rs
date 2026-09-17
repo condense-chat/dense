@@ -100,7 +100,6 @@ impl Config {
         self.data_dir.join("env")
     }
 
-    #[cfg(not(windows))]
     pub fn home(&self) -> &Path {
         &self.home
     }

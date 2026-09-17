@@ -3,6 +3,7 @@
 use crate::Result;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
+use crate::harness::commands;
 use crate::harness::{self, Target, Tool};
 
 // Dense-owned provider id, distinct from a hand-authored `[model_providers.condense]`:
@@ -57,6 +58,7 @@ impl Tool for Codex {
         for o in overrides {
             cmd.arg("-c").arg(o);
         }
+        cmd.arg("-c").arg(commands::codex_plugin_override());
     }
 
     fn binary(&self) -> &str {
@@ -70,6 +72,9 @@ impl Tool for Codex {
 
 /// `dense codex` — Codex through the OpenAI Responses proxy.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
+    commands::sweep_legacy(cfg);
+    commands::stage_codex_plugin(cfg);
+    commands::stage_codex_prompt(cfg);
     harness::launch(
         cfg,
         Codex {

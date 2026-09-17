@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 use crate::Result;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
+use crate::harness::commands;
 use crate::harness::{self, Target, Tool};
 
 const ANTHROPIC_NPM: &[&str] = &["@ai-sdk/anthropic"];
@@ -86,6 +87,7 @@ impl Tool for OpenCode {
 /// in the upstream-url header. Everything we set rides the child's environment,
 /// so an OpenCode launched any other way still goes straight to its vendor.
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
+    commands::sweep_legacy(cfg);
     let plugins = stage_plugins(cfg).unwrap_or_else(|e| {
         eprintln!("  warning: could not stage OpenCode plugins: {e}");
         Vec::new()
@@ -124,6 +126,8 @@ fn build_config(dialects: &[Target], catalog: &[Provider], plugins: &[PathBuf]) 
     }
     let mut cfg = Map::new();
     cfg.insert("provider".into(), Value::Object(providers));
+    // Inline command: scoped to this process, no file under the user's config.
+    cfg.insert("command".into(), commands::opencode_command());
     if !plugins.is_empty() {
         let paths: Vec<String> = plugins.iter().map(|p| p.to_string_lossy().into()).collect();
         cfg.insert("plugin".into(), json!(paths));
@@ -401,6 +405,19 @@ mod tests {
         let bare: Value =
             serde_json::from_str(&build_config(&targets(), &[], &[])).unwrap_or_default();
         assert!(bare["plugin"].is_null());
+    }
+
+    #[test]
+    fn inline_dense_command_sits_directly_under_command() {
+        let cfg: Value =
+            serde_json::from_str(&build_config(&targets(), &[], &[])).unwrap_or_default();
+        assert!(
+            cfg["command"]["dense:info"]["template"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("!`dense info"))
+        );
+        assert!(cfg["command"]["dense:info"]["dense"].is_null());
+        assert!(cfg["command"]["dense"].is_null());
     }
 
     #[test]

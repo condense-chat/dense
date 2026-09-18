@@ -109,6 +109,9 @@ pub enum Command {
     },
     /// Subscription limits used, with condense vs without it.
     Usage {
+        /// Exclude untagged Claude-harness usage from the estimate.
+        #[arg(long)]
+        attributed_only: bool,
         /// Print JSON instead of the summary.
         #[arg(long)]
         json: bool,

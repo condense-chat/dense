@@ -85,22 +85,22 @@ pub async fn run(cfg: &Config, sub: &str, json: bool, attributed_only: bool) -> 
             serde_json::to_string_pretty(&out).ctx("rendering usage JSON")?
         );
     } else {
-        print!("{}", summary(&rows));
+        print!("{}", summary(&rows, terminal_width()));
     }
     Ok(())
 }
 
-fn bar(used: f64, without: f64) -> String {
+fn bar(used: f64, without: f64, width: usize) -> String {
     let whole = without.max(used).max(100.0);
     let bp = |p: f64| (p / whole * 10_000.0).round().clamp(0.0, 10_000.0) as i64;
     let saved = (without - used).max(0.0);
-    let cells = info::allocate(&[bp(used), bp(saved)], 10_000, BAR);
+    let cells = info::allocate(&[bp(used), bp(saved)], 10_000, width);
     let n = |i: usize| cells.get(i).map_or(0, |c| c.0);
     format!(
         "{}{}{}",
         MOON_SPENT.repeat(n(0)),
         MOON_WOULD.repeat(n(1)),
-        MOON_SAVED.repeat(BAR.saturating_sub(n(0) + n(1)))
+        MOON_SAVED.repeat(width.saturating_sub(n(0) + n(1)))
     )
 }
 
@@ -198,54 +198,83 @@ fn row(w: &Window, got: &Value, inferred: &Value) -> Value {
     })
 }
 
-fn summary(rows: &[Value]) -> String {
+fn summary(rows: &[Value], width: usize) -> String {
     if rows.is_empty() {
-        return "no active plan limits on this claude.ai login\n".into();
+        return format!("{}\n", wrapped("No active Claude limits", width, ""));
     }
     let num = |r: &Value, k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let indent = if width >= 4 { "  " } else { "" };
+    let available = width.saturating_sub(indent.len());
     let mut out = String::new();
     for r in rows {
-        let used = num(r, "utilization");
-        let Some(without) = r.get("without").and_then(Value::as_f64) else {
+        let title = text(r, "title")
+            .replace("Current session", "Session")
+            .replace("Current week", "Week")
+            .replace(" (all models)", "")
+            .replace(" only)", ")");
+        let reset = format!("resets {}", resets(&text(r, "resets_at")));
+        if console::measure_text_width(&title) + console::measure_text_width(&reset) + 2 <= width {
+            out.push_str(&format!("{}  {}\n", ui::bold(&title), ui::dim(&reset)));
+        } else {
             out.push_str(&format!(
-                "{}  {}\n  with condense {used:.0}% · savings estimate unavailable (no matching spend)\n\n",
-                ui::bold(&text(r, "title")),
-                ui::dim(&format!("resets {}", resets(&text(r, "resets_at")))),
-            ));
-            continue;
-        };
-        out.push_str(&format!(
-            "{}  {}\n  {}  with condense {used:.0}% · estimated without {without:.0}% · saved {:.0} pts\n  estimated {:.2}× usage ({:.0}% more)\n  {}\n",
-            ui::bold(&text(r, "title")),
-            ui::dim(&format!("resets {}", resets(&text(r, "resets_at")))),
-            bar(used, without),
-            without - used,
-            num(r, "usage_multiplier"),
-            (num(r, "usage_multiplier") - 1.0) * 100.0,
-            ui::dim(&format!(
-                "reconciled {}/{} requests · pre ${} → sent ${} · raw ${} · output ${}",
-                num(r, "reconciled_requests"),
-                num(r, "requests"),
-                info::dollars(r.get("pre_usd")),
-                info::dollars(r.get("sent_usd")),
-                info::dollars(r.get("raw_usd")),
-                info::dollars(r.get("output_usd")),
-            )),
-        ));
-        if num(r, "inferred_requests") > 0.0 {
-            out.push_str(&format!(
-                "  includes {} untagged Claude-harness requests; may include API-key traffic\n",
-                num(r, "inferred_requests"),
+                "{}\n{}\n",
+                ui::bold(&wrapped(&title, width, "")),
+                ui::dim(&wrapped(&reset, width, indent)),
             ));
         }
-        out.push('\n');
+        let used = num(r, "utilization");
+        if let Some(without) = r.get("without").and_then(Value::as_f64) {
+            let comparison = format!("{used:.0}% with dense · {without:.0}% without (est.)");
+            let cells = available.saturating_sub(console::measure_text_width(&comparison) + 2)
+                / console::measure_text_width(MOON_SPENT);
+            if cells >= 4 {
+                out.push_str(&format!(
+                    "{indent}{}  {comparison}\n",
+                    bar(used, without, cells.min(BAR))
+                ));
+            } else {
+                let cells = (available / console::measure_text_width(MOON_SPENT)).min(BAR);
+                if cells > 0 {
+                    out.push_str(&format!("{indent}{}\n", bar(used, without, cells)));
+                }
+                out.push_str(&wrapped(&comparison, width, indent));
+                out.push('\n');
+            }
+            out.push_str(&wrapped(
+                &format!(
+                    "Estimated gain: {:.2}× ({:+.0}%)",
+                    num(r, "usage_multiplier"),
+                    (num(r, "usage_multiplier") - 1.0) * 100.0,
+                ),
+                width,
+                indent,
+            ));
+        } else {
+            out.push_str(&wrapped(
+                &format!("{used:.0}% used · estimate unavailable"),
+                width,
+                indent,
+            ));
+        }
+        out.push_str("\n\n");
     }
-    out.push_str(&ui::dim(
-        "note: traffic on this login outside dense is scaled by the same ratio.",
-    ));
-    out.push('\n');
     out
+}
+
+fn terminal_width() -> usize {
+    console::Term::stdout()
+        .size_checked()
+        .map(|(_, cols)| usize::from(cols))
+        .filter(|&cols| cols > 0)
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()?
+                .parse::<usize>()
+                .ok()
+                .filter(|&cols| cols > 0)
+        })
+        .unwrap_or(80)
 }
 
 fn usage_url(base: &str, w: &Window, inferred: bool) -> Result<reqwest::Url> {
@@ -332,6 +361,15 @@ fn windows(plan: &Value) -> Vec<Window> {
     out
 }
 
+fn wrapped(text: &str, width: usize, indent: &str) -> String {
+    textwrap::fill(
+        text,
+        textwrap::Options::new(width.max(1))
+            .initial_indent(indent)
+            .subsequent_indent(indent),
+    )
+}
+
 /// Plan % the same traffic would have used uncompressed: the reconciled part
 /// scales by pre/sent cost, the rest (raw, plus all output) counts as-is.
 pub(crate) fn without_pct(n: f64, pre: f64, sent: f64, raw: f64) -> f64 {
@@ -397,10 +435,9 @@ mod tests {
         assert_eq!(r["without"], 200.0);
         assert_eq!(r["usage_multiplier"], 2.0);
         assert_eq!(r["inferred_requests"], 2);
-        let display = summary(&[r]);
-        assert!(display.contains("with condense 100% · estimated without 200%"));
-        assert!(display.contains("2.00× usage (100% more)"));
-        assert!(display.contains("includes 2 untagged"));
+        let display = summary(&[r], 80);
+        assert!(display.contains("100% with dense · 200% without (est.)"));
+        assert!(display.contains("Estimated gain: 2.00× (+100%)"));
 
         let attributed = json!({"models": [{
             "model": "claude-fable-5-1", "provider": "anthropic",
@@ -422,10 +459,34 @@ mod tests {
         assert!(r["without"].is_null());
         assert!(r["saved"].is_null());
         assert!(r["usage_multiplier"].is_null());
-        let display = summary(&[r]);
-        assert!(display.contains("with condense 100% · savings estimate unavailable"));
+        let display = summary(&[r], 80);
+        assert!(display.contains("100% used · estimate unavailable"));
         assert!(!display.contains("saved 0"));
         assert!(!display.contains("-0.00"));
+    }
+
+    #[test]
+    fn summary_fits_narrow_and_wide_terminals() {
+        let rows = [json!({
+            "title": "Current week (Long model name 模型 only)",
+            "utilization": 100.0,
+            "without": 201.0,
+            "usage_multiplier": 2.01,
+            "resets_at": "2026-09-22T04:59:00+00:00",
+        })];
+        for width in [20, 32, 40, 60, 80, 120] {
+            let display = summary(&rows, width);
+            for line in display.lines() {
+                assert!(
+                    console::measure_text_width(line) <= width,
+                    "{width}: {line}"
+                );
+            }
+            let words = display.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("100% with dense · 201% without (est.)"));
+            assert!(words.contains("Estimated gain: 2.01× (+101%)"));
+            assert!(words.contains("resets 2026-09-22 04:59 UTC"));
+        }
     }
 
     #[test]
@@ -512,7 +573,7 @@ mod tests {
     #[test]
     fn bar_splits_used_saved_and_free() {
         assert_eq!(
-            bar(10.0, 25.0),
+            bar(10.0, 25.0, BAR),
             format!(
                 "{}{}{}",
                 MOON_SPENT.repeat(2),
@@ -521,11 +582,11 @@ mod tests {
             )
         );
         assert_eq!(
-            bar(90.0, 150.0),
+            bar(90.0, 150.0, BAR),
             format!("{}{}", MOON_SPENT.repeat(12), MOON_WOULD.repeat(8))
         );
         assert_eq!(
-            bar(100.0, 200.0),
+            bar(100.0, 200.0, BAR),
             format!("{}{}", MOON_SPENT.repeat(10), MOON_WOULD.repeat(10))
         );
     }

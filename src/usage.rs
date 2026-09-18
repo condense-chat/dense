@@ -9,12 +9,11 @@ use crate::api::{Api, auth};
 use crate::config::Config;
 use crate::error::{Context, Error};
 use crate::harness::claude;
-use crate::info::{self, BAR};
+use crate::info;
 use crate::ui;
 
 const BAR_USED: &str = "█";
 const BAR_FREE: &str = "░";
-const BAR_OVER: &str = "▓";
 const OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// The endpoint answers an empty 200 to any other agent.
 const CC_USER_AGENT: &str = "claude-cli/2.1.276 (external, cli)";
@@ -109,35 +108,65 @@ fn bar(used: f64, scale: f64, width: usize) -> String {
         BAR_USED.repeat(spent),
         BAR_FREE.repeat(base - spent),
         if scale > 100.0 { "│" } else { "" },
-        BAR_OVER.repeat(overflow),
+        BAR_USED.repeat(overflow),
     )
 }
 
-fn comparison(used: f64, without: f64, width: usize, indent: &str) -> String {
-    let scale = without.max(used).max(100.0);
-    let entries = [
-        (
-            "Regular Claude",
-            without,
-            format!("{without:.0}% of limit (estimated)"),
-        ),
-        ("With condense", used, format!("{used:.0}% of limit")),
-    ];
+fn comparison(used: f64, without: f64, scale: f64, width: usize, indent: &str) -> String {
     let available = width.saturating_sub(indent.len());
-    let marker_width = usize::from(scale > 100.0);
+    let inline = available >= 54;
+    let prefix = if inline { 16 } else { 0 };
+    let marker = usize::from(scale > 100.0);
+    let value_width = format!("{scale:.0}% est.").len();
     let cells = available
-        .saturating_sub(marker_width + 2)
-        .min((BAR as f64 * scale / 100.0).ceil() as usize);
+        .saturating_sub(prefix + if inline { value_width + 2 } else { 0 } + marker)
+        .min(48);
+    let chart_width = cells + marker;
     let mut out = String::new();
-    for (index, (label, value, suffix)) in entries.iter().enumerate() {
+    for (index, (label, value)) in [("Regular Claude", without), ("With condense", used)]
+        .iter()
+        .enumerate()
+    {
         if index > 0 {
             out.push('\n');
         }
-        out.push_str(&wrapped(&format!("{label:<14}  {suffix}"), width, indent));
-        out.push('\n');
-        if cells > 0 {
-            out.push_str(&format!("{indent}[{}]\n", bar(*value, scale, cells)));
+        let paint = if index == 0 { ui::dim } else { ui::green };
+        let rendered = bar(*value, scale, cells);
+        let percent = format!("{value:.0}%{}", if index == 0 { " est." } else { "" });
+        if inline {
+            let pad =
+                " ".repeat(chart_width.saturating_sub(console::measure_text_width(&rendered)));
+            out.push_str(&format!(
+                "{indent}{label:<14}  {}{pad}  {}\n",
+                paint(&rendered),
+                ui::bold(&percent)
+            ));
+        } else {
+            let gap = available
+                .saturating_sub(console::measure_text_width(label) + percent.len())
+                .max(2);
+            out.push_str(&wrapped(
+                &format!("{label}{}{percent}", " ".repeat(gap)),
+                width,
+                indent,
+            ));
+            out.push('\n');
+            if cells > 0 {
+                out.push_str(&format!("{indent}{}\n", paint(&rendered)));
+            }
         }
+    }
+    if scale > 100.0 && cells >= 12 {
+        let base = ((100.0 / scale * cells as f64).round() as usize).min(cells);
+        let (offset, label) = if base + 12 <= chart_width {
+            (base, "└ 100% limit")
+        } else {
+            (base.saturating_sub(11), "100% limit ┘")
+        };
+        out.push_str(&ui::dim(&format!(
+            "{indent}{}{label}\n",
+            " ".repeat(prefix + offset)
+        )));
     }
     out
 }
@@ -237,70 +266,72 @@ fn row(w: &Window, got: &Value, inferred: &Value) -> Value {
 }
 
 fn summary(rows: &[Value], width: usize) -> String {
+    let width = width.clamp(1, 76);
     if rows.is_empty() {
         return format!("{}\n", wrapped("No active Claude limits", width, ""));
     }
     let num = |r: &Value, k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let scale = rows
+        .iter()
+        .flat_map(|r| [num(r, "utilization"), num(r, "without")])
+        .fold(100.0, f64::max);
     let indent = if width >= 4 { "  " } else { "" };
-    let mut out = String::new();
+    let mut out = format!(
+        "{}\n{}\n\n",
+        ui::bold(&wrapped("Claude plan usage", width, "")),
+        ui::dim(&wrapped("Comparing the same work", width, ""))
+    );
     for r in rows {
         let title = text(r, "title")
             .replace("Current session", "Session")
-            .replace("Current week", "Week")
+            .replace("Current week", "This week")
             .replace(" (all models)", "")
             .replace(" only)", ")");
         if r.get("resets_at").is_some_and(Value::is_null) {
-            out.push_str(&wrapped(
-                &format!("{title} · inactive (0% used)"),
-                width,
-                "",
-            ));
+            out.push_str(&wrapped(&format!("{title} · no active session"), width, ""));
             out.push_str("\n\n");
             continue;
         }
-        let reset = format!("resets {}", resets(&text(r, "resets_at")));
-        if console::measure_text_width(&title) + console::measure_text_width(&reset) + 2 <= width {
-            out.push_str(&format!("{}  {}\n", ui::bold(&title), ui::dim(&reset)));
-        } else {
-            out.push_str(&format!(
-                "{}\n{}\n",
-                ui::bold(&wrapped(&title, width, "")),
-                ui::dim(&wrapped(&reset, width, indent)),
-            ));
+        let title_width = console::measure_text_width(&title);
+        out.push_str(&ui::bold(&wrapped(&title, width, "")));
+        let rule = width.saturating_sub(title_width + 2);
+        if rule > 0 {
+            out.push_str(&ui::dim(&format!("  {}", "─".repeat(rule))));
         }
+        out.push('\n');
         let used = num(r, "utilization");
         if let Some(without) = r.get("without").and_then(Value::as_f64) {
             let gain = (num(r, "usage_multiplier") - 1.0) * 100.0;
             let direction = if gain >= 0.0 { "more" } else { "less" };
             out.push_str(&ui::bold(&wrapped(
-                &format!(
-                    "Estimated benefit: {:.0}% {direction} usage on your plan",
-                    gain.abs()
-                ),
+                &format!("{:.0}% {direction} usage · estimated", gain.abs()),
                 width,
                 indent,
             )));
             out.push_str("\n\n");
-            out.push_str(&comparison(used, without, width, indent));
+            out.push_str(&comparison(used, without, scale, width, indent));
         } else {
             out.push_str(&wrapped(
                 &format!("{used:.0}% used · estimate unavailable"),
                 width,
                 indent,
             ));
-        }
-        if !out.ends_with("\n") {
             out.push('\n');
         }
-        out.push('\n');
+        out.push_str(&ui::dim(&wrapped(
+            &format!("Resets {}", resets(&text(r, "resets_at"))),
+            width,
+            indent,
+        )));
+        out.push_str("\n\n");
     }
     if rows
         .iter()
         .any(|r| r.get("without").and_then(Value::as_f64).is_some())
     {
         out.push_str(&ui::dim(&wrapped(
-            &format!("{BAR_USED} used · {BAR_FREE} left · │ 100% · {BAR_OVER} over limit"),
+            &format!("{BAR_USED} used · {BAR_FREE} remaining"),
             width,
             "",
         )));
@@ -433,6 +464,7 @@ pub(crate) fn without_pct(n: f64, pre: f64, sent: f64, raw: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::info::BAR;
 
     #[test]
     fn without_pct_scales_by_pre_over_post() {
@@ -490,8 +522,8 @@ mod tests {
         assert_eq!(r["inferred_requests"], 2);
         let display = summary(&[r], 80);
         assert!(display.contains("Regular Claude"));
-        assert!(display.contains("200% of limit (estimated)"));
-        assert!(display.contains("Estimated benefit: 100% more usage on your plan"));
+        assert!(display.contains("200%"));
+        assert!(display.contains("100% more usage · estimated"));
 
         let attributed = json!({"models": [{
             "model": "claude-fable-5-1", "provider": "anthropic",
@@ -539,10 +571,10 @@ mod tests {
             let words = display.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(words.contains("Regular Claude"));
             assert!(words.contains("With condense"));
-            assert!(words.contains("201% of limit (estimated)"));
+            assert!(words.contains("201%"));
             assert!(words.contains("100%"));
-            assert!(words.contains("Estimated benefit: 101% more usage on your plan"));
-            assert!(words.contains("resets 2026-09-22 04:59 UTC"));
+            assert!(words.contains("101% more usage · estimated"));
+            assert!(words.contains("Resets 2026-09-22 04:59 UTC"));
         }
     }
 
@@ -594,7 +626,7 @@ mod tests {
         let r = row(&ws[0], &Value::Null, &Value::Null);
         assert!(r["resets_at"].is_null());
         assert!(r["without"].is_null());
-        assert_eq!(summary(&[r], 80), "Session · inactive (0% used)\n\n");
+        assert!(summary(&[r], 80).contains("Session · no active session"));
     }
 
     #[test]
@@ -648,7 +680,7 @@ mod tests {
         assert_eq!(bar(100.0, 200.0, BAR), format!("{}│", BAR_USED.repeat(10)));
         assert_eq!(
             bar(200.0, 200.0, BAR),
-            format!("{}│{}", BAR_USED.repeat(10), BAR_OVER.repeat(10))
+            format!("{}│{}", BAR_USED.repeat(10), BAR_USED.repeat(10))
         );
         assert_eq!(
             bar(50.0, 200.0, BAR),

@@ -149,8 +149,8 @@ fn resets(at: &str) -> String {
     }
 }
 
-/// One window's row: the `/v1/me/usage/models` body summed across models,
-/// with output folded into raw since compression never touches it.
+/// One window's row: the `/v1/me/usage/models` body summed across models.
+/// Output counts like raw in the ratio, since compression never touches it.
 fn row(w: &Window, got: &Value) -> Value {
     let models = got
         .get("models")
@@ -169,12 +169,13 @@ fn row(w: &Window, got: &Value) -> Value {
             .sum();
         (sum * 1e6).round() / 1e6
     };
-    let (pre, sent, raw) = (
+    let (pre, sent, raw, output) = (
         usd(&["pre_usd"]),
         usd(&["sent_usd"]),
-        usd(&["raw_usd", "output_usd"]),
+        usd(&["raw_usd"]),
+        usd(&["output_usd"]),
     );
-    let without = without_pct(w.utilization, pre, sent, raw);
+    let without = without_pct(w.utilization, pre, sent, raw + output);
     json!({
         "key": w.key,
         "title": w.title,
@@ -187,6 +188,7 @@ fn row(w: &Window, got: &Value) -> Value {
         "pre_usd": pre,
         "sent_usd": sent,
         "raw_usd": raw,
+        "output_usd": output,
     })
 }
 
@@ -206,12 +208,13 @@ fn summary(rows: &[Value]) -> String {
             bar(used, without),
             without - used,
             ui::dim(&format!(
-                "reconciled {}/{} requests · pre ${} → sent ${} · raw ${}",
+                "reconciled {}/{} requests · pre ${} → sent ${} · raw ${} · output ${}",
                 num(r, "reconciled_requests"),
                 num(r, "requests"),
                 info::dollars(r.get("pre_usd")),
                 info::dollars(r.get("sent_usd")),
                 info::dollars(r.get("raw_usd")),
+                info::dollars(r.get("output_usd")),
             )),
         ));
     }
@@ -305,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn row_sums_models_with_output_as_raw() {
+    fn row_sums_models_and_counts_output_like_raw() {
         let w = Window {
             key: "seven_day".into(),
             model: String::new(),
@@ -329,7 +332,8 @@ mod tests {
         assert_eq!(r["reconciled_requests"], 110);
         assert_eq!(r["pre_usd"], 3.1);
         assert_eq!(r["sent_usd"], 1.2);
-        assert_eq!(r["raw_usd"], 2.8);
+        assert_eq!(r["raw_usd"], 0.5);
+        assert_eq!(r["output_usd"], 2.3);
         // 40 × (3.10 + 2.80) / (1.20 + 2.80)
         assert!((r["without"].as_f64().unwrap() - 59.0).abs() < 1e-9);
     }

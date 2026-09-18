@@ -259,6 +259,17 @@ fn summary(rows: &[Value], width: usize) -> String {
         }
         out.push_str("\n\n");
     }
+    if rows
+        .iter()
+        .any(|r| r.get("without").and_then(Value::as_f64).is_some())
+    {
+        out.push_str(&ui::dim(&wrapped(
+            &format!("{MOON_SPENT} used · {MOON_WOULD} saved (est.) · {MOON_SAVED} remaining"),
+            width,
+            "",
+        )));
+        out.push('\n');
+    }
     out
 }
 

@@ -123,7 +123,7 @@ fn comparison(used: f64, without: f64, scale: f64, width: usize, indent: &str) -
         .min(48);
     let chart_width = cells + marker;
     let mut out = String::new();
-    for (index, (label, value)) in [("Regular Claude", without), ("With condense", used)]
+    for (index, (label, value)) in [("Regular Claude", without), ("Dense Claude", used)]
         .iter()
         .enumerate()
     {
@@ -570,7 +570,7 @@ mod tests {
             }
             let words = display.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(words.contains("Regular Claude"));
-            assert!(words.contains("With condense"));
+            assert!(words.contains("Dense Claude"));
             assert!(words.contains("201%"));
             assert!(words.contains("100%"));
             assert!(words.contains("101% more usage · estimated"));

@@ -46,7 +46,7 @@ struct Window {
     utilization: f64,
 }
 
-pub async fn run(cfg: &Config, sub: &str, json: bool) -> Result<()> {
+pub async fn run(cfg: &Config, sub: &str, json: bool, attributed_only: bool) -> Result<()> {
     if sub != "claude" {
         return Err(Error::msg(format!(
             "`dense usage {sub}` is not supported yet"
@@ -70,25 +70,13 @@ pub async fn run(cfg: &Config, sub: &str, json: bool) -> Result<()> {
     let plan = fetch_plan(&oauth.access_token).await?;
     let mut rows = Vec::new();
     for w in windows(&plan) {
-        let secs = w.secs.to_string();
-        let mut params = vec![
-            ("until", w.resets_at.as_str()),
-            ("window", &secs),
-            ("upstream_sub", "claude_code"),
-            ("provider", "anthropic"),
-        ];
-        if !w.model.is_empty() {
-            params.push(("model", &w.model));
-        }
-        let url = reqwest::Url::parse_with_params(
-            &format!(
-                "{}/v1/me/usage/models",
-                cfg.api_base_url.trim_end_matches('/')
-            ),
-            params,
-        )
-        .ctx("building the usage URL")?;
-        rows.push(row(&w, &info::get(&api, url.as_str()).await?));
+        let got = info::get(&api, usage_url(&cfg.api_base_url, &w, false)?.as_str()).await?;
+        let inferred = if attributed_only {
+            Value::Null
+        } else {
+            info::get(&api, usage_url(&cfg.api_base_url, &w, true)?.as_str()).await?
+        };
+        rows.push(row(&w, &got, &inferred));
     }
     if json {
         let out = json!({"sub": sub, "windows": rows});
@@ -103,10 +91,10 @@ pub async fn run(cfg: &Config, sub: &str, json: bool) -> Result<()> {
 }
 
 fn bar(used: f64, without: f64) -> String {
-    let bp = |p: f64| (p * 100.0).round().clamp(0.0, 10_000.0) as i64;
-    let used = bp(used);
-    let saved = bp(without).saturating_sub(used).max(0);
-    let cells = info::allocate(&[used, saved], 10_000, BAR);
+    let whole = without.max(used).max(100.0);
+    let bp = |p: f64| (p / whole * 10_000.0).round().clamp(0.0, 10_000.0) as i64;
+    let saved = (without - used).max(0.0);
+    let cells = info::allocate(&[bp(used), bp(saved)], 10_000, BAR);
     let n = |i: usize| cells.get(i).map_or(0, |c| c.0);
     format!(
         "{}{}{}",
@@ -151,11 +139,22 @@ fn resets(at: &str) -> String {
 
 /// One window's row: the `/v1/me/usage/models` body summed across models.
 /// Output counts like raw in the ratio, since compression never touches it.
-fn row(w: &Window, got: &Value) -> Value {
-    let models = got
+fn row(w: &Window, got: &Value, inferred: &Value) -> Value {
+    let inferred_models = inferred
         .get("models")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
+    let inferred_requests: u64 = inferred_models
+        .iter()
+        .filter_map(|m| m.get("requests")?.as_u64())
+        .sum();
+    let models: Vec<&Value> = got
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .chain(inferred_models)
+        .collect();
     let count = |k: &str| {
         models
             .iter()
@@ -167,7 +166,11 @@ fn row(w: &Window, got: &Value) -> Value {
             .iter()
             .flat_map(|m| keys.iter().map(|k| m.get(*k).map_or(0.0, info::usd)))
             .sum();
-        (sum * 1e6).round() / 1e6
+        if sum == 0.0 {
+            0.0
+        } else {
+            (sum * 1e6).round() / 1e6
+        }
     };
     let (pre, sent, raw, output) = (
         usd(&["pre_usd"]),
@@ -175,15 +178,18 @@ fn row(w: &Window, got: &Value) -> Value {
         usd(&["raw_usd"]),
         usd(&["output_usd"]),
     );
-    let without = without_pct(w.utilization, pre, sent, raw + output);
+    let multiplier = (sent + raw + output > 0.0).then(|| without_pct(1.0, pre, sent, raw + output));
+    let without = multiplier.map(|m| w.utilization * m);
     json!({
         "key": w.key,
         "title": w.title,
         "utilization": w.utilization,
         "without": without,
-        "saved": without - w.utilization,
+        "saved": without.map(|n| n - w.utilization),
+        "usage_multiplier": multiplier,
         "resets_at": w.resets_at,
         "requests": count("requests"),
+        "inferred_requests": inferred_requests,
         "reconciled_requests": count("reconciled_requests"),
         "pre_usd": pre,
         "sent_usd": sent,
@@ -200,13 +206,23 @@ fn summary(rows: &[Value]) -> String {
     let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let mut out = String::new();
     for r in rows {
-        let (used, without) = (num(r, "utilization"), num(r, "without"));
+        let used = num(r, "utilization");
+        let Some(without) = r.get("without").and_then(Value::as_f64) else {
+            out.push_str(&format!(
+                "{}  {}\n  with condense {used:.0}% · savings estimate unavailable (no matching spend)\n\n",
+                ui::bold(&text(r, "title")),
+                ui::dim(&format!("resets {}", resets(&text(r, "resets_at")))),
+            ));
+            continue;
+        };
         out.push_str(&format!(
-            "{}  {}\n  {}  with condense {used:.0}% · without {without:.0}% · saved {:.0} pts\n  {}\n\n",
+            "{}  {}\n  {}  with condense {used:.0}% · estimated without {without:.0}% · saved {:.0} pts\n  estimated {:.2}× usage ({:.0}% more)\n  {}\n",
             ui::bold(&text(r, "title")),
             ui::dim(&format!("resets {}", resets(&text(r, "resets_at")))),
             bar(used, without),
             without - used,
+            num(r, "usage_multiplier"),
+            (num(r, "usage_multiplier") - 1.0) * 100.0,
             ui::dim(&format!(
                 "reconciled {}/{} requests · pre ${} → sent ${} · raw ${} · output ${}",
                 num(r, "reconciled_requests"),
@@ -217,12 +233,43 @@ fn summary(rows: &[Value]) -> String {
                 info::dollars(r.get("output_usd")),
             )),
         ));
+        if num(r, "inferred_requests") > 0.0 {
+            out.push_str(&format!(
+                "  includes {} untagged Claude-harness requests; may include API-key traffic\n",
+                num(r, "inferred_requests"),
+            ));
+        }
+        out.push('\n');
     }
     out.push_str(&ui::dim(
         "note: traffic on this login outside dense is scaled by the same ratio.",
     ));
     out.push('\n');
     out
+}
+
+fn usage_url(base: &str, w: &Window, inferred: bool) -> Result<reqwest::Url> {
+    let secs = w.secs.to_string();
+    let mut params = vec![
+        ("until", w.resets_at.as_str()),
+        ("window", &secs),
+        (
+            "upstream_sub",
+            if inferred { "none" } else { "claude_code" },
+        ),
+        ("provider", "anthropic"),
+    ];
+    if inferred {
+        params.extend([("kind", "claude_code"), ("kind", "compact_condense")]);
+    }
+    if !w.model.is_empty() {
+        params.push(("model", &w.model));
+    }
+    reqwest::Url::parse_with_params(
+        &format!("{}/v1/me/usage/models", base.trim_end_matches('/')),
+        params,
+    )
+    .ctx("building the usage URL")
 }
 
 fn windows(plan: &Value) -> Vec<Window> {
@@ -327,7 +374,7 @@ mod tests {
              "pre_usd": "0", "sent_usd": "0", "saved_usd": "0",
              "raw_usd": "0.10", "output_usd": "0.30"}
         ]});
-        let r = row(&w, &got);
+        let r = row(&w, &got, &Value::Null);
         assert_eq!(r["requests"], 125);
         assert_eq!(r["reconciled_requests"], 110);
         assert_eq!(r["pre_usd"], 3.1);
@@ -336,6 +383,88 @@ mod tests {
         assert_eq!(r["output_usd"], 2.3);
         // 40 × (3.10 + 2.80) / (1.20 + 2.80)
         assert!((r["without"].as_f64().unwrap() - 59.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn historical_rows_contribute_to_weekly_estimate() {
+        let w = weekly_window();
+        let inferred = json!({"models": [{
+            "model": "claude-fable-5-1", "provider": "anthropic",
+            "requests": 2, "reconciled_requests": 2,
+            "pre_usd": "3", "sent_usd": "1", "raw_usd": "0", "output_usd": "1"
+        }]});
+        let r = row(&w, &json!({"models": []}), &inferred);
+        assert_eq!(r["without"], 200.0);
+        assert_eq!(r["usage_multiplier"], 2.0);
+        assert_eq!(r["inferred_requests"], 2);
+        let display = summary(&[r]);
+        assert!(display.contains("with condense 100% · estimated without 200%"));
+        assert!(display.contains("2.00× usage (100% more)"));
+        assert!(display.contains("includes 2 untagged"));
+
+        let attributed = json!({"models": [{
+            "model": "claude-fable-5-1", "provider": "anthropic",
+            "requests": 1, "reconciled_requests": 1,
+            "pre_usd": "1", "sent_usd": "1", "raw_usd": "0", "output_usd": "0"
+        }]});
+        let combined = row(&w, &attributed, &inferred);
+        assert_eq!(combined["requests"], 3);
+        assert_eq!(combined["inferred_requests"], 2);
+        assert_eq!(combined["pre_usd"], 4.0);
+        assert_eq!(combined["sent_usd"], 2.0);
+        assert_eq!(combined["output_usd"], 1.0);
+        assert!((combined["without"].as_f64().unwrap() - 100.0 * 5.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_usage_does_not_claim_zero_savings() {
+        let r = row(&weekly_window(), &json!({"models": []}), &Value::Null);
+        assert!(r["without"].is_null());
+        assert!(r["saved"].is_null());
+        assert!(r["usage_multiplier"].is_null());
+        let display = summary(&[r]);
+        assert!(display.contains("with condense 100% · savings estimate unavailable"));
+        assert!(!display.contains("saved 0"));
+        assert!(!display.contains("-0.00"));
+    }
+
+    #[test]
+    fn usage_queries_keep_attributed_and_inferred_rows_disjoint() {
+        let mut w = weekly_window();
+        w.model = "fable".into();
+        for inferred in [false, true] {
+            let url = usage_url("https://api.example/", &w, inferred).unwrap();
+            let pairs: Vec<_> = url.query_pairs().collect();
+            let values = |key| {
+                pairs
+                    .iter()
+                    .filter(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_ref())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values("until"), [w.resets_at.as_str()]);
+            assert_eq!(values("window"), ["604800"]);
+            assert_eq!(values("provider"), ["anthropic"]);
+            assert_eq!(values("model"), ["fable"]);
+            if inferred {
+                assert_eq!(values("upstream_sub"), ["none"]);
+                assert_eq!(values("kind"), ["claude_code", "compact_condense"]);
+            } else {
+                assert_eq!(values("upstream_sub"), ["claude_code"]);
+                assert!(values("kind").is_empty());
+            }
+        }
+    }
+
+    fn weekly_window() -> Window {
+        Window {
+            key: "seven_day".into(),
+            model: String::new(),
+            resets_at: "2026-09-22T04:59:00+00:00".into(),
+            secs: WEEK_SECS,
+            title: "Current week (all models)".into(),
+            utilization: 100.0,
+        }
     }
 
     #[test]
@@ -393,7 +522,11 @@ mod tests {
         );
         assert_eq!(
             bar(90.0, 150.0),
-            format!("{}{}", MOON_SPENT.repeat(18), MOON_WOULD.repeat(2))
+            format!("{}{}", MOON_SPENT.repeat(12), MOON_WOULD.repeat(8))
+        );
+        assert_eq!(
+            bar(100.0, 200.0),
+            format!("{}{}", MOON_SPENT.repeat(10), MOON_WOULD.repeat(10))
         );
     }
 }

@@ -69,7 +69,11 @@ async fn main() -> EyreResult<()> {
             no_modify_path,
         } => persist::persist(&cfg, &targets, !no_modify_path),
         Command::Unpersist { targets } => persist::unpersist(&cfg, &targets),
-        Command::Usage { json, sub } => usage::run(&cfg, &sub, json).await,
+        Command::Usage {
+            attributed_only,
+            json,
+            sub,
+        } => usage::run(&cfg, &sub, json, attributed_only).await,
         Command::Doctor => doctor::run(&cfg).await,
         Command::Setup => setup::run(&cfg).await,
         Command::Profile { name, url, list } => {

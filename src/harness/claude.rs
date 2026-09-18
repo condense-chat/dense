@@ -1,5 +1,9 @@
 //! Claude Code through condense (Anthropic dialect).
 
+use std::path::Path;
+
+use serde::Deserialize;
+
 use crate::Result;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
@@ -10,6 +14,21 @@ pub struct Claude {
     /// Plugin dir carrying `/dense`; `None` when staging failed and the
     /// launch should proceed without the command.
     plugin_dir: Option<std::path::PathBuf>,
+}
+
+/// Claude Code's claude.ai login (`claudeAiOauth`). No `Debug`: it holds the token.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeOauth {
+    pub access_token: String,
+    /// Epoch milliseconds.
+    pub expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct Stored {
+    #[serde(rename = "claudeAiOauth")]
+    oauth: ClaudeOauth,
 }
 
 impl Tool for Claude {
@@ -119,9 +138,49 @@ fn merge_headers(existing: Option<&str>, headers: &[(String, String)]) -> String
     lines.join("\n")
 }
 
+/// Claude Code's stored login: `.credentials.json`, else (macOS) its keychain item.
+pub(crate) fn read_oauth(home: &Path) -> Option<ClaudeOauth> {
+    let custom = std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let dir = commands::claude_home(home, |_| custom.clone());
+    let parse = |raw: Vec<u8>| serde_json::from_slice::<Stored>(&raw).ok().map(|s| s.oauth);
+    std::fs::read(dir.join(".credentials.json"))
+        .ok()
+        .and_then(parse)
+        .or_else(|| keychain(custom.as_deref()).and_then(parse))
+}
+
+fn keychain(custom_dir: Option<&str>) -> Option<Vec<u8>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut service = "Claude Code-credentials".to_string();
+    if let Some(dir) = custom_dir {
+        service.push('-');
+        service.push_str(&commands::sha256_hex(dir.as_bytes())[..8]);
+    }
+    let user = std::env::var("USER").ok()?;
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-a", &user, "-w", "-s", &service])
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_login_parses_claude_code_credentials() {
+        let raw = br#"{"claudeAiOauth":{"accessToken":"t","expiresAt":7,"scopes":["user:profile"]},"mcpOAuth":{}}"#;
+        let s: Stored = serde_json::from_slice(raw).unwrap();
+        assert_eq!(
+            (s.oauth.access_token.as_str(), s.oauth.expires_at),
+            ("t", 7)
+        );
+    }
 
     #[test]
     fn merge_drops_stale_condense_headers_keeps_users() {

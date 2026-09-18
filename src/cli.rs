@@ -107,6 +107,14 @@ pub enum Command {
         #[arg(value_name = "TOOL")]
         targets: Vec<String>,
     },
+    /// Subscription limits used, with condense vs without it.
+    Usage {
+        /// Print JSON instead of the summary.
+        #[arg(long)]
+        json: bool,
+        #[arg(value_name = "SUB", default_value = "claude", value_parser = ["claude", "codex"])]
+        sub: String,
+    },
 }
 
 #[derive(Subcommand)]

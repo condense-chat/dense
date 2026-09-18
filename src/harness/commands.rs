@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::error::Context;
 
 const CLAUDE_BODY: &str = include_str!("../../assets/claude/info.md");
+const CLAUDE_USAGE: &str = include_str!("../../assets/claude/usage.md");
 const CODEX_BODY: &str = include_str!("../../assets/codex/info.md");
 const CODEX_SKILL: &str = include_str!("../../assets/codex/SKILL.md");
 const OPENCODE_BODY: &str = include_str!("../../assets/opencode/info.md");
@@ -69,8 +70,8 @@ pub fn claude_plugin_dir(cfg: &Config) -> Result<PathBuf> {
 }
 
 // Plugin `dense` with command `info` surfaces as `/dense:info` (and as `/info`
-// unless the user has their own). The dir is dense-owned, so anything
-// else under commands/ is a stale earlier name.
+// unless the user has their own), `usage` as `/dense:usage`. The dir is
+// dense-owned, so anything else under commands/ is a stale earlier name.
 fn stage_claude_plugin(root: &Path) -> Result<()> {
     write_if_changed(
         &root.join(".claude-plugin").join("plugin.json"),
@@ -78,9 +79,10 @@ fn stage_claude_plugin(root: &Path) -> Result<()> {
     )?;
     let commands = root.join("commands");
     write_if_changed(&commands.join("info.md"), CLAUDE_BODY)?;
+    write_if_changed(&commands.join("usage.md"), CLAUDE_USAGE)?;
     if let Ok(entries) = fs::read_dir(&commands) {
         for e in entries.flatten() {
-            if e.file_name() != "info.md" {
+            if e.file_name() != "info.md" && e.file_name() != "usage.md" {
                 let _ = fs::remove_file(e.path());
             }
         }
@@ -219,6 +221,10 @@ pub(crate) fn codex_plugin_owned_root(
         .join(CODEX_PLUGIN)
 }
 
+pub(crate) fn claude_home(home: &Path, env: impl Fn(&str) -> Option<String>) -> PathBuf {
+    root(home, env("CLAUDE_CONFIG_DIR"), ".claude")
+}
+
 fn codex_home(home: &Path, env: impl Fn(&str) -> Option<String>) -> PathBuf {
     root(home, env("CODEX_HOME"), ".codex")
 }
@@ -294,7 +300,7 @@ fn description(front: &str) -> String {
         .unwrap_or_default()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -447,6 +453,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(commands.join("info.md")).expect("read"),
             CLAUDE_BODY
+        );
+        assert_eq!(
+            fs::read_to_string(commands.join("usage.md")).expect("read"),
+            CLAUDE_USAGE
         );
         assert!(!commands.join("dense.md").exists());
         assert!(dir.path().join(".claude-plugin/plugin.json").exists());

@@ -12,14 +12,14 @@ use crate::config::Config;
 use crate::error::{Context, Error};
 use crate::ui;
 
-const BAR: usize = 20;
+pub(crate) const BAR: usize = 20;
 const COLS: usize = 20;
 const ROWS: usize = 10;
 const CELLS: usize = COLS * ROWS;
 // 20 cells + 19 spaces, then the gap before the legend.
 const LEGEND_INDENT: usize = COLS * 2 + 3;
-const MOON_SAVED: &str = "🌕";
-const MOON_SPENT: &str = "🌑";
+pub(crate) const MOON_SAVED: &str = "🌕";
+pub(crate) const MOON_SPENT: &str = "🌑";
 
 type Paint = fn(&str) -> String;
 
@@ -135,7 +135,7 @@ async fn detail_of(resp: reqwest::Response) -> Option<String> {
     body.get("detail")?.as_str().map(str::to_owned)
 }
 
-fn dollars(v: Option<&Value>) -> String {
+pub(crate) fn dollars(v: Option<&Value>) -> String {
     let raw = match v {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
@@ -160,7 +160,7 @@ async fn fetch_session(api: &Api, id: Option<&str>) -> Option<Result<Value>> {
 }
 
 /// Failures carry `<status> <detail-or-reason>` so callers can specialise.
-async fn get(api: &Api, path: &str) -> Result<Value> {
+pub(crate) async fn get(api: &Api, path: &str) -> Result<Value> {
     let resp = api.get_response(path).await?;
     let status = resp.status();
     if status.is_success() {
@@ -576,7 +576,7 @@ fn spend_bar(money: &Value) -> Option<String> {
     ))
 }
 
-fn usd(v: &Value) -> f64 {
+pub(crate) fn usd(v: &Value) -> f64 {
     match v {
         Value::String(s) => s.parse().unwrap_or(0.0),
         Value::Number(n) => n.as_f64().unwrap_or(0.0),
@@ -586,7 +586,7 @@ fn usd(v: &Value) -> f64 {
 
 // Cells per part, largest remainder so they sum to the rounded total; a
 // part with tokens but no cell borrows one and is flagged partial.
-fn allocate(parts: &[i64], whole: i64, total: usize) -> Vec<(usize, bool)> {
+pub(crate) fn allocate(parts: &[i64], whole: i64, total: usize) -> Vec<(usize, bool)> {
     let n = parts.len();
     if whole <= 0 {
         return vec![(0, false); n];

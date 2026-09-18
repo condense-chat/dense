@@ -35,6 +35,9 @@ pub trait Tool {
     /// The dialects this tool speaks; `apply` gets one [`Target`] per entry.
     fn dialects(&self) -> &'static [Dialect];
 
+    /// The `x-condense-kind` value; the server takes it verbatim.
+    fn kind(&self) -> &'static str;
+
     fn label(&self) -> &str;
 }
 
@@ -66,7 +69,7 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
         announce(cfg, tool.label());
     }
 
-    let headers = condense_headers(cfg, &creds, &session.id);
+    let headers = condense_headers(cfg, &creds, &session.id, tool.kind());
     let targets: Vec<Target> = tool
         .dialects()
         .iter()
@@ -128,10 +131,15 @@ fn announce(cfg: &Config, label: &str) {
     eprintln!();
 }
 
-/// The `x-condense-*` headers on every request — auth/user/session, plus the
-/// optional upstream override. Universal; the upstream comes from [`Config`].
-fn condense_headers(cfg: &Config, creds: &Creds, session_id: &str) -> Vec<(String, String)> {
-    let mut h = Vec::new();
+/// The `x-condense-*` headers on every request — auth/user/session, the
+/// harness kind, plus the optional upstream override.
+fn condense_headers(
+    cfg: &Config,
+    creds: &Creds,
+    session_id: &str,
+    kind: &str,
+) -> Vec<(String, String)> {
+    let mut h = vec![("x-condense-kind".to_string(), kind.to_string())];
     if let Some(token) = &creds.token {
         h.push(("x-condense-auth-token".to_string(), token.clone()));
     }

@@ -44,6 +44,10 @@ dense info [--bar|--matrix|--json] [SESSION]
                              session's context sizes and spend.
                              --matrix is the coloured glyph grid (terminal
                              default), --bar the emoji bars (piped default)
+dense usage [claude] [--json] [--attributed-only]
+                             Claude limits + estimated gain; fits terminal width.
+                             --json includes costs and request counts.
+                             --attributed-only excludes untagged requests.
 dense status                 current login + endpoint
 dense doctor                 verify the install is wired correctly
 dense setup                  first-run wizard (the installer hands off to this)

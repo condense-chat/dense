@@ -107,6 +107,17 @@ pub enum Command {
         #[arg(value_name = "TOOL")]
         targets: Vec<String>,
     },
+    /// Subscription limits used, with condense vs without it.
+    Usage {
+        /// Exclude untagged Claude-harness usage from the estimate.
+        #[arg(long)]
+        attributed_only: bool,
+        /// Print JSON instead of the summary.
+        #[arg(long)]
+        json: bool,
+        #[arg(value_name = "SUB", default_value = "claude", value_parser = ["claude", "codex"])]
+        sub: String,
+    },
 }
 
 #[derive(Subcommand)]

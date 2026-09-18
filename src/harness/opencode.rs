@@ -77,6 +77,10 @@ impl Tool for OpenCode {
         "opencode"
     }
 
+    fn kind(&self) -> &'static str {
+        "opencode"
+    }
+
     fn label(&self) -> &str {
         "OpenCode"
     }

@@ -116,37 +116,27 @@ fn bar(used: f64, scale: f64, width: usize) -> String {
 fn comparison(used: f64, without: f64, width: usize, indent: &str) -> String {
     let scale = without.max(used).max(100.0);
     let entries = [
-        ("Without condense", without, format!("{without:.0}% (est.)")),
-        ("With condense", used, format!("{used:.0}%")),
+        (
+            "Regular Claude",
+            without,
+            format!("{without:.0}% of limit (estimated)"),
+        ),
+        ("With condense", used, format!("{used:.0}% of limit")),
     ];
     let available = width.saturating_sub(indent.len());
-    let suffix_width = entries.iter().map(|(_, _, s)| s.len()).max().unwrap_or(0);
     let marker_width = usize::from(scale > 100.0);
-    let glyph_width = console::measure_text_width(BAR_USED);
-    let inline_cells = available.saturating_sub(16 + 4 + suffix_width + marker_width) / glyph_width;
-    let inline = inline_cells >= 8;
-    let cells = if inline {
-        inline_cells
-    } else {
-        available.saturating_sub(marker_width) / glyph_width
-    };
-    let cells = cells.min((BAR as f64 * scale / 100.0).ceil() as usize);
-    let bar_width = cells * glyph_width + marker_width;
+    let cells = available
+        .saturating_sub(marker_width + 2)
+        .min((BAR as f64 * scale / 100.0).ceil() as usize);
     let mut out = String::new();
-    for (label, value, suffix) in entries {
-        let rendered = bar(value, scale, cells);
-        if inline {
-            let padding =
-                " ".repeat(bar_width.saturating_sub(console::measure_text_width(&rendered)));
-            out.push_str(&format!(
-                "{indent}{label:<16}  {rendered}{padding}  {suffix}\n"
-            ));
-        } else {
-            out.push_str(&wrapped(&format!("{label}: {suffix}"), width, indent));
+    for (index, (label, value, suffix)) in entries.iter().enumerate() {
+        if index > 0 {
             out.push('\n');
-            if cells > 0 {
-                out.push_str(&format!("{indent}{rendered}\n"));
-            }
+        }
+        out.push_str(&wrapped(&format!("{label:<14}  {suffix}"), width, indent));
+        out.push('\n');
+        if cells > 0 {
+            out.push_str(&format!("{indent}[{}]\n", bar(*value, scale, cells)));
         }
     }
     out
@@ -281,16 +271,18 @@ fn summary(rows: &[Value], width: usize) -> String {
         }
         let used = num(r, "utilization");
         if let Some(without) = r.get("without").and_then(Value::as_f64) {
-            out.push_str(&comparison(used, without, width, indent));
-            out.push_str(&wrapped(
+            let gain = (num(r, "usage_multiplier") - 1.0) * 100.0;
+            let direction = if gain >= 0.0 { "more" } else { "less" };
+            out.push_str(&ui::bold(&wrapped(
                 &format!(
-                    "Estimated gain: {:.2}× ({:+.0}%)",
-                    num(r, "usage_multiplier"),
-                    (num(r, "usage_multiplier") - 1.0) * 100.0,
+                    "Estimated benefit: {:.0}% {direction} usage on your plan",
+                    gain.abs()
                 ),
                 width,
                 indent,
-            ));
+            )));
+            out.push_str("\n\n");
+            out.push_str(&comparison(used, without, width, indent));
         } else {
             out.push_str(&wrapped(
                 &format!("{used:.0}% used · estimate unavailable"),
@@ -298,14 +290,17 @@ fn summary(rows: &[Value], width: usize) -> String {
                 indent,
             ));
         }
-        out.push_str("\n\n");
+        if !out.ends_with("\n") {
+            out.push('\n');
+        }
+        out.push('\n');
     }
     if rows
         .iter()
         .any(|r| r.get("without").and_then(Value::as_f64).is_some())
     {
         out.push_str(&ui::dim(&wrapped(
-            &format!("{BAR_USED} used · {BAR_FREE} remaining · │ 100% · {BAR_OVER} over limit"),
+            &format!("{BAR_USED} used · {BAR_FREE} left · │ 100% · {BAR_OVER} over limit"),
             width,
             "",
         )));
@@ -494,9 +489,9 @@ mod tests {
         assert_eq!(r["usage_multiplier"], 2.0);
         assert_eq!(r["inferred_requests"], 2);
         let display = summary(&[r], 80);
-        assert!(display.contains("Without condense"));
-        assert!(display.contains("200% (est.)"));
-        assert!(display.contains("Estimated gain: 2.00× (+100%)"));
+        assert!(display.contains("Regular Claude"));
+        assert!(display.contains("200% of limit (estimated)"));
+        assert!(display.contains("Estimated benefit: 100% more usage on your plan"));
 
         let attributed = json!({"models": [{
             "model": "claude-fable-5-1", "provider": "anthropic",
@@ -542,11 +537,11 @@ mod tests {
                 );
             }
             let words = display.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(words.contains("Without condense"));
+            assert!(words.contains("Regular Claude"));
             assert!(words.contains("With condense"));
-            assert!(words.contains("201% (est.)"));
+            assert!(words.contains("201% of limit (estimated)"));
             assert!(words.contains("100%"));
-            assert!(words.contains("Estimated gain: 2.01× (+101%)"));
+            assert!(words.contains("Estimated benefit: 101% more usage on your plan"));
             assert!(words.contains("resets 2026-09-22 04:59 UTC"));
         }
     }

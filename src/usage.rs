@@ -71,6 +71,10 @@ pub async fn run(cfg: &Config, sub: &str, json: bool, attributed_only: bool) -> 
     let plan = fetch_plan(&oauth.access_token).await?;
     let mut rows = Vec::new();
     for w in windows(&plan) {
+        if w.resets_at.is_empty() {
+            rows.push(row(&w, &Value::Null, &Value::Null));
+            continue;
+        }
         let got = info::get(&api, usage_url(&cfg.api_base_url, &w, false)?.as_str()).await?;
         let inferred = if attributed_only {
             Value::Null
@@ -231,7 +235,7 @@ fn row(w: &Window, got: &Value, inferred: &Value) -> Value {
         "without": without,
         "saved": without.map(|n| n - w.utilization),
         "usage_multiplier": multiplier,
-        "resets_at": w.resets_at,
+        "resets_at": if w.resets_at.is_empty() { None } else { Some(&w.resets_at) },
         "requests": count("requests"),
         "inferred_requests": inferred_requests,
         "reconciled_requests": count("reconciled_requests"),
@@ -256,6 +260,15 @@ fn summary(rows: &[Value], width: usize) -> String {
             .replace("Current week", "Week")
             .replace(" (all models)", "")
             .replace(" only)", ")");
+        if r.get("resets_at").is_some_and(Value::is_null) {
+            out.push_str(&wrapped(
+                &format!("{title} · inactive (0% used)"),
+                width,
+                "",
+            ));
+            out.push_str("\n\n");
+            continue;
+        }
         let reset = format!("resets {}", resets(&text(r, "resets_at")));
         if console::measure_text_width(&title) + console::measure_text_width(&reset) + 2 <= width {
             out.push_str(&format!("{}  {}\n", ui::bold(&title), ui::dim(&reset)));
@@ -345,13 +358,19 @@ fn windows(plan: &Value) -> Vec<Window> {
         .iter()
         .filter_map(|&(key, title, secs, model)| {
             let w = plan.get(key)?;
+            let utilization = w.get("utilization")?.as_f64()?;
+            let resets_at = match w.get("resets_at")? {
+                Value::String(at) => at.clone(),
+                Value::Null if key == "five_hour" && utilization == 0.0 => String::new(),
+                _ => return None,
+            };
             Some(Window {
                 key: key.into(),
                 model: model.into(),
-                resets_at: w.get("resets_at")?.as_str()?.into(),
+                resets_at,
                 secs,
                 title: title.into(),
-                utilization: w.get("utilization")?.as_f64()?,
+                utilization,
             })
         })
         .collect();
@@ -569,6 +588,18 @@ mod tests {
             title: "Current week (all models)".into(),
             utilization: 100.0,
         }
+    }
+
+    #[test]
+    fn inactive_session_remains_visible_without_an_estimate() {
+        let plan = json!({"five_hour": {"utilization": 0, "resets_at": null}});
+        let ws = windows(&plan);
+        assert_eq!(ws.len(), 1);
+        assert!(ws[0].resets_at.is_empty());
+        let r = row(&ws[0], &Value::Null, &Value::Null);
+        assert!(r["resets_at"].is_null());
+        assert!(r["without"].is_null());
+        assert_eq!(summary(&[r], 80), "Session · inactive (0% used)\n\n");
     }
 
     #[test]

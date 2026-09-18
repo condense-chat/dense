@@ -9,11 +9,12 @@ use crate::api::{Api, auth};
 use crate::config::Config;
 use crate::error::{Context, Error};
 use crate::harness::claude;
-use crate::info::{self, BAR, MOON_SAVED, MOON_SPENT};
+use crate::info::{self, BAR};
 use crate::ui;
 
-/// Headroom the plan would have spent without condense.
-const MOON_WOULD: &str = "🌓";
+const BAR_USED: &str = "█";
+const BAR_FREE: &str = "░";
+const BAR_OVER: &str = "▓";
 const OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// The endpoint answers an empty 200 to any other agent.
 const CC_USER_AGENT: &str = "claude-cli/2.1.276 (external, cli)";
@@ -90,18 +91,61 @@ pub async fn run(cfg: &Config, sub: &str, json: bool, attributed_only: bool) -> 
     Ok(())
 }
 
-fn bar(used: f64, without: f64, width: usize) -> String {
-    let whole = without.max(used).max(100.0);
-    let bp = |p: f64| (p / whole * 10_000.0).round().clamp(0.0, 10_000.0) as i64;
-    let saved = (without - used).max(0.0);
-    let cells = info::allocate(&[bp(used), bp(saved)], 10_000, width);
-    let n = |i: usize| cells.get(i).map_or(0, |c| c.0);
+fn bar(used: f64, scale: f64, width: usize) -> String {
+    let base = ((100.0 / scale * width as f64).round() as usize).min(width);
+    let spent = ((used.clamp(0.0, 100.0) / 100.0 * base as f64).round() as usize).min(base);
+    let overflow = if scale > 100.0 {
+        (((used - 100.0).max(0.0) / (scale - 100.0) * (width - base) as f64).round() as usize)
+            .min(width - base)
+    } else {
+        0
+    };
     format!(
-        "{}{}{}",
-        MOON_SPENT.repeat(n(0)),
-        MOON_WOULD.repeat(n(1)),
-        MOON_SAVED.repeat(width.saturating_sub(n(0) + n(1)))
+        "{}{}{}{}",
+        BAR_USED.repeat(spent),
+        BAR_FREE.repeat(base - spent),
+        if scale > 100.0 { "│" } else { "" },
+        BAR_OVER.repeat(overflow),
     )
+}
+
+fn comparison(used: f64, without: f64, width: usize, indent: &str) -> String {
+    let scale = without.max(used).max(100.0);
+    let entries = [
+        ("Without condense", without, format!("{without:.0}% (est.)")),
+        ("With condense", used, format!("{used:.0}%")),
+    ];
+    let available = width.saturating_sub(indent.len());
+    let suffix_width = entries.iter().map(|(_, _, s)| s.len()).max().unwrap_or(0);
+    let marker_width = usize::from(scale > 100.0);
+    let glyph_width = console::measure_text_width(BAR_USED);
+    let inline_cells = available.saturating_sub(16 + 4 + suffix_width + marker_width) / glyph_width;
+    let inline = inline_cells >= 8;
+    let cells = if inline {
+        inline_cells
+    } else {
+        available.saturating_sub(marker_width) / glyph_width
+    };
+    let cells = cells.min((BAR as f64 * scale / 100.0).ceil() as usize);
+    let bar_width = cells * glyph_width + marker_width;
+    let mut out = String::new();
+    for (label, value, suffix) in entries {
+        let rendered = bar(value, scale, cells);
+        if inline {
+            let padding =
+                " ".repeat(bar_width.saturating_sub(console::measure_text_width(&rendered)));
+            out.push_str(&format!(
+                "{indent}{label:<16}  {rendered}{padding}  {suffix}\n"
+            ));
+        } else {
+            out.push_str(&wrapped(&format!("{label}: {suffix}"), width, indent));
+            out.push('\n');
+            if cells > 0 {
+                out.push_str(&format!("{indent}{rendered}\n"));
+            }
+        }
+    }
+    out
 }
 
 async fn fetch_plan(token: &str) -> Result<Value> {
@@ -205,7 +249,6 @@ fn summary(rows: &[Value], width: usize) -> String {
     let num = |r: &Value, k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let indent = if width >= 4 { "  " } else { "" };
-    let available = width.saturating_sub(indent.len());
     let mut out = String::new();
     for r in rows {
         let title = text(r, "title")
@@ -225,22 +268,7 @@ fn summary(rows: &[Value], width: usize) -> String {
         }
         let used = num(r, "utilization");
         if let Some(without) = r.get("without").and_then(Value::as_f64) {
-            let comparison = format!("{used:.0}% with dense · {without:.0}% without (est.)");
-            let cells = available.saturating_sub(console::measure_text_width(&comparison) + 2)
-                / console::measure_text_width(MOON_SPENT);
-            if cells >= 4 {
-                out.push_str(&format!(
-                    "{indent}{}  {comparison}\n",
-                    bar(used, without, cells.min(BAR))
-                ));
-            } else {
-                let cells = (available / console::measure_text_width(MOON_SPENT)).min(BAR);
-                if cells > 0 {
-                    out.push_str(&format!("{indent}{}\n", bar(used, without, cells)));
-                }
-                out.push_str(&wrapped(&comparison, width, indent));
-                out.push('\n');
-            }
+            out.push_str(&comparison(used, without, width, indent));
             out.push_str(&wrapped(
                 &format!(
                     "Estimated gain: {:.2}× ({:+.0}%)",
@@ -264,7 +292,7 @@ fn summary(rows: &[Value], width: usize) -> String {
         .any(|r| r.get("without").and_then(Value::as_f64).is_some())
     {
         out.push_str(&ui::dim(&wrapped(
-            &format!("{MOON_SPENT} used · {MOON_WOULD} saved (est.) · {MOON_SAVED} remaining"),
+            &format!("{BAR_USED} used · {BAR_FREE} remaining · │ 100% · {BAR_OVER} over limit"),
             width,
             "",
         )));
@@ -447,7 +475,8 @@ mod tests {
         assert_eq!(r["usage_multiplier"], 2.0);
         assert_eq!(r["inferred_requests"], 2);
         let display = summary(&[r], 80);
-        assert!(display.contains("100% with dense · 200% without (est.)"));
+        assert!(display.contains("Without condense"));
+        assert!(display.contains("200% (est.)"));
         assert!(display.contains("Estimated gain: 2.00× (+100%)"));
 
         let attributed = json!({"models": [{
@@ -494,7 +523,10 @@ mod tests {
                 );
             }
             let words = display.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(words.contains("100% with dense · 201% without (est.)"));
+            assert!(words.contains("Without condense"));
+            assert!(words.contains("With condense"));
+            assert!(words.contains("201% (est.)"));
+            assert!(words.contains("100%"));
             assert!(words.contains("Estimated gain: 2.01× (+101%)"));
             assert!(words.contains("resets 2026-09-22 04:59 UTC"));
         }
@@ -582,23 +614,19 @@ mod tests {
     }
 
     #[test]
-    fn bar_splits_used_saved_and_free() {
+    fn bars_share_scale_and_extend_beyond_the_limit() {
         assert_eq!(
-            bar(10.0, 25.0, BAR),
-            format!(
-                "{}{}{}",
-                MOON_SPENT.repeat(2),
-                MOON_WOULD.repeat(3),
-                MOON_SAVED.repeat(15)
-            )
+            bar(10.0, 100.0, BAR),
+            format!("{}{}", BAR_USED.repeat(2), BAR_FREE.repeat(18))
+        );
+        assert_eq!(bar(100.0, 200.0, BAR), format!("{}│", BAR_USED.repeat(10)));
+        assert_eq!(
+            bar(200.0, 200.0, BAR),
+            format!("{}│{}", BAR_USED.repeat(10), BAR_OVER.repeat(10))
         );
         assert_eq!(
-            bar(90.0, 150.0, BAR),
-            format!("{}{}", MOON_SPENT.repeat(12), MOON_WOULD.repeat(8))
-        );
-        assert_eq!(
-            bar(100.0, 200.0, BAR),
-            format!("{}{}", MOON_SPENT.repeat(10), MOON_WOULD.repeat(10))
+            bar(50.0, 200.0, BAR),
+            format!("{}{}│", BAR_USED.repeat(5), BAR_FREE.repeat(5))
         );
     }
 }

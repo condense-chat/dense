@@ -70,14 +70,22 @@ pub async fn run(cfg: &Config, sub: &str, json: bool) -> Result<()> {
     let plan = fetch_plan(&oauth.access_token).await?;
     let mut rows = Vec::new();
     for w in windows(&plan) {
+        let secs = w.secs.to_string();
+        let mut params = vec![
+            ("until", w.resets_at.as_str()),
+            ("window", &secs),
+            ("upstream_sub", "claude_code"),
+            ("provider", "anthropic"),
+        ];
+        if !w.model.is_empty() {
+            params.push(("model", &w.model));
+        }
         let url = reqwest::Url::parse_with_params(
-            &format!("{}/v1/me/usage/sub", cfg.api_base_url.trim_end_matches('/')),
-            [
-                ("sub", "claude_code"),
-                ("until", &w.resets_at),
-                ("window", &w.secs.to_string()),
-                ("model", &w.model),
-            ],
+            &format!(
+                "{}/v1/me/usage/models",
+                cfg.api_base_url.trim_end_matches('/')
+            ),
+            params,
         )
         .ctx("building the usage URL")?;
         rows.push(row(&w, &info::get(&api, url.as_str()).await?));
@@ -141,15 +149,32 @@ fn resets(at: &str) -> String {
     }
 }
 
+/// One window's row: the `/v1/me/usage/models` body summed across models,
+/// with output folded into raw since compression never touches it.
 fn row(w: &Window, got: &Value) -> Value {
-    let field = |k: &str| got.get(k).cloned().unwrap_or(Value::Null);
-    let usd = |k: &str| got.get(k).map_or(0.0, info::usd);
-    let without = without_pct(
-        w.utilization,
-        usd("attributed_pre_usd"),
-        usd("attributed_post_usd"),
-        usd("raw_usd"),
+    let models = got
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let count = |k: &str| {
+        models
+            .iter()
+            .filter_map(|m| m.get(k)?.as_u64())
+            .sum::<u64>()
+    };
+    let usd = |keys: &[&str]| {
+        let sum: f64 = models
+            .iter()
+            .flat_map(|m| keys.iter().map(|k| m.get(*k).map_or(0.0, info::usd)))
+            .sum();
+        (sum * 1e6).round() / 1e6
+    };
+    let (pre, sent, raw) = (
+        usd(&["pre_usd"]),
+        usd(&["sent_usd"]),
+        usd(&["raw_usd", "output_usd"]),
     );
+    let without = without_pct(w.utilization, pre, sent, raw);
     json!({
         "key": w.key,
         "title": w.title,
@@ -157,11 +182,11 @@ fn row(w: &Window, got: &Value) -> Value {
         "without": without,
         "saved": without - w.utilization,
         "resets_at": w.resets_at,
-        "requests": field("requests"),
-        "attributed": field("attributed"),
-        "attributed_pre_usd": field("attributed_pre_usd"),
-        "attributed_post_usd": field("attributed_post_usd"),
-        "raw_usd": field("raw_usd"),
+        "requests": count("requests"),
+        "reconciled_requests": count("reconciled_requests"),
+        "pre_usd": pre,
+        "sent_usd": sent,
+        "raw_usd": raw,
     })
 }
 
@@ -181,11 +206,11 @@ fn summary(rows: &[Value]) -> String {
             bar(used, without),
             without - used,
             ui::dim(&format!(
-                "attributed {}/{} requests · pre ${} → post ${} · raw ${}",
-                num(r, "attributed"),
+                "reconciled {}/{} requests · pre ${} → sent ${} · raw ${}",
+                num(r, "reconciled_requests"),
                 num(r, "requests"),
-                info::dollars(r.get("attributed_pre_usd")),
-                info::dollars(r.get("attributed_post_usd")),
+                info::dollars(r.get("pre_usd")),
+                info::dollars(r.get("sent_usd")),
                 info::dollars(r.get("raw_usd")),
             )),
         ));
@@ -257,15 +282,11 @@ fn windows(plan: &Value) -> Vec<Window> {
     out
 }
 
-/// Plan % the same traffic would have used uncompressed: the attributed part
-/// scales by pre/post cost, the unattributed (raw) part counts as-is.
-pub(crate) fn without_pct(n: f64, pre_attr: f64, post_attr: f64, raw: f64) -> f64 {
-    let d = post_attr + raw;
-    if d <= 0.0 {
-        n
-    } else {
-        n * (pre_attr + raw) / d
-    }
+/// Plan % the same traffic would have used uncompressed: the reconciled part
+/// scales by pre/sent cost, the rest (raw, plus all output) counts as-is.
+pub(crate) fn without_pct(n: f64, pre: f64, sent: f64, raw: f64) -> f64 {
+    let d = sent + raw;
+    if d <= 0.0 { n } else { n * (pre + raw) / d }
 }
 
 #[cfg(test)]
@@ -278,9 +299,39 @@ mod tests {
     }
 
     #[test]
-    fn without_pct_is_identity_with_nothing_attributed() {
+    fn without_pct_is_identity_with_nothing_reconciled() {
         assert!((without_pct(40.0, 0.0, 0.0, 5.0) - 40.0).abs() < 1e-9);
         assert!((without_pct(40.0, 0.0, 0.0, 0.0) - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn row_sums_models_with_output_as_raw() {
+        let w = Window {
+            key: "seven_day".into(),
+            model: String::new(),
+            resets_at: "2026-09-21T00:00:00+00:00".into(),
+            secs: WEEK_SECS,
+            title: "Current week (all models)".into(),
+            utilization: 40.0,
+        };
+        let got = serde_json::json!({"since": "a", "until": "b", "models": [
+            {"model": "claude-opus-4-6", "provider": "anthropic",
+             "requests": 120, "reconciled_requests": 110,
+             "pre_usd": "3.10", "sent_usd": "1.20", "saved_usd": "1.90",
+             "raw_usd": "0.40", "output_usd": "2.00"},
+            {"model": "claude-sonnet-4-6", "provider": "anthropic",
+             "requests": 5, "reconciled_requests": 0,
+             "pre_usd": "0", "sent_usd": "0", "saved_usd": "0",
+             "raw_usd": "0.10", "output_usd": "0.30"}
+        ]});
+        let r = row(&w, &got);
+        assert_eq!(r["requests"], 125);
+        assert_eq!(r["reconciled_requests"], 110);
+        assert_eq!(r["pre_usd"], 3.1);
+        assert_eq!(r["sent_usd"], 1.2);
+        assert_eq!(r["raw_usd"], 2.8);
+        // 40 × (3.10 + 2.80) / (1.20 + 2.80)
+        assert!((r["without"].as_f64().unwrap() - 59.0).abs() < 1e-9);
     }
 
     #[test]

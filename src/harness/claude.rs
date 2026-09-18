@@ -72,6 +72,10 @@ impl Tool for Claude {
         "claude"
     }
 
+    fn kind(&self) -> &'static str {
+        "claude_code"
+    }
+
     fn label(&self) -> &str {
         "Claude Code"
     }
@@ -180,6 +184,17 @@ mod tests {
             (s.oauth.access_token.as_str(), s.oauth.expires_at),
             ("t", 7)
         );
+    }
+
+    #[test]
+    fn condense_headers_carry_claude_code_kind() {
+        let cfg = Config::resolve(Some("https://api.example.com".into()), None).unwrap();
+        let creds = crate::api::auth::Creds {
+            token: Some("t".into()),
+            user_id: Some("u".into()),
+        };
+        let h = harness::condense_headers(&cfg, &creds, "s", Claude { plugin_dir: None }.kind());
+        assert!(h.contains(&("x-condense-kind".to_string(), "claude_code".to_string())));
     }
 
     #[test]

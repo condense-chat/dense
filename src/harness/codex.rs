@@ -65,6 +65,10 @@ impl Tool for Codex {
         "codex"
     }
 
+    fn kind(&self) -> &'static str {
+        "codex"
+    }
+
     fn label(&self) -> &str {
         "Codex"
     }

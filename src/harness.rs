@@ -35,6 +35,9 @@ pub trait Tool {
     /// The dialects this tool speaks; `apply` gets one [`Target`] per entry.
     fn dialects(&self) -> &'static [Dialect];
 
+    /// The `x-condense-kind` value; the server takes it verbatim.
+    fn kind(&self) -> &'static str;
+
     fn label(&self) -> &str;
 }
 
@@ -66,7 +69,7 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
         announce(cfg, tool.label());
     }
 
-    let headers = condense_headers(cfg, &creds, &session.id, tool.binary());
+    let headers = condense_headers(cfg, &creds, &session.id, tool.kind());
     let targets: Vec<Target> = tool
         .dialects()
         .iter()
@@ -174,25 +177,4 @@ fn swallow_interrupts() -> tokio::task::JoinHandle<()> {
             let _ = tokio::signal::ctrl_c().await;
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        h.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
-    }
-
-    #[test]
-    fn condense_headers_carries_kind() {
-        let cfg = Config::resolve(Some("https://api.example.com".into()), None).unwrap();
-        let creds = Creds {
-            token: Some("t".into()),
-            user_id: Some("u".into()),
-        };
-
-        let h = condense_headers(&cfg, &creds, "s", "opencode");
-        assert_eq!(header(&h, "x-condense-kind"), Some("opencode"));
-    }
 }

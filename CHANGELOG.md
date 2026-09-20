@@ -3,6 +3,17 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.10.0] - 2026-09-20
+
+### Bug Fixes
+- Keep output_usd as its own field- Include historical estimates and show gains above limits- Compact report to fit terminal width- Add compact moon phase legend- Compare with and without condense in separate bars- Keep inactive session windows visible- Clarify plan benefits and separate comparison bars- Simplify report hierarchy and share bar scale- Label optimized subscription Dense Claude
+
+### CI
+- Retry the release upload when GitHub fails it
+
+### Features
+- Tag every request with the harness kind- Subscription limits with condense vs without it- Read the per-model usage API, send the final kind
+
 ## [0.9.0] - 2026-09-17
 
 ### Bug Fixes

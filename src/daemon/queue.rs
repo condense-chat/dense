@@ -61,10 +61,6 @@ impl Queue {
     }
 
     /// Append `records`, then drop the oldest lines beyond the cap.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "producer lands with offline usage (IMIR-1034)")
-    )]
     pub fn push(&self, records: &[UsageRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());

@@ -7,6 +7,7 @@
 
 pub mod autostart;
 pub mod queue;
+pub mod sessions;
 pub mod switch;
 
 use std::fs::File;
@@ -55,6 +56,10 @@ pub struct State {
     pub member_enabled: Option<bool>,
     pub mode: Option<switch::Mode>,
     pub pid: Option<u32>,
+    /// When no condense routing was applied: the only spans whose
+    /// session-file usage the daemon reports (the proxy reports the rest).
+    #[serde(default)]
+    pub transparent_windows: sessions::Windows,
 }
 
 impl Backoff {
@@ -107,6 +112,11 @@ impl State {
         self.managed = None;
         self.member_enabled = None;
         self.device_enabled = None;
+    }
+
+    fn observed(&mut self, mode: switch::Mode) {
+        self.mode = Some(mode);
+        self.transparent_windows.note(mode, now_ms());
     }
 
     fn record(&mut self, reply: &HeartbeatReply) {
@@ -199,6 +209,9 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
         state.pid = Some(std::process::id());
     }
     tracing::info!(device = %device_id, profile = cfg.profile(), "dense daemon started");
+    if switch::observe(cfg) == switch::Mode::Condensing {
+        state.transparent_windows.close(last_seen_ms(&state));
+    }
     if let Some(enabled) = state.enforced() {
         tracing::info!(enabled, "applying the last known switch");
         apply(cfg, &mut state, enabled);
@@ -312,12 +325,12 @@ fn apply(cfg: &Config, state: &mut State, enabled: bool) -> bool {
             if outcome.changed {
                 tracing::info!(enabled, mode = outcome.mode.as_str(), "switch applied");
             }
-            state.mode = Some(outcome.mode);
+            state.observed(outcome.mode);
             outcome.changed
         }
         Err(e) => {
             tracing::warn!("could not apply switch (enabled={enabled}): {e}");
-            state.mode = Some(switch::observe(cfg));
+            state.observed(switch::observe(cfg));
             false
         }
     }
@@ -364,6 +377,11 @@ fn lock(cfg: &Config) -> Result<Option<File>> {
     }
 }
 
+/// When the daemon last ran a tick (ms) — the latest a mode change it missed can be dated.
+fn last_seen_ms(state: &State) -> u64 {
+    state.last_attempt_at.map_or_else(now_ms, |s| s * 1_000)
+}
+
 fn lock_file(cfg: &Config) -> PathBuf {
     cfg.data_dir().join("daemon").join("daemon.lock")
 }
@@ -373,6 +391,34 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Queue session-file usage for the transparent windows. Runs before the
+/// heartbeat so it works offline; the queue carries it to the next upload.
+/// The window follows the shims actually on disk: unmanaged devices without
+/// shims are transparent throughout (`dense claude` runs are excluded by
+/// their routed spans instead).
+fn report_offline_usage(cfg: &Config, state: &mut State) {
+    let now = now_ms();
+    match switch::observe(cfg) {
+        switch::Mode::Condensing => state.transparent_windows.close(last_seen_ms(state)),
+        switch::Mode::Transparent => state
+            .transparent_windows
+            .note(switch::Mode::Transparent, now),
+    }
+    state.transparent_windows.prune(now);
+    match sessions::report(cfg, &state.transparent_windows, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("queued {n} offline usage records from session files"),
+        Err(e) => tracing::warn!("could not read session usage: {e}"),
+    }
 }
 
 fn running(cfg: &Config) -> bool {
@@ -462,6 +508,7 @@ async fn tick(
     state: &mut State,
     backoff: &mut Backoff,
 ) -> Duration {
+    report_offline_usage(cfg, state);
     let (reply, api) = match heartbeat(cfg, device_id, state).await {
         Ok(Some(ok)) => ok,
         Ok(None) => {
@@ -481,7 +528,7 @@ async fn tick(
     let changed = match state.enforced() {
         Some(enabled) => apply(cfg, state, enabled),
         None => {
-            state.mode = Some(switch::observe(cfg));
+            state.observed(switch::observe(cfg));
             false
         }
     };
@@ -558,11 +605,18 @@ mod tests {
             managed: true,
             member_enabled: Some(true),
         });
+        s.transparent_windows.note(switch::Mode::Transparent, 1_000);
+        s.transparent_windows.close(2_000);
+        s.transparent_windows.note(switch::Mode::Transparent, 3_000);
         s.save(&cfg).unwrap();
         let back = State::load(&cfg);
         assert_eq!(back.enabled, Some(false));
         assert_eq!(back.device_enabled, Some(false));
         assert_eq!(back.enforced(), Some(false));
+        assert_eq!(back.transparent_windows, s.transparent_windows);
+        assert!(
+            back.transparent_windows.contains(1_500) && !back.transparent_windows.contains(2_500)
+        );
     }
 
     /// A one-route HTTP server: every request gets `status` + `body`; returns

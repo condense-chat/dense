@@ -61,6 +61,8 @@ pub struct State {
     /// session-file usage the daemon reports (the proxy reports the rest).
     #[serde(default)]
     pub transparent_windows: sessions::Windows,
+    /// Hash of the credentials the windows and queue belong to.
+    pub user: Option<String>,
 }
 
 impl Backoff {
@@ -133,6 +135,7 @@ impl State {
 }
 
 pub async fn install(cfg: &Config) -> Result<()> {
+    sessions::remember_root(cfg);
     let device_id = device::id(cfg)?;
     let report = autostart::install(cfg)?;
     println!("daemon autostart installed -> {}", report.path.display());
@@ -146,6 +149,7 @@ pub async fn install(cfg: &Config) -> Result<()> {
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
 pub async fn after_login(cfg: &Config) {
+    sessions::remember_root(cfg);
     if let Some(user) = auth::load_creds(cfg).user_id {
         match device::bind_user(cfg, &user) {
             Ok(true) => drop_usage(cfg),
@@ -190,7 +194,8 @@ pub async fn after_login(cfg: &Config) {
 pub fn forget_switch(cfg: &Config) {
     let mut state = State::load(cfg);
     state.forget_switch();
-    state.transparent_windows.close(now_ms());
+    state.transparent_windows = sessions::Windows::default();
+    state.user = None;
     save(cfg, &state);
     drop_usage(cfg);
 }
@@ -214,6 +219,7 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
         return Ok(());
     };
     let mut device_id = device::id(cfg)?;
+    sessions::remember_root(cfg);
     let mut state = State::load(cfg);
     if !once {
         state.pid = Some(std::process::id());
@@ -417,8 +423,20 @@ fn now_ms() -> u64 {
 /// their routed spans instead).
 fn report_offline_usage(cfg: &Config, state: &mut State) {
     let now = now_ms();
-    if !auth::load_creds(cfg).is_authenticated() {
-        state.transparent_windows.close(now);
+    let user = user_ref(&auth::load_creds(cfg));
+    if state.user != user {
+        // Nothing from before the change may be reported or uploaded as the new user.
+        if state.user.is_some() {
+            state.transparent_windows = sessions::Windows::default();
+            drop_usage(cfg);
+        }
+        if user.is_none() {
+            state.forget_switch();
+        }
+        state.user.clone_from(&user);
+    }
+    if user.is_none() {
+        state.transparent_windows = sessions::Windows::default();
         return;
     }
     match switch::observe(cfg) {
@@ -433,6 +451,12 @@ fn report_offline_usage(cfg: &Config, state: &mut State) {
         Ok(n) => tracing::info!("queued {n} offline usage records from session files"),
         Err(e) => tracing::warn!("could not read session usage: {e}"),
     }
+}
+
+fn user_ref(creds: &auth::Creds) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let who = creds.user_id.as_deref().or(creds.token.as_deref())?;
+    Some(hex::encode(&Sha256::digest(who.as_bytes())[..8]))
 }
 
 fn running(cfg: &Config) -> bool {
@@ -902,6 +926,45 @@ mod tests {
         report_offline_usage(&cfg, &mut state);
         assert!(!state.transparent_windows.contains(now_ms() + 1));
         assert!(!cfg.data_dir().join("daemon/sessions.json").exists());
+    }
+
+    #[test]
+    fn user_change_never_carries_windows_queue_or_switch_over() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        let login = |who: &str| {
+            std::fs::create_dir_all(cfg.cred_dir()).unwrap();
+            std::fs::write(cfg.user_file(), who).unwrap();
+        };
+        login("user-a");
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        };
+        report_offline_usage(&cfg, &mut state);
+        let a = state.user.clone();
+        assert!(a.is_some() && state.transparent_windows.contains(now_ms()));
+        state.transparent_windows = sessions::Windows::default();
+        state
+            .transparent_windows
+            .note(switch::Mode::Transparent, 1_000);
+        let q = queue::Queue::open(&cfg);
+        q.push(&[usage_record("m1")]).unwrap();
+
+        login("user-b");
+        report_offline_usage(&cfg, &mut state);
+        assert!(state.user.is_some() && state.user != a);
+        assert!(!state.transparent_windows.contains(1_500));
+        assert_eq!(q.len(), 0);
+        assert_eq!(state.enforced(), Some(false));
+
+        std::fs::remove_file(cfg.user_file()).unwrap();
+        q.push(&[usage_record("m2")]).unwrap();
+        report_offline_usage(&cfg, &mut state);
+        assert_eq!((state.user.as_deref(), state.enforced()), (None, None));
+        assert!(!state.transparent_windows.contains(now_ms()));
+        assert_eq!(q.len(), 0);
     }
 
     fn usage_record(id: &str) -> queue::UsageRecord {

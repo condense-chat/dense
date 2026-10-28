@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::queue::{Queue, UsageRecord};
-use super::routed::{Bindings, Routed, Verdict};
+use super::routed::{Bindings, Routed, Seen, Verdict};
 use super::switch::Mode;
 use crate::Result;
 use crate::config::Config;
@@ -68,10 +68,14 @@ struct Ctx<'a> {
     bindings: &'a mut Bindings,
     filter: &'a Filter<'a>,
     now_ms: u64,
+    project: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Cursor {
+    /// Timestamp of the file's first assistant line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_ms: Option<u64>,
     /// sha256 of the first `head_len` bytes: a mismatch means the file was replaced.
     head: String,
     head_len: u64,
@@ -240,11 +244,29 @@ pub fn roots(home: &Path, env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> 
 /// Remember this process's `CLAUDE_CONFIG_DIR` for the daemon, whose
 /// supervisor environment does not carry it.
 pub fn remember_root(cfg: &Config) {
-    let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-    else {
+    {
+        remember_dir(cfg, dir);
+    }
+}
+
+fn remember_dir(cfg: &Config, dir: PathBuf) {
+    if remembered_roots(cfg).contains(&dir) {
         return;
+    }
+    let lock = std::fs::create_dir_all(cfg.data_dir()).and_then(|()| {
+        let f = File::create(roots_file(cfg).with_extension("lock"))?;
+        f.lock()?;
+        Ok(f)
+    });
+    let _lock = match lock {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("could not lock the CLAUDE_CONFIG_DIR list: {e}");
+            return;
+        }
     };
     let mut known = remembered_roots(cfg);
     if known.contains(&dir) {
@@ -260,9 +282,7 @@ pub fn remember_root(cfg: &Config) {
         .collect();
     let path = roots_file(cfg);
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = std::fs::create_dir_all(cfg.data_dir())
-        .and_then(|()| std::fs::write(&tmp, body))
-        .and_then(|()| std::fs::rename(&tmp, &path));
+    let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         tracing::debug!("could not remember CLAUDE_CONFIG_DIR: {e}");
@@ -283,6 +303,15 @@ pub fn scan(
     }
     files.sort();
     files.dedup();
+    let project_of = |path: &Path| {
+        roots.iter().find_map(|r| {
+            let rel = path.strip_prefix(r).ok()?;
+            let mut parts = rel.components();
+            let dir = parts.next()?.as_os_str().to_str()?.to_string();
+            parts.next()?;
+            parts.next().is_none().then_some(dir)
+        })
+    };
     let mut out = Vec::new();
     let mut dirty = false;
     let mut live = BTreeSet::new();
@@ -294,6 +323,7 @@ pub fn scan(
             bindings: &mut cursors.bindings,
             filter,
             now_ms,
+            project: project_of(&path),
         };
         let bound = ctx.bindings.len();
         match read_file(&path, cursor, &mut ctx, &mut out) {
@@ -361,13 +391,16 @@ fn handle_line(
     {
         return true;
     }
+    let file_first_ms = *cursor.first_ms.get_or_insert(ts);
     if !cursor.pending.contains_key(&id) {
-        let sid = Some(session.as_str()).filter(|s| !s.is_empty());
-        match ctx
-            .filter
-            .routed
-            .judge(ctx.bindings, sid, parsed.cwd.as_deref(), ts, ctx.now_ms)
-        {
+        let seen = Seen {
+            cwd: parsed.cwd.as_deref(),
+            file_first_ms,
+            project: ctx.project.as_deref(),
+            session: Some(session.as_str()).filter(|s| !s.is_empty()),
+            ts_ms: ts,
+        };
+        match ctx.filter.routed.judge(ctx.bindings, &seen, ctx.now_ms) {
             Verdict::Defer => return false,
             Verdict::Skip => {
                 remember(cursor, id);
@@ -532,6 +565,7 @@ fn read_file(
                 && (size < cursor.head_len
                     || head_hash(&mut file, cursor.head_len)? != cursor.head));
         if replaced {
+            cursor.first_ms = None;
             cursor.offset = 0;
             cursor.head_len = 0;
         }
@@ -743,6 +777,7 @@ mod tests {
             start_ms: T0 + 10,
         };
         let routed = Routed {
+            complete: true,
             loaded_ms: T0 + 1_000,
             spans: vec![span("pinned", Some("s-pin")), span("resumed", None)],
         };
@@ -754,16 +789,31 @@ mod tests {
             format!("{v}\n")
         };
         fx.append(
-            "-w-routed/s.jsonl",
+            "-w-routed/s-pin.jsonl",
             &[
-                line("pin_cd", T0 + 20, "s-pin", "/elsewhere"),
                 line("pin_before", T0 + 5, "s-pin", "/w/routed"),
+                line("pin_cd", T0 + 20, "s-pin", "/elsewhere"),
                 line("pin_after", T0 + 100, "s-pin", "/w/routed"),
+            ]
+            .concat(),
+        );
+        fx.append(
+            "-w-routed/s-res.jsonl",
+            &[
                 line("res_first", T0 + 30, "s-res", "/w/routed"),
                 line("res_cd", T0 + 40, "s-res", "/w/routed/sub"),
-                line("plain_sub", T0 + 50, "s-plain", "/w/routed/sub"),
+            ]
+            .concat(),
+        );
+        fx.append(
+            "-w-routed-sub/s-plain.jsonl",
+            &line("plain_sub", T0 + 50, "s-plain", "/w/routed/sub"),
+        );
+        fx.append(
+            "-w-other/s-other.jsonl",
+            &[
                 line("plain_other", T0 + 50, "s-other", "/w/other"),
-                line("later", T0 + 1_500, "s-plain", "/w/other"),
+                line("later", T0 + 1_500, "s-other", "/w/other"),
             ]
             .concat(),
         );
@@ -775,7 +825,7 @@ mod tests {
         let mut got = ids(&got);
         got.sort_unstable();
         assert_eq!(got, ["pin_after", "pin_before", "plain_other", "plain_sub"]);
-        assert_eq!(c.bindings.len(), 1);
+        assert_eq!(c.bindings.len(), 2);
 
         let routed = Routed {
             loaded_ms: T0 + 1_000_000,
@@ -787,6 +837,77 @@ mod tests {
         };
         let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 1_000_000);
         assert_eq!(ids(&got), ["later"]);
+    }
+
+    #[test]
+    fn clear_inside_a_pinned_session_is_not_reported() {
+        let fx = Fx::new();
+        let mut c = Cursors::default();
+        let w = open_from(T0);
+        let routed = Routed {
+            complete: true,
+            loaded_ms: T0 + 1_000,
+            spans: vec![Span {
+                cwd: "/w/routed".into(),
+                end_ms: None,
+                id: "pinned".into(),
+                pid: 1,
+                seen_ms: T0 + 500,
+                session_id: Some("X".into()),
+                start_ms: T0 + 10,
+            }],
+        };
+        let line = |id: &str, at: u64, sid: &str, cwd: &str| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&assistant(id, at, 5, Some("end_turn"))).unwrap();
+            v["sessionId"] = json!(sid);
+            v["cwd"] = json!(cwd);
+            format!("{v}\n")
+        };
+        fx.append(
+            "-w-routed/X.jsonl",
+            &line("before_clear", T0 + 20, "X", "/w/routed"),
+        );
+        fx.append(
+            "-w-routed/Y.jsonl",
+            &line("after_clear", T0 + 30, "Y", "/w/routed/sub"),
+        );
+        fx.append(
+            "-w-elsewhere/Z.jsonl",
+            &line("plain", T0 + 30, "Z", "/w/elsewhere"),
+        );
+        let f = Filter {
+            routed: &routed,
+            windows: &w,
+        };
+        let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 600);
+        assert_eq!(ids(&got), ["plain"]);
+    }
+
+    #[test]
+    fn a_far_future_line_does_not_block_its_file() {
+        let fx = Fx::new();
+        let mut c = Cursors::default();
+        let w = open_from(T0);
+        let routed = Routed {
+            complete: true,
+            loaded_ms: T0 + 1_000,
+            spans: vec![],
+        };
+        fx.append(
+            "p/s.jsonl",
+            &[
+                assistant("future", T0 + 10_000_000, 5, Some("end_turn")),
+                assistant("normal", T0 + 20, 5, Some("end_turn")),
+            ]
+            .concat(),
+        );
+        let f = Filter {
+            routed: &routed,
+            windows: &w,
+        };
+        let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 1_000);
+        assert_eq!(ids(&got), ["future", "normal"]);
     }
 
     #[test]
@@ -826,6 +947,23 @@ mod tests {
                 .as_millis(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn concurrent_root_updates_keep_every_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let mut want: Vec<PathBuf> = (0..8).map(|i| tmp.path().join(format!("c{i}"))).collect();
+        std::thread::scope(|s| {
+            for dir in &want {
+                let cfg = &cfg;
+                s.spawn(move || remember_dir(cfg, dir.clone()));
+            }
+        });
+        let mut got = remembered_roots(&cfg);
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     fn ids(records: &[UsageRecord]) -> Vec<&str> {

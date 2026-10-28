@@ -44,6 +44,9 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
+    /// Device daemon: heartbeat, apply the org's on/off switch, upload usage.
+    #[command(subcommand, hide = true)]
+    Daemon(DaemonCommand),
     /// Verify the install is wired correctly.
     Doctor,
     /// Account, lifetime savings, and — given a session — that session's context and spend.
@@ -118,6 +121,20 @@ pub enum Command {
         #[arg(value_name = "SUB", default_value = "claude", value_parser = ["claude", "codex"])]
         sub: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Start the daemon at login (launchd / systemd user unit / Startup folder).
+    Install,
+    /// Run the daemon loop in the foreground.
+    Run {
+        /// Run a single heartbeat tick and exit.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Remove the autostart entry and tell condense this device is gone.
+    Uninstall,
 }
 
 #[derive(Subcommand)]

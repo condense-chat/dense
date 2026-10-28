@@ -57,6 +57,28 @@ impl Config {
         }
     }
 
+    /// A config rooted at `root` for an ad-hoc `url`, independent of the
+    /// process env — tests must not touch the real home.
+    #[cfg(test)]
+    pub fn for_test(root: &Path, url: &str) -> Self {
+        let profile = profile_for_url(&root.join("config"), url);
+        Self {
+            api_base_url: profile.api_url.clone(),
+            api_host: crate::hosts::host_of(&profile.api_url),
+            auth_required: profile.auth_required,
+            codex_websocket: true,
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            home: root.to_path_buf(),
+            open_links: false,
+            profile_name: profile.name,
+            profile_url: None,
+            release_url: None,
+            session_id: None,
+            upstream: None,
+        }
+    }
+
     /// Directory the `dense` binary itself is installed to (and put on PATH).
     #[cfg(not(windows))]
     pub fn bin_dir(&self) -> PathBuf {
@@ -92,8 +114,18 @@ impl Config {
         cred_dir_for(&self.config_dir, &self.profile_name)
     }
 
+    /// Per-profile daemon state + usage queue: `<data>/daemon/<profile>/`.
+    pub fn daemon_dir(&self) -> PathBuf {
+        self.data_dir.join("daemon").join(&self.profile_name)
+    }
+
     pub fn data_dir(&self) -> PathBuf {
         self.data_dir.clone()
+    }
+
+    /// The device identity — a UUID generated once per credential dir.
+    pub fn device_file(&self) -> PathBuf {
+        self.cred_dir().join("device")
     }
 
     pub fn env_file(&self) -> PathBuf {

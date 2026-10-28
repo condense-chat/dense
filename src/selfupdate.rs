@@ -24,6 +24,10 @@ struct Manifest {
 }
 
 pub fn uninstall(cfg: &Config) -> Result<()> {
+    let pid = crate::daemon::State::load(cfg).pid;
+    if let Err(e) = crate::daemon::autostart::uninstall(cfg, pid) {
+        eprintln!("warning: could not remove the daemon autostart ({e})");
+    }
     for name in persist::load_record(cfg).tools.keys() {
         let _ = std::fs::remove_file(persist::shim_path(cfg, name));
     }

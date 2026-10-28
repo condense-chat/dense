@@ -4,6 +4,8 @@
 mod api;
 mod cli;
 mod config;
+mod daemon;
+mod device;
 mod doctor;
 mod env_file;
 mod error;
@@ -26,7 +28,7 @@ use color_eyre::Result as EyreResult;
 use tracing_subscriber::EnvFilter;
 
 use api::auth;
-use cli::{Cli, Command, SelfCommand};
+use cli::{Cli, Command, DaemonCommand, SelfCommand};
 use config::Config;
 
 fn init_tracing(verbose: u8) {
@@ -59,6 +61,9 @@ async fn main() -> EyreResult<()> {
             status(&cfg);
             Ok(())
         }
+        Command::Daemon(DaemonCommand::Install) => daemon::install(&cfg).await,
+        Command::Daemon(DaemonCommand::Run { once }) => daemon::run(&cfg, once).await,
+        Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg).await,
         Command::Codex { args } => harness::codex::run(&cfg, &args).await,
         Command::Login => auth::login(&cfg).await,
         Command::Logout => auth::logout(&cfg),
@@ -118,4 +123,7 @@ fn status(cfg: &Config) {
     println!("creds:   {}", cfg.cred_dir().display());
     println!("token:   {}", presence(creds.token.is_some()));
     println!("user:    {}", presence(creds.user_id.is_some()));
+    for (label, value) in daemon::status_lines(cfg) {
+        println!("{:<9}{value}", format!("{label}:"));
+    }
 }

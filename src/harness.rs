@@ -69,7 +69,8 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
         announce(cfg, tool.label());
     }
 
-    let headers = condense_headers(cfg, &creds, &session.id, tool.kind());
+    let device_id = crate::device::id(cfg).ok();
+    let headers = condense_headers(cfg, &creds, device_id.as_deref(), &session.id, tool.kind());
     let targets: Vec<Target> = tool
         .dialects()
         .iter()
@@ -131,11 +132,12 @@ fn announce(cfg: &Config, label: &str) {
     eprintln!();
 }
 
-/// The `x-condense-*` headers on every request — auth/user/session, the
-/// harness kind, plus the optional upstream override.
+/// The `x-condense-*` headers on every request — auth/user/device/session,
+/// the harness kind, plus the optional upstream override.
 fn condense_headers(
     cfg: &Config,
     creds: &Creds,
+    device_id: Option<&str>,
     session_id: &str,
     kind: &str,
 ) -> Vec<(String, String)> {
@@ -145,6 +147,9 @@ fn condense_headers(
     }
     if let Some(user) = &creds.user_id {
         h.push(("x-condense-user-id".to_string(), user.clone()));
+    }
+    if let Some(device) = device_id {
+        h.push((crate::device::HEADER.to_string(), device.to_string()));
     }
     h.push(("x-condense-session-id".to_string(), session_id.to_string()));
     if let Some(upstream) = cfg.upstream() {

@@ -5,6 +5,7 @@
 //! descriptors ([`profile`]), and live sessions ([`session`]).
 
 pub mod auth;
+pub mod devices;
 pub mod dialect;
 pub mod profile;
 pub mod session;
@@ -39,9 +40,16 @@ impl Api {
         Self::build(base, HeaderMap::new())
     }
 
-    /// Client for the configured api with `creds` attached to every request.
+    /// Client for the configured api with `creds` and the device id attached
+    /// to every request.
     pub fn authed(cfg: &Config, creds: &Creds) -> Result<Self> {
-        Self::build(&cfg.api_base_url, creds_headers(creds)?)
+        let mut headers = creds_headers(creds)?;
+        if let Some(id) = crate::device::id(cfg).ok()
+            && let Ok(value) = HeaderValue::from_str(&id)
+        {
+            headers.insert(crate::device::HEADER, value);
+        }
+        Self::build(&cfg.api_base_url, headers)
     }
 
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {

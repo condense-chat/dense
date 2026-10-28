@@ -1,6 +1,7 @@
 //! Spans in which `dense claude` routed a Claude Code process through the
 //! proxy. The proxy already reports that usage, so the session reader skips
-//! lines from those spans. One file per launch under `<daemon dir>/routed/`;
+//! lines from those spans. One file per launch under `<data dir>/routed/`,
+//! shared by every profile since one daemon serves the machine;
 //! the launcher refreshes `seen_ms` while alive, so a crashed launcher's span
 //! ends at its last refresh plus [`LEASE_MS`].
 
@@ -128,7 +129,7 @@ impl Span {
 }
 
 fn dir(cfg: &Config) -> PathBuf {
-    cfg.daemon_dir().join("routed")
+    cfg.data_dir().join("routed")
 }
 
 fn now_ms() -> u64 {
@@ -198,5 +199,21 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["live.json"]);
+    }
+
+    #[tokio::test]
+    async fn span_from_any_profile_reaches_the_machine_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let other = Config::for_test(tmp.path(), "http://127.0.0.2:9");
+        assert_ne!(daemon.profile(), other.profile());
+        let guard = Guard::open(&other).unwrap();
+        let now = now_ms();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(Routed::load_and_prune(&daemon, now).covers(&cwd, now));
+        guard.close();
+        let r = Routed::load_and_prune(&daemon, now_ms());
+        assert_eq!(r.0.len(), 1);
+        assert!(r.0[0].end_ms.is_some());
     }
 }

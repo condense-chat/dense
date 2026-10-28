@@ -2,7 +2,7 @@
 name = "dense"
 version = "0.10.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Durable condense CLI — login once, run Claude Code (and later Codex) through the condense proxy."
 license = "MIT"
 repository = "https://github.com/condense-chat/dense"

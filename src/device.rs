@@ -21,8 +21,22 @@ pub fn id(cfg: &Config) -> Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&path, format!("{id}\n")).ctx(format!("writing {}", path.display()))?;
-    Ok(id)
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    write_private(&tmp, &format!("{id}\n"))?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    // Hard-link, not rename: two first runs racing keep one id, never two.
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match (linked, load(cfg)) {
+        (_, Some(stored)) => Ok(stored),
+        (Err(e), None) => Err(e).ctx(format!("writing {}", path.display())),
+        (Ok(()), None) => Err(crate::error::Error::msg(format!(
+            "{} is unreadable after writing it",
+            path.display()
+        ))),
+    }
 }
 
 /// The stored device id, if one exists and parses as a UUID.
@@ -40,6 +54,18 @@ pub fn platform() -> &'static str {
     } else {
         "linux"
     }
+}
+
+fn write_private(path: &std::path::Path, body: &str) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).ctx(format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut f, body.as_bytes()).ctx(format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -68,5 +94,19 @@ mod tests {
         std::fs::write(cfg.device_file(), "not-a-uuid\n").unwrap();
         let fresh = id(&cfg).unwrap();
         assert_ne!(fresh, "not-a-uuid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(home.path(), "http://127.0.0.1:9");
+        id(&cfg).unwrap();
+        let mode = std::fs::metadata(cfg.device_file())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

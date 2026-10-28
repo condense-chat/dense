@@ -65,8 +65,14 @@ async fn main() -> EyreResult<()> {
         Command::Daemon(DaemonCommand::Run { once }) => daemon::run(&cfg, once).await,
         Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg).await,
         Command::Codex { args } => harness::codex::run(&cfg, &args).await,
-        Command::Login => auth::login(&cfg).await,
-        Command::Logout => auth::logout(&cfg),
+        Command::Login => match auth::login(&cfg).await {
+            Ok(()) => {
+                daemon::after_login(&cfg).await;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        Command::Logout => auth::logout(&cfg).inspect(|()| daemon::forget_switch(&cfg)),
         Command::Claude { args } => harness::claude::run(&cfg, &args).await,
         Command::Opencode { args } => harness::opencode::run(&cfg, &args).await,
         Command::Persist {
@@ -92,7 +98,7 @@ async fn main() -> EyreResult<()> {
             }
         }
         Command::SelfCmd(SelfCommand::Update) => selfupdate::update(&cfg).await,
-        Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg),
+        Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg).await,
         Command::Info {
             bar,
             json,

@@ -1,6 +1,9 @@
 //! Per-user autostart for `dense daemon run`: a systemd user unit (Linux), a
 //! launchd agent (macOS), a hidden Startup-folder launcher (Windows). The
-//! entry pins `--url` so the daemon serves the profile it was installed from.
+//! entry pins `--url` so the daemon serves the profile it was installed from,
+//! and carries the installing shell's PATH/XDG dirs so it finds the same
+//! tools and credentials. There is one entry per user: one daemon owns the
+//! shared shim dir.
 
 use std::path::{Path, PathBuf};
 
@@ -8,10 +11,11 @@ use crate::Result;
 use crate::config::Config;
 use crate::error::{Context, Error};
 
-#[cfg(target_os = "macos")]
 const LABEL: &str = "chat.condense.dense.daemon";
 #[cfg(all(unix, not(target_os = "macos")))]
 const UNIT: &str = "dense-daemon.service";
+/// Milliseconds the Windows launcher waits before restarting a crashed daemon.
+const VBS_RESTART_MS: u32 = 10_000;
 
 /// What install/uninstall did, for the caller to print.
 pub struct Report {
@@ -33,6 +37,8 @@ pub fn command(cfg: &Config) -> Result<(PathBuf, Vec<String>)> {
     ))
 }
 
+/// Write the entry and start it now. Fails (leaving the entry, which still
+/// applies at next login) when the service manager would not start it.
 pub fn install(cfg: &Config) -> Result<Report> {
     let path = entry_path(cfg)?;
     let (exe, args) = command(cfg)?;
@@ -40,8 +46,20 @@ pub fn install(cfg: &Config) -> Result<Report> {
         std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
     }
     std::fs::create_dir_all(cfg.daemon_dir()).ctx("creating dense daemon dir")?;
-    std::fs::write(&path, render(cfg, &exe, &args)).ctx(format!("writing {}", path.display()))?;
-    let notes = activate(&path);
+    let mut notes = Vec::new();
+    if let Ok(old) = std::fs::read_to_string(&path)
+        && !old.contains(&cfg.api_base_url)
+    {
+        notes.push("replaced the autostart entry of another profile".to_string());
+    }
+    std::fs::write(&path, render(cfg, &exe, &args, &env_vars()))
+        .ctx(format!("writing {}", path.display()))?;
+    activate(&path).map_err(|e| {
+        Error::msg(format!(
+            "autostart entry written to {} but the daemon could not be started: {e}",
+            path.display()
+        ))
+    })?;
     Ok(Report { notes, path })
 }
 
@@ -51,6 +69,7 @@ pub fn installed(cfg: &Config) -> Option<PathBuf> {
 }
 
 /// Stop and remove the entry; `None` when there was nothing installed.
+/// `pid` is the running daemon's, for platforms that stop it by pid.
 pub fn uninstall(cfg: &Config, pid: Option<u32>) -> Result<Option<Report>> {
     let Some(path) = installed(cfg) else {
         return Ok(None);
@@ -67,37 +86,25 @@ pub fn uninstall(cfg: &Config, pid: Option<u32>) -> Result<Option<Report>> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn activate(_path: &Path) -> Vec<String> {
-    let mut notes = Vec::new();
-    for args in [
-        &["--user", "daemon-reload"][..],
-        &["--user", "enable", "--now", UNIT][..],
-    ] {
-        if let Err(e) = run("systemctl", args) {
-            notes.push(format!("systemctl {}: {e}", args.join(" ")));
-        }
-    }
-    notes
+fn activate(_path: &Path) -> Result<()> {
+    run("systemctl", &["--user", "daemon-reload"])?;
+    run("systemctl", &["--user", "enable", "--now", UNIT])
 }
 
 #[cfg(target_os = "macos")]
-fn activate(path: &Path) -> Vec<String> {
+fn activate(path: &Path) -> Result<()> {
     let p = path.to_string_lossy();
     let _ = run("launchctl", &["unload", &p]);
     run("launchctl", &["load", "-w", &p])
-        .err()
-        .map(|e| vec![format!("launchctl load: {e}")])
-        .unwrap_or_default()
 }
 
 #[cfg(windows)]
-fn activate(path: &Path) -> Vec<String> {
-    match std::process::Command::new("wscript.exe").arg(path).spawn() {
-        Ok(_) => Vec::new(),
-        Err(e) => vec![format!(
-            "could not start the daemon now ({e}); it starts at next login"
-        )],
-    }
+fn activate(path: &Path) -> Result<()> {
+    std::process::Command::new("wscript.exe")
+        .arg(path)
+        .spawn()
+        .map(drop)
+        .map_err(|e| Error::msg(format!("running wscript.exe: {e}")))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -116,15 +123,23 @@ fn deactivate(path: &Path, _pid: Option<u32>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The launcher restarts the daemon only while its own file exists, so the
+/// file goes first; then the daemon is stopped.
 #[cfg(windows)]
-fn deactivate(_path: &Path, pid: Option<u32>) -> Vec<String> {
-    let Some(pid) = pid else { return Vec::new() };
+fn deactivate(path: &Path, pid: Option<u32>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        notes.push(format!("removing {}: {e}", path.display()));
+    }
+    let Some(pid) = pid else { return notes };
     let image = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "dense.exe".into());
     // The image filter keeps a stale, reused pid from killing something else.
-    run(
+    if let Err(e) = run(
         "taskkill",
         &[
             "/F",
@@ -133,10 +148,10 @@ fn deactivate(_path: &Path, pid: Option<u32>) -> Vec<String> {
             "/FI",
             &format!("IMAGENAME eq {image}"),
         ],
-    )
-    .err()
-    .map(|e| vec![format!("could not stop daemon pid {pid}: {e}")])
-    .unwrap_or_default()
+    ) {
+        notes.push(format!("could not stop daemon pid {pid}: {e}"));
+    }
+    notes
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -174,26 +189,80 @@ fn entry_path(cfg: &Config) -> Result<PathBuf> {
         .join("dense-daemon.vbs"))
 }
 
+/// Environment the daemon needs to see what the installing shell sees. A
+/// Windows logon session already carries the user's environment.
+fn env_vars() -> Vec<(String, String)> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    ["PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect()
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
-fn render(_cfg: &Config, exe: &Path, args: &[String]) -> String {
-    let quoted: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
-        .chain(args.iter().cloned())
-        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
-        .collect();
-    format!(
-        "[Unit]\nDescription=dense device daemon\nAfter=network-online.target\n\n\
-         [Service]\nExecStart={}\nRestart=always\nRestartSec=10\n\n\
-         [Install]\nWantedBy=default.target\n",
-        quoted.join(" ")
-    )
+fn render(_cfg: &Config, exe: &Path, args: &[String], env: &[(String, String)]) -> String {
+    render_systemd(exe, args, env)
 }
 
 #[cfg(target_os = "macos")]
-fn render(cfg: &Config, exe: &Path, args: &[String]) -> String {
-    let log = cfg.daemon_dir().join("daemon.log");
+fn render(cfg: &Config, exe: &Path, args: &[String], env: &[(String, String)]) -> String {
+    render_launchd(&cfg.daemon_dir().join("daemon.log"), exe, args, env)
+}
+
+#[cfg(windows)]
+fn render(_cfg: &Config, exe: &Path, args: &[String], _env: &[(String, String)]) -> String {
+    render_vbs(exe, args)
+}
+
+/// systemd expands `%` specifiers everywhere and `$VAR` in `ExecStart`,
+/// quoted or not, so both are doubled.
+#[cfg_attr(
+    not(any(test, all(unix, not(target_os = "macos")))),
+    expect(dead_code, reason = "the Linux renderer")
+)]
+fn render_systemd(exe: &Path, args: &[String], env: &[(String, String)]) -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let exec: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .map(|a| quote(&a.replace('%', "%%").replace('$', "$$")))
+        .collect();
+    let environment: String = env
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "Environment={}\n",
+                quote(&format!("{k}={v}").replace('%', "%%"))
+            )
+        })
+        .collect();
+    format!(
+        "[Unit]\nDescription=dense device daemon\nAfter=network-online.target\n\n\
+         [Service]\n{environment}ExecStart={}\nRestart=always\nRestartSec=10\n\n\
+         [Install]\nWantedBy=default.target\n",
+        exec.join(" ")
+    )
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "macos")),
+    expect(dead_code, reason = "the macOS renderer")
+)]
+fn render_launchd(log: &Path, exe: &Path, args: &[String], env: &[(String, String)]) -> String {
     let program: String = std::iter::once(exe.to_string_lossy().into_owned())
         .chain(args.iter().cloned())
         .map(|a| format!("    <string>{}</string>\n", xml_escape(&a)))
+        .collect();
+    let vars: String = env
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "    <key>{}</key>\n    <string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
         .collect();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -201,6 +270,7 @@ fn render(cfg: &Config, exe: &Path, args: &[String]) -> String {
          <plist version=\"1.0\">\n<dict>\n\
          \x20 <key>Label</key>\n  <string>{LABEL}</string>\n\
          \x20 <key>ProgramArguments</key>\n  <array>\n{program}  </array>\n\
+         \x20 <key>EnvironmentVariables</key>\n  <dict>\n{vars}  </dict>\n\
          \x20 <key>RunAtLoad</key>\n  <true/>\n\
          \x20 <key>KeepAlive</key>\n  <true/>\n\
          \x20 <key>StandardErrorPath</key>\n  <string>{}</string>\n\
@@ -209,15 +279,25 @@ fn render(cfg: &Config, exe: &Path, args: &[String]) -> String {
     )
 }
 
-/// A VBScript launcher: `Run …, 0` starts the console binary with no window.
-#[cfg(windows)]
-fn render(_cfg: &Config, exe: &Path, args: &[String]) -> String {
+/// A VBScript launcher: `Run …, 0, True` runs the console binary with no
+/// window and waits; a non-zero exit is restarted while this file exists.
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(dead_code, reason = "the Windows renderer")
+)]
+fn render_vbs(exe: &Path, args: &[String]) -> String {
     let line: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
         .chain(args.iter().cloned())
         .map(|a| format!("\"{a}\""))
         .collect();
     format!(
-        "CreateObject(\"WScript.Shell\").Run \"{}\", 0, False\r\n",
+        "Set sh = CreateObject(\"WScript.Shell\")\r\n\
+         Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+         Do\r\n\
+         \x20 rc = sh.Run(\"{}\", 0, True)\r\n\
+         \x20 If rc = 0 Or Not fso.FileExists(WScript.ScriptFullName) Then Exit Do\r\n\
+         \x20 WScript.Sleep {VBS_RESTART_MS}\r\n\
+         Loop\r\n",
         line.join(" ").replace('"', "\"\"")
     )
 }
@@ -230,12 +310,13 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
-    Err(Error::msg(
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    ))
+    Err(Error::msg(format!(
+        "{program} {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
 }
 
-#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -247,39 +328,80 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    fn args(url: &str) -> Vec<String> {
+        ["--url", url, "daemon", "run"].map(str::to_string).to_vec()
+    }
+
     #[test]
-    fn systemd_unit_runs_daemon_for_the_profile() {
-        let root = tempfile::tempdir().unwrap();
-        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
-        let unit = render(
-            &cfg,
+    fn systemd_unit_runs_daemon_with_the_install_env() {
+        let env = vec![
+            (
+                "PATH".to_string(),
+                "/home/u/.local/bin:/usr/bin".to_string(),
+            ),
+            ("XDG_CONFIG_HOME".to_string(), "/home/u/cfg".to_string()),
+        ];
+        let unit = render_systemd(
             Path::new("/home/u/.local/bin/dense"),
-            &command(&cfg).unwrap().1,
+            &args("http://127.0.0.1:9"),
+            &env,
         );
         assert!(unit.contains(
             "ExecStart=\"/home/u/.local/bin/dense\" \"--url\" \"http://127.0.0.1:9\" \"daemon\" \"run\"\n"
         ));
+        assert!(unit.contains("Environment=\"PATH=/home/u/.local/bin:/usr/bin\"\n"));
+        assert!(unit.contains("Environment=\"XDG_CONFIG_HOME=/home/u/cfg\"\n"));
+        assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target"));
-        assert_eq!(
-            entry_path(&cfg).unwrap(),
-            root.path().join("systemd/user/dense-daemon.service")
-        );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn vbs_launcher_doubles_quotes() {
-        let root = tempfile::tempdir().unwrap();
-        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
-        let vbs = render(
-            &cfg,
+    fn systemd_unit_escapes_specifiers_and_variables() {
+        let env = vec![("PATH".to_string(), "/opt/100%/bin".to_string())];
+        let unit = render_systemd(Path::new("/x/$HOME/dense"), &args("http://h/a%2Fb"), &env);
+        assert!(unit.contains("\"/x/$$HOME/dense\""));
+        assert!(unit.contains("\"http://h/a%%2Fb\""));
+        assert!(unit.contains("Environment=\"PATH=/opt/100%%/bin\"\n"));
+    }
+
+    #[test]
+    fn launchd_plist_carries_args_and_env() {
+        let env = vec![("PATH".to_string(), "/usr/bin:/a&b".to_string())];
+        let plist = render_launchd(
+            Path::new("/tmp/daemon.log"),
+            Path::new("/usr/local/bin/dense"),
+            &args("https://api.condense.chat"),
+            &env,
+        );
+        assert!(plist.contains("<string>chat.condense.dense.daemon</string>"));
+        assert!(plist.contains("    <string>/usr/local/bin/dense</string>\n    <string>--url</string>\n    <string>https://api.condense.chat</string>\n"));
+        assert!(plist.contains("<key>PATH</key>\n    <string>/usr/bin:/a&amp;b</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n  <true/>"));
+    }
+
+    #[test]
+    fn vbs_launcher_doubles_quotes_and_restarts_while_present() {
+        let vbs = render_vbs(
             Path::new("C:\\dense.exe"),
             &["daemon".to_string(), "run".to_string()],
         );
+        assert!(vbs.contains(
+            "rc = sh.Run(\"\"\"C:\\dense.exe\"\" \"\"daemon\"\" \"\"run\"\"\", 0, True)\r\n"
+        ));
+        assert!(
+            vbs.contains("If rc = 0 Or Not fso.FileExists(WScript.ScriptFullName) Then Exit Do")
+        );
+        assert!(vbs.contains("WScript.Sleep 10000"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn systemd_entry_lives_next_to_the_config_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
         assert_eq!(
-            vbs,
-            "CreateObject(\"WScript.Shell\").Run \"\"\"C:\\dense.exe\"\" \"\"daemon\"\" \"\"run\"\"\", 0, False\r\n"
+            entry_path(&cfg).unwrap(),
+            root.path().join("systemd/user/dense-daemon.service")
         );
     }
 }

@@ -178,7 +178,10 @@ pub fn unpersist(cfg: &Config, targets: &[String]) -> Result<()> {
 fn save_record(cfg: &Config, rec: &Record) -> Result<()> {
     std::fs::create_dir_all(cfg.data_dir()).ctx("creating dense data dir")?;
     let body = toml::to_string_pretty(rec).ctx("serializing persist record")?;
-    std::fs::write(cfg.persist_file(), body).ctx("writing persist record")
+    let path = cfg.persist_file();
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body).ctx("writing persist record")?;
+    std::fs::rename(&tmp, &path).ctx("replacing persist record")
 }
 
 fn select(targets: &[String]) -> Result<Vec<&'static ToolSpec>> {

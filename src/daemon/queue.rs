@@ -1,22 +1,30 @@
 //! The offline usage queue: an append-only JSONL file under the daemon dir,
 //! capped at [`MAX_RECORDS`] (oldest dropped first), drained to
 //! `POST /v1/devices/usage` in batches of [`BATCH`]. The server dedupes on
-//! `(device_id, message_id)`, so a batch resent after a crash is harmless.
+//! `(device_id, message_id)`, so a batch resent after a crash is harmless; a
+//! batch it rejects outright (non-retryable 4xx) is dropped, not retried.
 
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::api::Api;
-use crate::api::devices;
+use crate::api::devices::{self, Reply};
 use crate::config::Config;
 use crate::error::Context;
 
 pub const BATCH: usize = 500;
 pub const MAX_RECORDS: usize = 20_000;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Flushed {
+    /// Records in batches the server rejected for good.
+    pub dropped: usize,
+    pub sent: usize,
+}
 
 pub struct Queue {
     cap: usize,
@@ -68,9 +76,15 @@ impl Queue {
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)
             .ctx(format!("opening {}", self.path.display()))?;
+        if !ends_with_newline(&mut file) {
+            // A torn tail from an interrupted write: close it off so it is
+            // dropped as one corrupt line instead of swallowing our first record.
+            buf.insert(0, '\n');
+        }
         file.write_all(buf.as_bytes())
             .ctx(format!("appending to {}", self.path.display()))?;
         drop(file);
@@ -120,40 +134,61 @@ impl Queue {
     }
 }
 
-/// Drain the queue through `send`, one [`BATCH`] at a time; a batch leaves
-/// the queue only after `send` succeeds. Returns how many records were sent.
-pub async fn flush<F, Fut>(queue: &Queue, mut send: F) -> Result<usize>
+/// Drain the queue through `send`, one [`BATCH`] at a time. A batch leaves
+/// the queue once `send` returns `Ok` — accepted, or rejected for good — and
+/// stays (stopping the drain) on `Err`.
+pub async fn flush<F, Fut>(queue: &Queue, mut send: F) -> Result<Flushed>
 where
     F: FnMut(Vec<UsageRecord>) -> Fut,
-    Fut: Future<Output = Result<()>>,
+    Fut: Future<Output = Result<Reply<()>>>,
 {
-    let mut sent = 0;
+    let mut out = Flushed::default();
     loop {
         let (records, consumed) = queue.peek(BATCH);
         if consumed == 0 {
-            return Ok(sent);
+            return Ok(out);
         }
         let count = records.len();
-        if count > 0 {
-            send(records).await?;
-        }
+        let reply = if count > 0 {
+            send(records).await?
+        } else {
+            Reply::Ok(())
+        };
         queue.drop_front(consumed)?;
-        sent += count;
+        match reply {
+            Reply::Ok(()) => out.sent += count,
+            Reply::Rejected(status) => {
+                tracing::warn!("server rejected {count} usage records ({status}); dropped them");
+                out.dropped += count;
+            }
+        }
     }
 }
 
 /// [`flush`] to `POST /v1/devices/usage`.
-pub async fn flush_to(api: &Api, device_id: &str, queue: &Queue) -> Result<usize> {
+pub async fn flush_to(api: &Api, device_id: &str, queue: &Queue) -> Result<Flushed> {
     flush(queue, |batch| async move {
-        let reply = devices::upload_usage(api, device_id, &batch).await?;
-        tracing::debug!(
-            accepted = reply.accepted,
-            duplicates = reply.duplicates,
-            "usage batch uploaded"
-        );
-        Ok(())
+        Ok(match devices::upload_usage(api, device_id, &batch).await? {
+            Reply::Ok(reply) => {
+                tracing::debug!(
+                    accepted = reply.accepted,
+                    duplicates = reply.duplicates,
+                    "usage batch uploaded"
+                );
+                Reply::Ok(())
+            }
+            Reply::Rejected(status) => Reply::Rejected(status),
+        })
     })
     .await
+}
+
+fn ends_with_newline(file: &mut std::fs::File) -> bool {
+    let mut last = [0u8; 1];
+    match file.seek(SeekFrom::End(-1)) {
+        Ok(_) => file.read_exact(&mut last).is_err() || last[0] == b'\n',
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -197,11 +232,11 @@ mod tests {
         let mut sizes = Vec::new();
         let sent = flush(&q, |b| {
             sizes.push(b.len());
-            async { Ok(()) }
+            async { Ok(Reply::Ok(())) }
         })
         .await
         .unwrap();
-        assert_eq!(sent, 1_234);
+        assert_eq!(sent.sent, 1_234);
         assert_eq!(sizes, vec![500, 500, 234]);
         assert_eq!(q.len(), 0);
     }
@@ -219,7 +254,7 @@ mod tests {
                 if fail {
                     Err(Error::msg("offline"))
                 } else {
-                    Ok(())
+                    Ok(Reply::Ok(()))
                 }
             }
         })
@@ -243,11 +278,60 @@ mod tests {
         let mut got = Vec::new();
         flush(&q, |b| {
             got.extend(b);
-            async { Ok(()) }
+            async { Ok(Reply::Ok(())) }
         })
         .await
         .unwrap();
         assert_eq!(got, records(0..3));
+        assert_eq!(q.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn torn_tail_does_not_eat_the_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let q = Queue::at(path.clone(), 100);
+        q.push(&records(0..1)).unwrap();
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"cache_read\":0,\"mess");
+        std::fs::write(&path, raw).unwrap();
+        q.push(&records(1..3)).unwrap();
+        let mut got = Vec::new();
+        flush(&q, |b| {
+            got.extend(b);
+            async { Ok(Reply::Ok(())) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, records(0..3));
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_is_dropped_and_the_rest_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("q.jsonl"), 5_000);
+        q.push(&records(0..700)).unwrap();
+        let mut calls = 0;
+        let out = flush(&q, |_| {
+            calls += 1;
+            let first = calls == 1;
+            async move {
+                Ok(if first {
+                    Reply::Rejected(422)
+                } else {
+                    Reply::Ok(())
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            Flushed {
+                dropped: 500,
+                sent: 200
+            }
+        );
         assert_eq!(q.len(), 0);
     }
 }

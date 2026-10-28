@@ -1,12 +1,15 @@
 //! `dense daemon` — the headless device daemon. Each tick heartbeats
 //! `POST /v1/devices/heartbeat`, applies the returned switch ([`switch`]),
 //! and drains the offline usage [`queue`]. The last known switch is kept in
-//! `state.toml`, so a restart while offline keeps enforcing it.
+//! `state.toml`, so a restart while offline keeps enforcing it. The switch is
+//! only ever applied for a `managed` (Enterprise) device. One daemon per
+//! machine: shims are shared by every profile, so the lock is too.
 
 pub mod autostart;
 pub mod queue;
 pub mod switch;
 
+use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,9 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::Api;
 use crate::api::auth;
-use crate::api::devices::{self, Heartbeat, HeartbeatReply};
+use crate::api::devices::{self, Heartbeat, HeartbeatReply, Reply};
 use crate::config::Config;
-use crate::error::Context;
+use crate::error::{Context, Error};
 use crate::{Result, device};
 
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -42,12 +45,11 @@ pub struct State {
     pub last_attempt_at: Option<u64>,
     pub last_error: Option<String>,
     pub last_ok_at: Option<u64>,
+    /// Whether the switch is ours to apply; unknown is treated as not.
+    pub managed: Option<bool>,
     pub member_enabled: Option<bool>,
     pub mode: Option<switch::Mode>,
     pub pid: Option<u32>,
-    /// Tools the switch manages (restored when it flips back on).
-    #[serde(default)]
-    pub tools: Vec<String>,
 }
 
 impl Backoff {
@@ -72,10 +74,13 @@ impl Backoff {
 
 impl State {
     pub fn load(cfg: &Config) -> Self {
-        std::fs::read_to_string(state_file(cfg))
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(raw) = std::fs::read_to_string(state_file(cfg)) else {
+            return Self::default();
+        };
+        toml::from_str(&raw).unwrap_or_else(|e| {
+            tracing::warn!("ignoring unreadable daemon state: {e}");
+            Self::default()
+        })
     }
 
     pub fn save(&self, cfg: &Config) -> Result<()> {
@@ -87,7 +92,20 @@ impl State {
         std::fs::rename(&tmp, &path).ctx(format!("replacing {}", path.display()))
     }
 
+    /// The switch to enforce, if this device is managed and one is known.
+    fn enforced(&self) -> Option<bool> {
+        self.enabled.filter(|_| self.managed == Some(true))
+    }
+
+    fn forget_switch(&mut self) {
+        self.enabled = None;
+        self.managed = None;
+        self.member_enabled = None;
+        self.device_enabled = None;
+    }
+
     fn record(&mut self, reply: &HeartbeatReply) {
+        self.managed = Some(reply.managed);
         self.enabled = Some(reply.enabled);
         self.member_enabled = reply.member_enabled;
         self.device_enabled = reply.device_enabled;
@@ -108,27 +126,80 @@ pub async fn install(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// The daemon loop. `once` runs a single tick and exits (scripts, QA).
+/// After `dense login`: if the account's org manages devices, install the
+/// daemon so the switch applies without anyone running `dense daemon install`.
+pub async fn after_login(cfg: &Config) {
+    if autostart::installed(cfg).is_some() {
+        return;
+    }
+    let Ok(device_id) = device::id(cfg) else {
+        return;
+    };
+    let mut state = State::load(cfg);
+    match heartbeat(cfg, &device_id, &mut state).await {
+        Ok(Some((reply, _))) if reply.managed => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::debug!("post-login heartbeat failed: {e}");
+            return;
+        }
+    }
+    save(cfg, &state);
+    match autostart::install(cfg) {
+        Ok(_) => {
+            println!("this device is managed by your organization; the dense daemon is installed")
+        }
+        Err(e) => eprintln!(
+            "warning: this device is managed by your organization, but installing the dense daemon failed ({}); run `dense daemon install`",
+            error_chain(&e)
+        ),
+    }
+}
+
+/// Clear the cached switch (on logout): a later account must not inherit it.
+pub fn forget_switch(cfg: &Config) {
+    let mut state = State::load(cfg);
+    if state.enabled.is_some() || state.managed.is_some() {
+        state.forget_switch();
+        save(cfg, &state);
+    }
+}
+
+/// The daemon loop. `once` runs a single tick (plus the follow-up report when
+/// it changed the mode) and exits, leaving a running daemon's pid alone.
 pub async fn run(cfg: &Config, once: bool) -> Result<()> {
+    let Some(_lock) = lock(cfg)? else {
+        let msg = "another dense daemon is already running";
+        if once {
+            return Err(Error::msg(msg));
+        }
+        // Exit cleanly so a supervisor's restart loop treats this as done.
+        eprintln!("{msg}; exiting");
+        return Ok(());
+    };
     let device_id = device::id(cfg)?;
     let mut state = State::load(cfg);
-    state.pid = Some(std::process::id());
+    if !once {
+        state.pid = Some(std::process::id());
+    }
     tracing::info!(device = %device_id, profile = cfg.profile(), "dense daemon started");
-    if let Some(enabled) = state.enabled {
+    if let Some(enabled) = state.enforced() {
         tracing::info!(enabled, "applying the last known switch");
         apply(cfg, &mut state, enabled);
     }
     save(cfg, &state);
 
     let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+    let mut reported = false;
     loop {
         let delay = tick(cfg, &device_id, &mut state, &mut backoff).await;
         save(cfg, &state);
-        if once {
+        if once && (reported || delay != REPORT_DELAY) {
             return Ok(());
         }
+        reported = true;
         tokio::select! {
-            () = tokio::time::sleep(delay) => {}
+            () = tokio::time::sleep(jitter(delay)) => {}
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("dense daemon stopping");
                 return Ok(());
@@ -145,23 +216,29 @@ pub fn status_lines(cfg: &Config) -> Vec<(&'static str, String)> {
         Some(p) => format!("autostart installed ({})", p.display()),
         None => "autostart not installed".into(),
     };
+    let running = match (running(cfg), state.pid) {
+        (true, Some(pid)) => format!("running (pid {pid})"),
+        (true, None) => "running".into(),
+        (false, _) => "not running".into(),
+    };
     let beat = match (state.last_ok_at, &state.last_error) {
         (_, Some(err)) => format!("last heartbeat failed: {err}"),
         (Some(at), None) => format!("last heartbeat ok {}s ago", now().saturating_sub(at)),
         (None, None) => "never heartbeated".into(),
     };
-    let switch = match state.enabled {
-        Some(on) => format!(
+    let switch = match (state.managed, state.enabled) {
+        (Some(false), _) => "not managed (no org device management)".into(),
+        (_, Some(on)) => format!(
             "{} (member {}, device {})",
             if on { "enabled" } else { "disabled" },
             flag(state.member_enabled),
             flag(state.device_enabled)
         ),
-        None => "unknown (no heartbeat yet)".into(),
+        (_, None) => "unknown (no heartbeat yet)".into(),
     };
     vec![
         ("device", device),
-        ("daemon", format!("{autostart}; {beat}")),
+        ("daemon", format!("{running}; {autostart}; {beat}")),
         ("switch", switch),
         ("mode", switch::observe(cfg).as_str().to_string()),
         (
@@ -182,28 +259,37 @@ pub async fn uninstall(cfg: &Config) -> Result<()> {
         }
         None => println!("daemon autostart was not installed"),
     }
+    report_uninstall(cfg).await;
+    Ok(())
+}
+
+/// Tell condense this device is gone (`POST /v1/devices/uninstall`); warns,
+/// never fails, since the local uninstall must go through regardless.
+pub async fn report_uninstall(cfg: &Config) {
     let Some(device_id) = device::load(cfg) else {
-        return Ok(());
+        return;
     };
     let creds = auth::load_creds(cfg);
     if !creds.is_authenticated() {
         eprintln!("warning: not logged in; the server still lists this device as installed");
-        return Ok(());
+        return;
     }
-    let api = Api::authed(cfg, &creds)?;
-    match devices::uninstall(&api, &device_id).await {
+    let result = match Api::authed(cfg, &creds) {
+        Ok(api) => devices::uninstall(&api, &device_id).await,
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(()) => println!("device {device_id} marked uninstalled"),
         Err(e) => eprintln!(
             "warning: could not report the uninstall ({})",
             error_chain(&e)
         ),
     }
-    Ok(())
 }
 
 /// Apply `enabled`, logging (never propagating) a failure.
 fn apply(cfg: &Config, state: &mut State, enabled: bool) -> bool {
-    match switch::apply(cfg, &mut state.tools, enabled, true) {
+    match switch::apply(cfg, enabled, &switch::installed(cfg), true) {
         Ok(outcome) => {
             if outcome.changed {
                 tracing::info!(enabled, mode = outcome.mode.as_str(), "switch applied");
@@ -231,11 +317,51 @@ fn flag(v: Option<bool>) -> &'static str {
     }
 }
 
+/// Up to +20% so a fleet that went offline together does not retry in lockstep.
+fn jitter(d: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|t| t.subsec_nanos())
+        .unwrap_or(0);
+    d + d.mul_f64(f64::from(nanos % 1_000) / 5_000.0)
+}
+
+/// The machine-wide single-instance lock, held for the daemon's lifetime;
+/// `None` when another daemon holds it.
+fn lock(cfg: &Config) -> Result<Option<File>> {
+    let path = lock_file(cfg);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
+    }
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .ctx(format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).ctx(format!("locking {}", path.display())),
+    }
+}
+
+fn lock_file(cfg: &Config) -> PathBuf {
+    cfg.data_dir().join("daemon").join("daemon.lock")
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn running(cfg: &Config) -> bool {
+    let Ok(file) = File::options().write(true).open(lock_file(cfg)) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
 fn save(cfg: &Config, state: &State) {
@@ -248,21 +374,19 @@ fn state_file(cfg: &Config) -> PathBuf {
     cfg.daemon_dir().join("state.toml")
 }
 
-/// One heartbeat + apply + flush. Returns how long to sleep before the next.
-async fn tick(cfg: &Config, device_id: &str, state: &mut State, backoff: &mut Backoff) -> Duration {
+/// One heartbeat. `Ok(None)`: the server refused this credential/device for
+/// good (4xx) — the cached switch is dropped so nothing stale is enforced.
+async fn heartbeat(
+    cfg: &Config,
+    device_id: &str,
+    state: &mut State,
+) -> Result<Option<(HeartbeatReply, Api)>> {
     state.last_attempt_at = Some(now());
     let creds = auth::load_creds(cfg);
     if !creds.is_authenticated() {
-        state.last_error = Some("not logged in (run `dense login`)".into());
-        return backoff.next_delay();
+        return Err(Error::msg("not logged in (run `dense login`)"));
     }
-    let api = match Api::authed(cfg, &creds) {
-        Ok(api) => api,
-        Err(e) => {
-            state.last_error = Some(e.to_string());
-            return backoff.next_delay();
-        }
-    };
+    let api = Api::authed(cfg, &creds)?;
     let hostname = device::hostname();
     let body = Heartbeat {
         app_version: env!("CARGO_PKG_VERSION"),
@@ -271,8 +395,34 @@ async fn tick(cfg: &Config, device_id: &str, state: &mut State, backoff: &mut Ba
         mode: Some(switch::observe(cfg)),
         platform: device::platform(),
     };
-    let reply = match devices::heartbeat(&api, &body).await {
-        Ok(reply) => reply,
+    match devices::heartbeat(&api, &body).await? {
+        Reply::Ok(reply) => {
+            state.record(&reply);
+            Ok(Some((reply, api)))
+        }
+        Reply::Rejected(status) => {
+            if state.enforced().is_some() {
+                tracing::warn!(
+                    "heartbeat rejected ({status}); no longer enforcing the cached switch"
+                );
+            }
+            state.forget_switch();
+            state.last_error = Some(match status {
+                401 | 403 => format!(
+                    "heartbeat rejected ({status}): credential not accepted for this device (run `dense login`)"
+                ),
+                _ => format!("heartbeat rejected ({status})"),
+            });
+            Ok(None)
+        }
+    }
+}
+
+/// One heartbeat + apply + flush. Returns how long to sleep before the next.
+async fn tick(cfg: &Config, device_id: &str, state: &mut State, backoff: &mut Backoff) -> Duration {
+    let (reply, api) = match heartbeat(cfg, device_id, state).await {
+        Ok(Some(ok)) => ok,
+        Ok(None) => return backoff.next_delay(),
         Err(e) => {
             let delay = backoff.next_delay();
             tracing::warn!("heartbeat failed, retrying in {}s: {e}", delay.as_secs());
@@ -281,13 +431,23 @@ async fn tick(cfg: &Config, device_id: &str, state: &mut State, backoff: &mut Ba
         }
     };
     backoff.reset();
-    state.record(&reply);
-    let changed = apply(cfg, state, reply.enabled);
+    let changed = match state.enforced() {
+        Some(enabled) => apply(cfg, state, enabled),
+        None => {
+            state.mode = Some(switch::observe(cfg));
+            false
+        }
+    };
 
     let queue = queue::Queue::open(cfg);
     match queue::flush_to(&api, device_id, &queue).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!("uploaded {n} queued usage records"),
+        Ok(f) if f.dropped > 0 => tracing::warn!(
+            sent = f.sent,
+            dropped = f.dropped,
+            "dropped usage records the server rejected"
+        ),
+        Ok(f) if f.sent > 0 => tracing::info!("uploaded {} queued usage records", f.sent),
+        Ok(_) => {}
         Err(e) => tracing::warn!("usage upload failed, kept queued: {e}"),
     }
 
@@ -338,14 +498,160 @@ mod tests {
             device_enabled: Some(false),
             enabled: false,
             heartbeat_interval_s: 30,
+            managed: true,
             member_enabled: Some(true),
         });
-        s.tools = vec!["claude".into()];
         s.save(&cfg).unwrap();
         let back = State::load(&cfg);
         assert_eq!(back.enabled, Some(false));
         assert_eq!(back.device_enabled, Some(false));
-        assert_eq!(back.tools, vec!["claude".to_string()]);
+        assert_eq!(back.enforced(), Some(false));
+    }
+
+    /// A one-route HTTP server: every request gets `status` + `body`; returns
+    /// the base URL and the request lines it saw.
+    fn serve(status: u16, body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut len = 0;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                    if h == "\r\n" {
+                        break;
+                    }
+                }
+                let mut buf = vec![0; len];
+                reader.read_exact(&mut buf).unwrap();
+                let _ = tx.send(line.trim().to_string());
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = reader.get_mut().write_all(reply.as_bytes());
+            }
+        });
+        (url, rx)
+    }
+
+    fn logged_in(root: &std::path::Path, url: &str) -> Config {
+        let cfg = Config::for_test(root, url);
+        std::fs::create_dir_all(cfg.cred_dir()).unwrap();
+        std::fs::write(cfg.user_file(), "u\n").unwrap();
+        cfg
+    }
+
+    fn shim(cfg: &Config) -> PathBuf {
+        let path = crate::persist::shim_path(cfg, "claude");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn managed_off_switch_unpersists() {
+        let (url, rx) = serve(
+            200,
+            r#"{"managed":true,"enabled":false,"member_enabled":false,"device_enabled":true,"heartbeat_interval_s":42}"#,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let shim = shim(&cfg);
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await, REPORT_DELAY);
+        assert!(!shim.exists());
+        assert_eq!(state.mode, Some(switch::Mode::Transparent));
+        assert_eq!(state.enforced(), Some(false));
+        assert_eq!(rx.recv().unwrap(), "POST /v1/devices/heartbeat HTTP/1.1");
+        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await.as_secs(), 42);
+    }
+
+    #[tokio::test]
+    async fn unmanaged_device_never_touches_shims() {
+        let (url, _rx) = serve(
+            200,
+            r#"{"managed":false,"enabled":false,"heartbeat_interval_s":60}"#,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let shim = shim(&cfg);
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await.as_secs(), 60);
+        assert!(shim.exists());
+        assert_eq!(state.enforced(), None);
+        assert_eq!(state.mode, Some(switch::Mode::Condensing));
+    }
+
+    #[tokio::test]
+    async fn missing_managed_field_is_unmanaged() {
+        let (url, _rx) = serve(200, r#"{"enabled":false,"heartbeat_interval_s":60}"#);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let shim = shim(&cfg);
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        tick(&cfg, "d", &mut state, &mut b).await;
+        assert!(shim.exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_heartbeat_forgets_the_cached_switch() {
+        let (url, _rx) = serve(403, r#"{"detail":"forbidden"}"#);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let shim = shim(&cfg);
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        };
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await, BACKOFF_MIN);
+        assert_eq!(state.enforced(), None);
+        assert!(shim.exists());
+        assert!(state.last_error.unwrap().contains("403"));
+    }
+
+    #[test]
+    fn logout_forgets_switch_but_keeps_device() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        let id = device::id(&cfg).unwrap();
+        State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        }
+        .save(&cfg)
+        .unwrap();
+        forget_switch(&cfg);
+        assert_eq!(State::load(&cfg).enforced(), None);
+        assert_eq!(device::load(&cfg), Some(id));
+    }
+
+    #[test]
+    fn second_daemon_does_not_get_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        assert!(!running(&cfg));
+        let held = lock(&cfg).unwrap();
+        assert!(held.is_some());
+        assert!(lock(&cfg).unwrap().is_none());
+        assert!(running(&cfg));
+        drop(held);
+        assert!(lock(&cfg).unwrap().is_some());
     }
 
     #[tokio::test]

@@ -146,10 +146,12 @@ pub async fn install(cfg: &Config) -> Result<()> {
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
 pub async fn after_login(cfg: &Config) {
-    if let Some(user) = auth::load_creds(cfg).user_id
-        && let Err(e) = device::bind_user(cfg, &user)
-    {
-        tracing::warn!("could not bind the device id to this user: {e}");
+    if let Some(user) = auth::load_creds(cfg).user_id {
+        match device::bind_user(cfg, &user) {
+            Ok(true) => drop_usage(cfg),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not bind the device id to this user: {e}"),
+        }
     }
     if autostart::installed(cfg).is_some() {
         return;
@@ -183,12 +185,19 @@ pub async fn after_login(cfg: &Config) {
     }
 }
 
-/// Clear the cached switch (on logout): a later account must not inherit it.
+/// Clear the cached switch (on logout): a later account must not inherit it,
+/// nor this account's unsent usage.
 pub fn forget_switch(cfg: &Config) {
     let mut state = State::load(cfg);
-    if state.enabled.is_some() || state.managed.is_some() {
-        state.forget_switch();
-        save(cfg, &state);
+    state.forget_switch();
+    state.transparent_windows.close(now_ms());
+    save(cfg, &state);
+    drop_usage(cfg);
+}
+
+fn drop_usage(cfg: &Config) {
+    if let Err(e) = queue::Queue::open(cfg).clear() {
+        tracing::warn!("could not drop queued usage: {e}");
     }
 }
 
@@ -408,6 +417,10 @@ fn now_ms() -> u64 {
 /// their routed spans instead).
 fn report_offline_usage(cfg: &Config, state: &mut State) {
     let now = now_ms();
+    if !auth::load_creds(cfg).is_authenticated() {
+        state.transparent_windows.close(now);
+        return;
+    }
     match switch::observe(cfg) {
         switch::Mode::Condensing => state.transparent_windows.close(last_seen_ms(state)),
         switch::Mode::Transparent => state
@@ -870,9 +883,38 @@ mod tests {
         }
         .save(&cfg)
         .unwrap();
+        let q = queue::Queue::open(&cfg);
+        q.push(&[usage_record("m1")]).unwrap();
         forget_switch(&cfg);
         assert_eq!(State::load(&cfg).enforced(), None);
         assert_eq!(device::load(&cfg), Some(id));
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn logged_out_daemon_reads_no_sessions_and_closes_its_window() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        let mut state = State::default();
+        state
+            .transparent_windows
+            .note(switch::Mode::Transparent, 1_000);
+        report_offline_usage(&cfg, &mut state);
+        assert!(!state.transparent_windows.contains(now_ms() + 1));
+        assert!(!cfg.data_dir().join("daemon/sessions.json").exists());
+    }
+
+    fn usage_record(id: &str) -> queue::UsageRecord {
+        queue::UsageRecord {
+            cache_read: 0,
+            cache_write: 0,
+            input_tokens: 1,
+            message_id: id.into(),
+            model: "m".into(),
+            occurred_at: "2026-10-28T12:00:00.000Z".into(),
+            output_tokens: 1,
+            session_ref: "s".into(),
+        }
     }
 
     #[test]

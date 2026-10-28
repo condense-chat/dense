@@ -36,7 +36,7 @@ const SYNTHETIC_MODEL: &str = "<synthetic>";
 const WALK_DEPTH: usize = 4;
 const WINDOW_RETENTION_MS: u64 = 35 * 24 * 3_600 * 1_000;
 
-/// Per-file read positions, persisted at `<daemon dir>/sessions.json`.
+/// Per-file read positions, machine-wide at `<data dir>/daemon/sessions.json`.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Cursors {
     #[serde(default)]
@@ -802,6 +802,30 @@ mod tests {
         let got = fx.scan(&mut c, &w, T0 + 10);
         assert_eq!(ids(&got), ["nulls"]);
         assert_eq!((got[0].cache_read, got[0].output_tokens), (0, 7));
+    }
+
+    #[test]
+    fn cursors_are_shared_so_another_profile_never_rereads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prod = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let stage = Config::for_test(tmp.path(), "http://127.0.0.2:9");
+        let at = now_ms_for_test() - 60_000;
+        let dir = tmp.path().join(".claude/projects/-p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.jsonl"), assistant("m", at, 5, Some("end_turn"))).unwrap();
+        let w = open_from(at - 1_000);
+        assert_eq!(report(&stage, &w, at + 1_000).unwrap(), 1);
+        assert_eq!(report(&prod, &w, at + 1_000).unwrap(), 0);
+    }
+
+    fn now_ms_for_test() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
     }
 
     fn ids(records: &[UsageRecord]) -> Vec<&str> {

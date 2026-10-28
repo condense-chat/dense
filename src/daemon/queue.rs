@@ -52,6 +52,15 @@ impl Queue {
         Self { cap, path }
     }
 
+    pub fn clear(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).ctx(format!("removing {}", self.path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.lines().len()
     }

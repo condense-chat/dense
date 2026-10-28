@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::queue::{Queue, UsageRecord};
-use super::routed::Routed;
+use super::routed::{Bindings, Routed, Verdict};
 use super::switch::Mode;
 use crate::Result;
 use crate::config::Config;
@@ -22,9 +22,11 @@ use crate::error::Context;
 use crate::harness::commands;
 
 const HEAD_BYTES: u64 = 256;
+const MAX_ID: usize = 256;
 const MAX_LINE: usize = 16 << 20;
 const MAX_PENDING: usize = 4_096;
 const MAX_READ_PER_TICK: u64 = 64 << 20;
+const MAX_ROOTS: usize = 16;
 const MAX_WINDOWS: usize = 256;
 const RECENT_IDS: usize = 64;
 /// A message with no `stop_reason` line yet (aborted, or still streaming) is
@@ -37,6 +39,8 @@ const WINDOW_RETENTION_MS: u64 = 35 * 24 * 3_600 * 1_000;
 /// Per-file read positions, persisted at `<daemon dir>/sessions.json`.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Cursors {
+    #[serde(default)]
+    bindings: Bindings,
     files: BTreeMap<String, Cursor>,
 }
 
@@ -59,6 +63,12 @@ pub struct Window {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Windows(Vec<Window>);
+
+struct Ctx<'a> {
+    bindings: &'a mut Bindings,
+    filter: &'a Filter<'a>,
+    now_ms: u64,
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Cursor {
@@ -107,13 +117,13 @@ struct Pending {
 #[derive(Deserialize)]
 struct Usage {
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    output_tokens: u64,
+    output_tokens: Option<u64>,
 }
 
 impl Cursors {
@@ -187,9 +197,15 @@ pub fn report(cfg: &Config, windows: &Windows, now_ms: u64) -> Result<usize> {
     if windows.is_empty() {
         return Ok(0);
     }
-    let path = cfg.daemon_dir().join("sessions.json");
+    let path = cfg.data_dir().join("daemon").join("sessions.json");
     let mut cursors = Cursors::load(&path);
-    let roots = roots(cfg.home(), |k| std::env::var(k).ok());
+    let mut roots = roots(cfg.home(), |k| std::env::var(k).ok());
+    for dir in remembered_roots(cfg) {
+        let p = dir.join("projects");
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
     let filter = Filter {
         routed: &routed,
         windows,
@@ -221,6 +237,38 @@ pub fn roots(home: &Path, env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> 
         .collect()
 }
 
+/// Remember this process's `CLAUDE_CONFIG_DIR` for the daemon, whose
+/// supervisor environment does not carry it.
+pub fn remember_root(cfg: &Config) {
+    let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    else {
+        return;
+    };
+    let mut known = remembered_roots(cfg);
+    if known.contains(&dir) {
+        return;
+    }
+    known.push(dir);
+    let excess = known.len().saturating_sub(MAX_ROOTS);
+    known.drain(..excess);
+    let body: String = known
+        .iter()
+        .filter_map(|p| p.to_str())
+        .map(|p| format!("{p}\n"))
+        .collect();
+    let path = roots_file(cfg);
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let written = std::fs::create_dir_all(cfg.data_dir())
+        .and_then(|()| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::debug!("could not remember CLAUDE_CONFIG_DIR: {e}");
+    }
+}
+
 /// Read new bytes of every session file under `roots`. Returns the settled
 /// in-window records and whether any cursor changed.
 pub fn scan(
@@ -238,11 +286,18 @@ pub fn scan(
     let mut out = Vec::new();
     let mut dirty = false;
     let mut live = BTreeSet::new();
+    dirty |= cursors.bindings.retain_known(filter.routed);
     for path in files {
         let key = path.to_string_lossy().into_owned();
         let cursor = cursors.files.entry(key.clone()).or_default();
-        match read_file(&path, cursor, filter, now_ms, &mut out) {
-            Ok(changed) => dirty |= changed,
+        let mut ctx = Ctx {
+            bindings: &mut cursors.bindings,
+            filter,
+            now_ms,
+        };
+        let bound = ctx.bindings.len();
+        match read_file(&path, cursor, &mut ctx, &mut out) {
+            Ok(changed) => dirty |= changed || ctx.bindings.len() != bound,
             Err(e) => tracing::debug!("skipping {}: {e}", path.display()),
         }
         live.insert(key);
@@ -275,30 +330,51 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn handle_line(line: &[u8], cursor: &mut Cursor, filter: &Filter, out: &mut Vec<UsageRecord>) {
+/// Returns false when the line must wait for a later tick.
+fn handle_line(
+    line: &[u8],
+    cursor: &mut Cursor,
+    ctx: &mut Ctx,
+    out: &mut Vec<UsageRecord>,
+) -> bool {
     if !contains(line, b"\"usage\"") {
-        return;
+        return true;
     }
     let Ok(parsed) = serde_json::from_slice::<Line>(line) else {
-        return;
+        return true;
     };
     if parsed.type_.as_deref() != Some("assistant") {
-        return;
+        return true;
     }
     let (Some(msg), Some(at)) = (parsed.message, parsed.timestamp) else {
-        return;
+        return true;
     };
     let (Some(id), Some(usage), Some(ts)) = (msg.id, msg.usage, parse_ms(&at)) else {
-        return;
+        return true;
     };
-    if cursor.recent.contains(&id) {
-        return;
-    }
-    if !cursor.pending.contains_key(&id)
-        && parsed.cwd.is_some_and(|cwd| filter.routed.covers(&cwd, ts))
+    let session = parsed.session_id.unwrap_or_default();
+    let model = msg.model.unwrap_or_default();
+    if [&id, &session, &model, &at]
+        .iter()
+        .any(|v| v.len() > MAX_ID)
+        || cursor.recent.contains(&id)
     {
-        remember(cursor, id);
-        return;
+        return true;
+    }
+    if !cursor.pending.contains_key(&id) {
+        let sid = Some(session.as_str()).filter(|s| !s.is_empty());
+        match ctx
+            .filter
+            .routed
+            .judge(ctx.bindings, sid, parsed.cwd.as_deref(), ts, ctx.now_ms)
+        {
+            Verdict::Defer => return false,
+            Verdict::Skip => {
+                remember(cursor, id);
+                return true;
+            }
+            Verdict::Report => {}
+        }
     }
     let entry = cursor.pending.entry(id.clone()).or_insert_with(|| Pending {
         cache_read: 0,
@@ -307,19 +383,21 @@ fn handle_line(line: &[u8], cursor: &mut Cursor, filter: &Filter, out: &mut Vec<
         first_ms: ts,
         input_tokens: 0,
         last_ms: ts,
-        model: msg.model.clone().unwrap_or_default(),
+        model,
         output_tokens: 0,
-        session_ref: parsed.session_id.clone().unwrap_or_default(),
+        session_ref: session,
     });
-    entry.cache_read = entry.cache_read.max(usage.cache_read_input_tokens);
-    entry.cache_write = entry.cache_write.max(usage.cache_creation_input_tokens);
-    entry.input_tokens = entry.input_tokens.max(usage.input_tokens);
-    entry.output_tokens = entry.output_tokens.max(usage.output_tokens);
+    let n = |v: Option<u64>| v.unwrap_or(0);
+    entry.cache_read = entry.cache_read.max(n(usage.cache_read_input_tokens));
+    entry.cache_write = entry.cache_write.max(n(usage.cache_creation_input_tokens));
+    entry.input_tokens = entry.input_tokens.max(n(usage.input_tokens));
+    entry.output_tokens = entry.output_tokens.max(n(usage.output_tokens));
     entry.last_ms = entry.last_ms.max(ts);
     if ts < entry.first_ms {
         entry.first_ms = ts;
         entry.first_at = at;
     }
+    let filter = ctx.filter;
     if msg.stop_reason.is_some() {
         settle(cursor, &id, filter, out);
     } else if cursor.pending.len() > MAX_PENDING
@@ -331,6 +409,7 @@ fn handle_line(line: &[u8], cursor: &mut Cursor, filter: &Filter, out: &mut Vec<
     {
         settle(cursor, &oldest, filter, out);
     }
+    true
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -432,12 +511,10 @@ fn read_line_bounded(
 fn read_file(
     path: &Path,
     cursor: &mut Cursor,
-    filter: &Filter,
-    now_ms: u64,
+    ctx: &mut Ctx,
     out: &mut Vec<UsageRecord>,
 ) -> std::io::Result<bool> {
-    let mut file = File::open(path)?;
-    let meta = file.metadata()?;
+    let meta = std::fs::metadata(path)?;
     let size = meta.len();
     let mtime_ms = meta
         .modified()
@@ -445,24 +522,29 @@ fn read_file(
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let before = (cursor.offset, cursor.pending.len());
-
-    let replaced = size < cursor.offset
-        || (cursor.head_len > 0
-            && (size < cursor.head_len || head_hash(&mut file, cursor.head_len)? != cursor.head));
-    if replaced {
-        cursor.offset = 0;
-        cursor.head_len = 0;
-    }
-    let unchanged = !replaced && size == cursor.offset && mtime_ms == cursor.mtime_ms;
+    let mut at_end = cursor.offset == size;
+    let unchanged = at_end && size == cursor.size && mtime_ms == cursor.mtime_ms;
+    let mut replaced = false;
     if !unchanged {
-        if filter
+        let mut file = File::open(path)?;
+        replaced = size < cursor.offset
+            || (cursor.head_len > 0
+                && (size < cursor.head_len
+                    || head_hash(&mut file, cursor.head_len)? != cursor.head));
+        if replaced {
+            cursor.offset = 0;
+            cursor.head_len = 0;
+        }
+        if ctx
+            .filter
             .windows
             .earliest()
             .is_some_and(|start| mtime_ms < start)
         {
             cursor.offset = size;
+            at_end = true;
         } else {
-            read_from(&mut file, cursor, size, filter, out)?;
+            at_end = read_from(&mut file, cursor, size, ctx, out)?;
         }
         cursor.head_len = cursor.offset.min(HEAD_BYTES);
         cursor.head = head_hash(&mut file, cursor.head_len)?;
@@ -470,25 +552,29 @@ fn read_file(
         cursor.size = size;
     }
 
-    let stale: Vec<String> = cursor
-        .pending
-        .iter()
-        .filter(|(_, p)| p.last_ms + SETTLE_MS <= now_ms)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for id in stale {
-        settle(cursor, &id, filter, out);
+    // A backlog cut off by the read budget or by a deferred line is not stale yet.
+    if at_end {
+        let stale: Vec<String> = cursor
+            .pending
+            .iter()
+            .filter(|(_, p)| p.last_ms + SETTLE_MS <= ctx.now_ms)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in stale {
+            settle(cursor, &id, ctx.filter, out);
+        }
     }
     Ok(!unchanged || replaced || before != (cursor.offset, cursor.pending.len()))
 }
 
+/// Returns whether the read reached `size`.
 fn read_from(
     file: &mut File,
     cursor: &mut Cursor,
     size: u64,
-    filter: &Filter,
+    ctx: &mut Ctx,
     out: &mut Vec<UsageRecord>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     file.seek(SeekFrom::Start(cursor.offset))?;
     let budget = size.saturating_sub(cursor.offset).min(MAX_READ_PER_TICK);
     let mut reader = BufReader::with_capacity(64 << 10, file.by_ref().take(budget));
@@ -497,20 +583,29 @@ fn read_from(
         buf.clear();
         let (n, complete, overlong) = read_line_bounded(&mut reader, &mut buf, MAX_LINE)?;
         if n == 0 {
-            return Ok(());
+            return Ok(cursor.offset == size);
         }
         if !complete {
             // A partial last line waits for its newline, unless one line ate the whole budget.
             if n >= MAX_READ_PER_TICK {
                 cursor.offset += n;
             }
-            return Ok(());
+            return Ok(false);
+        }
+        if !overlong && !handle_line(&buf, cursor, ctx, out) {
+            return Ok(false);
         }
         cursor.offset += n;
-        if !overlong {
-            handle_line(&buf, cursor, filter, out);
-        }
     }
+}
+
+fn remembered_roots(cfg: &Config) -> Vec<PathBuf> {
+    std::fs::read_to_string(roots_file(cfg))
+        .unwrap_or_default()
+        .lines()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect()
 }
 
 fn remember(cursor: &mut Cursor, id: String) {
@@ -539,6 +634,10 @@ fn settle(cursor: &mut Cursor, id: &str, filter: &Filter, out: &mut Vec<UsageRec
         output_tokens: p.output_tokens,
         session_ref: p.session_ref,
     });
+}
+
+fn roots_file(cfg: &Config) -> PathBuf {
+    cfg.data_dir().join("claude-roots")
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -629,45 +728,42 @@ mod tests {
         format!("{line}\n")
     }
 
-    fn in_cwd(line: &str, cwd: &str) -> String {
-        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
-        v["cwd"] = json!(cwd);
-        format!("{v}\n")
-    }
-
     #[test]
     fn messages_from_a_dense_routed_span_are_not_reported() {
         let fx = Fx::new();
         let mut c = Cursors::default();
         let w = open_from(T0);
-        let routed = Routed(vec![Span {
+        let span = |id: &str, sid: Option<&str>| Span {
             cwd: "/w/routed".into(),
             end_ms: Some(T0 + 100),
+            id: id.into(),
             pid: 1,
             seen_ms: T0 + 100,
+            session_id: sid.map(str::to_string),
             start_ms: T0 + 10,
-        }]);
+        };
+        let routed = Routed {
+            loaded_ms: T0 + 1_000,
+            spans: vec![span("pinned", Some("s-pin")), span("resumed", None)],
+        };
+        let line = |id: &str, at: u64, sid: &str, cwd: &str| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&assistant(id, at, 5, Some("end_turn"))).unwrap();
+            v["sessionId"] = json!(sid);
+            v["cwd"] = json!(cwd);
+            format!("{v}\n")
+        };
         fx.append(
             "-w-routed/s.jsonl",
             &[
-                in_cwd(&assistant("routed", T0 + 20, 5, None), "/w/routed/sub"),
-                in_cwd(
-                    &assistant("routed", T0 + 120, 9, Some("end_turn")),
-                    "/w/routed",
-                ),
-                in_cwd(
-                    &assistant("before", T0 + 5, 5, Some("end_turn")),
-                    "/w/routed",
-                ),
-                in_cwd(
-                    &assistant("after", T0 + 100, 5, Some("end_turn")),
-                    "/w/routed",
-                ),
-                in_cwd(
-                    &assistant("other", T0 + 50, 5, Some("end_turn")),
-                    "/w/other",
-                ),
-                assistant("no_cwd", T0 + 50, 5, Some("end_turn")),
+                line("pin_cd", T0 + 20, "s-pin", "/elsewhere"),
+                line("pin_before", T0 + 5, "s-pin", "/w/routed"),
+                line("pin_after", T0 + 100, "s-pin", "/w/routed"),
+                line("res_first", T0 + 30, "s-res", "/w/routed"),
+                line("res_cd", T0 + 40, "s-res", "/w/routed/sub"),
+                line("plain_sub", T0 + 50, "s-plain", "/w/routed/sub"),
+                line("plain_other", T0 + 50, "s-other", "/w/other"),
+                line("later", T0 + 1_500, "s-plain", "/w/other"),
             ]
             .concat(),
         );
@@ -675,10 +771,37 @@ mod tests {
             routed: &routed,
             windows: &w,
         };
-        let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 200);
+        let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 2_000);
         let mut got = ids(&got);
         got.sort_unstable();
-        assert_eq!(got, ["after", "before", "no_cwd", "other"]);
+        assert_eq!(got, ["pin_after", "pin_before", "plain_other", "plain_sub"]);
+        assert_eq!(c.bindings.len(), 1);
+
+        let routed = Routed {
+            loaded_ms: T0 + 1_000_000,
+            ..routed
+        };
+        let f = Filter {
+            routed: &routed,
+            windows: &w,
+        };
+        let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 1_000_000);
+        assert_eq!(ids(&got), ["later"]);
+    }
+
+    #[test]
+    fn null_usage_fields_count_as_zero_and_huge_ids_are_dropped() {
+        let fx = Fx::new();
+        let mut c = Cursors::default();
+        let w = open_from(T0);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&assistant("nulls", T0 + 1, 7, Some("end_turn"))).unwrap();
+        v["message"]["usage"]["cache_read_input_tokens"] = json!(null);
+        let huge = assistant(&"x".repeat(MAX_ID + 1), T0 + 2, 7, Some("end_turn"));
+        fx.append("p/s.jsonl", &format!("{v}\n{huge}"));
+        let got = fx.scan(&mut c, &w, T0 + 10);
+        assert_eq!(ids(&got), ["nulls"]);
+        assert_eq!((got[0].cache_read, got[0].output_tokens), (0, 7));
     }
 
     fn ids(records: &[UsageRecord]) -> Vec<&str> {

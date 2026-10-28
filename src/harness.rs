@@ -17,6 +17,7 @@ use crate::api::auth::{self, Creds};
 use crate::api::dialect::Dialect;
 use crate::api::session::Session;
 use crate::config::Config;
+use crate::daemon::routed::{Guard, Pin};
 use crate::error::Error;
 use crate::{Result, hosts, tool};
 
@@ -87,12 +88,22 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     cmd.env(SESSION_ENV, &session.id);
     // The child's `dense usage` must land on the same api as this session.
     cmd.env("CONDENSE_URL", &cfg.api_base_url);
-    cmd.args(args);
-
     // The proxy reports this child's usage; keep the daemon's disk reader off it.
-    let routed = (tool.kind() == "claude_code")
-        .then(|| crate::daemon::routed::Guard::open(cfg))
-        .flatten();
+    let routed = if tool.kind() == "claude_code" {
+        crate::daemon::sessions::remember_root(cfg);
+        let session_id = match Pin::of(args) {
+            Pin::Inject(id) => {
+                cmd.args(["--session-id", &id]);
+                Some(id)
+            }
+            Pin::Known(id) => Some(id),
+            Pin::Unknown => None,
+        };
+        Guard::open(cfg, session_id)
+    } else {
+        None
+    };
+    cmd.args(args);
     spawn_and_wait(&api, &session, &bin, cmd, routed).await
 }
 
@@ -102,7 +113,7 @@ async fn spawn_and_wait(
     session: &Session,
     bin: &Path,
     mut cmd: tokio::process::Command,
-    routed: Option<crate::daemon::routed::Guard>,
+    routed: Option<Guard>,
 ) -> Result<()> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -114,7 +125,7 @@ async fn spawn_and_wait(
     interrupts.abort();
     heartbeat.abort();
     if let Some(g) = routed {
-        g.close();
+        g.close().await;
     }
     session.end(api).await;
 

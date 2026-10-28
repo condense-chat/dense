@@ -12,6 +12,12 @@ use crate::daemon::switch::Mode;
 use crate::error::{Context, Error};
 
 const DEFAULT_INTERVAL_S: u64 = 60;
+/// The device id is bound to another user: regenerate it.
+pub const DEVICE_OWNED_ELSEWHERE: &str = "device_owned_elsewhere";
+/// The server has no row for this device yet; a heartbeat creates it.
+pub const DEVICE_UNKNOWN: &str = "device_unknown";
+/// The user is at their live-device cap.
+pub const DEVICE_LIMIT: &str = "device_limit";
 
 /// A device endpoint's answer: the parsed body, or a status the server will
 /// keep returning (4xx other than 408/429), so retrying it is pointless.
@@ -19,7 +25,14 @@ const DEFAULT_INTERVAL_S: u64 = 60;
 #[derive(Debug)]
 pub enum Reply<T> {
     Ok(T),
-    Rejected(u16),
+    Rejected(Rejection),
+}
+
+/// A permanent refusal: the status plus the server's `detail.code`, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub code: Option<String>,
+    pub status: u16,
 }
 
 #[derive(Serialize)]
@@ -57,15 +70,47 @@ struct UsageBatch<'a> {
     records: &'a [UsageRecord],
 }
 
+impl Rejection {
+    #[cfg(test)]
+    pub fn new(status: u16, code: Option<&str>) -> Self {
+        Self {
+            code: code.map(str::to_string),
+            status,
+        }
+    }
+
+    pub fn is(&self, code: &str) -> bool {
+        self.code.as_deref() == Some(code)
+    }
+
+    fn parse(status: u16, body: &str) -> Self {
+        let code = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["detail"]["code"].as_str().map(str::to_string));
+        Self { code, status }
+    }
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.code {
+            Some(code) => write!(f, "{} {code}", self.status),
+            None => write!(f, "{}", self.status),
+        }
+    }
+}
+
 pub async fn heartbeat(api: &Api, body: &Heartbeat<'_>) -> Result<Reply<HeartbeatReply>> {
     post(api, "/v1/devices/heartbeat", body).await
 }
 
-pub async fn uninstall(api: &Api, device_id: &str) -> Result<()> {
+/// `Ok(false)` when the server never knew the device (nothing to mark).
+pub async fn uninstall(api: &Api, device_id: &str) -> Result<bool> {
     let path = "/v1/devices/uninstall";
     match post::<serde_json::Value>(api, path, &json!({ "device_id": device_id })).await? {
-        Reply::Ok(_) => Ok(()),
-        Reply::Rejected(status) => Err(Error::msg(format!("POST {path} returned {status}"))),
+        Reply::Ok(_) => Ok(true),
+        Reply::Rejected(r) if r.is(DEVICE_UNKNOWN) => Ok(false),
+        Reply::Rejected(r) => Err(Error::msg(format!("POST {path} returned {r}"))),
     }
 }
 
@@ -93,7 +138,8 @@ async fn post<T: DeserializeOwned>(
     let resp = api.post_response(path, body).await?;
     let status = resp.status();
     if is_permanent(status) {
-        return Ok(Reply::Rejected(status.as_u16()));
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(Reply::Rejected(Rejection::parse(status.as_u16(), &body)));
     }
     if !status.is_success() {
         return Err(Error::msg(format!("POST {path} returned {status}")));
@@ -119,5 +165,15 @@ mod tests {
         assert!(permanent(413) && permanent(422));
         assert!(!permanent(408) && !permanent(429) && !permanent(500) && !permanent(503));
         assert!(!permanent(200));
+    }
+
+    #[test]
+    fn rejection_reads_the_detail_code() {
+        let r = Rejection::parse(403, r#"{"detail":{"code":"device_owned_elsewhere"}}"#);
+        assert!(r.is(DEVICE_OWNED_ELSEWHERE));
+        assert_eq!(r.to_string(), "403 device_owned_elsewhere");
+        let plain = Rejection::parse(403, r#"{"detail":"forbidden"}"#);
+        assert_eq!(plain.code, None);
+        assert_eq!(Rejection::parse(422, "not json").to_string(), "422");
     }
 }

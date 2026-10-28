@@ -22,6 +22,8 @@ use crate::config::Config;
 use crate::error::{Context, Error};
 use crate::{Result, device};
 
+const DEVICE_LIMIT_MSG: &str =
+    "device limit reached: remove old devices in the dashboard (this device stays unmanaged)";
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const INTERVAL_MAX_S: u64 = 3_600;
@@ -45,6 +47,9 @@ pub struct State {
     pub last_attempt_at: Option<u64>,
     pub last_error: Option<String>,
     pub last_ok_at: Option<u64>,
+    /// The server refused this device for the user's device cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub limited: bool,
     /// Whether the switch is ours to apply; unknown is treated as not.
     pub managed: Option<bool>,
     pub member_enabled: Option<bool>,
@@ -105,6 +110,7 @@ impl State {
     }
 
     fn record(&mut self, reply: &HeartbeatReply) {
+        self.limited = false;
         self.managed = Some(reply.managed);
         self.enabled = Some(reply.enabled);
         self.member_enabled = reply.member_enabled;
@@ -129,16 +135,26 @@ pub async fn install(cfg: &Config) -> Result<()> {
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
 pub async fn after_login(cfg: &Config) {
+    if let Some(user) = auth::load_creds(cfg).user_id
+        && let Err(e) = device::bind_user(cfg, &user)
+    {
+        tracing::warn!("could not bind the device id to this user: {e}");
+    }
     if autostart::installed(cfg).is_some() {
         return;
     }
-    let Ok(device_id) = device::id(cfg) else {
+    let Ok(mut device_id) = device::id(cfg) else {
         return;
     };
     let mut state = State::load(cfg);
-    match heartbeat(cfg, &device_id, &mut state).await {
+    match heartbeat(cfg, &mut device_id, &mut state).await {
         Ok(Some((reply, _))) if reply.managed => {}
-        Ok(_) => return,
+        Ok(_) => {
+            if state.limited {
+                eprintln!("warning: {DEVICE_LIMIT_MSG}");
+            }
+            return;
+        }
         Err(e) => {
             tracing::debug!("post-login heartbeat failed: {e}");
             return;
@@ -177,7 +193,7 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
         eprintln!("{msg}; exiting");
         return Ok(());
     };
-    let device_id = device::id(cfg)?;
+    let mut device_id = device::id(cfg)?;
     let mut state = State::load(cfg);
     if !once {
         state.pid = Some(std::process::id());
@@ -192,7 +208,7 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
     let mut reported = false;
     loop {
-        let delay = tick(cfg, &device_id, &mut state, &mut backoff).await;
+        let delay = tick(cfg, &mut device_id, &mut state, &mut backoff).await;
         save(cfg, &state);
         if once && (reported || delay != REPORT_DELAY) {
             return Ok(());
@@ -227,6 +243,7 @@ pub fn status_lines(cfg: &Config) -> Vec<(&'static str, String)> {
         (None, None) => "never heartbeated".into(),
     };
     let switch = match (state.managed, state.enabled) {
+        _ if state.limited => DEVICE_LIMIT_MSG.into(),
         (Some(false), _) => "not managed (no org device management)".into(),
         (_, Some(on)) => format!(
             "{} (member {}, device {})",
@@ -279,7 +296,8 @@ pub async fn report_uninstall(cfg: &Config) {
         Err(e) => Err(e),
     };
     match result {
-        Ok(()) => println!("device {device_id} marked uninstalled"),
+        Ok(true) => println!("device {device_id} marked uninstalled"),
+        Ok(false) => println!("device {device_id} was never registered; nothing to mark"),
         Err(e) => eprintln!(
             "warning: could not report the uninstall ({})",
             error_chain(&e)
@@ -376,9 +394,11 @@ fn state_file(cfg: &Config) -> PathBuf {
 
 /// One heartbeat. `Ok(None)`: the server refused this credential/device for
 /// good (4xx) — the cached switch is dropped so nothing stale is enforced.
+/// Heartbeat once. A `device_owned_elsewhere` refusal swaps in a fresh device
+/// id (or one another process already wrote) and retries once.
 async fn heartbeat(
     cfg: &Config,
-    device_id: &str,
+    device_id: &mut String,
     state: &mut State,
 ) -> Result<Option<(HeartbeatReply, Api)>> {
     state.last_attempt_at = Some(now());
@@ -386,7 +406,44 @@ async fn heartbeat(
     if !creds.is_authenticated() {
         return Err(Error::msg("not logged in (run `dense login`)"));
     }
-    let api = Api::authed(cfg, &creds)?;
+    let mut retried = false;
+    let rejection = loop {
+        let api = Api::authed(cfg, &creds)?;
+        match send_heartbeat(cfg, &api, device_id).await? {
+            Reply::Ok(reply) => {
+                state.record(&reply);
+                return Ok(Some((reply, api)));
+            }
+            Reply::Rejected(r) if r.is(devices::DEVICE_OWNED_ELSEWHERE) && !retried => {
+                retried = true;
+                let fresh = match device::load(cfg).filter(|id| id != device_id) {
+                    Some(id) => id,
+                    None => device::regenerate(cfg)?,
+                };
+                tracing::warn!(old = %device_id, new = %fresh, "device id belongs to another user; switched to a new one");
+                *device_id = fresh;
+            }
+            Reply::Rejected(r) => break r,
+        }
+    };
+    if state.enforced().is_some() {
+        tracing::warn!("heartbeat rejected ({rejection}); no longer enforcing the cached switch");
+    }
+    state.forget_switch();
+    state.limited = rejection.is(devices::DEVICE_LIMIT);
+    state.last_error = Some(if state.limited {
+        DEVICE_LIMIT_MSG.to_string()
+    } else if matches!(rejection.status, 401 | 403) {
+        format!(
+            "heartbeat rejected ({rejection}): credential not accepted for this device (run `dense login`)"
+        )
+    } else {
+        format!("heartbeat rejected ({rejection})")
+    });
+    Ok(None)
+}
+
+async fn send_heartbeat(cfg: &Config, api: &Api, device_id: &str) -> Result<Reply<HeartbeatReply>> {
     let hostname = device::hostname();
     let body = Heartbeat {
         app_version: env!("CARGO_PKG_VERSION"),
@@ -395,34 +452,24 @@ async fn heartbeat(
         mode: Some(switch::observe(cfg)),
         platform: device::platform(),
     };
-    match devices::heartbeat(&api, &body).await? {
-        Reply::Ok(reply) => {
-            state.record(&reply);
-            Ok(Some((reply, api)))
-        }
-        Reply::Rejected(status) => {
-            if state.enforced().is_some() {
-                tracing::warn!(
-                    "heartbeat rejected ({status}); no longer enforcing the cached switch"
-                );
-            }
-            state.forget_switch();
-            state.last_error = Some(match status {
-                401 | 403 => format!(
-                    "heartbeat rejected ({status}): credential not accepted for this device (run `dense login`)"
-                ),
-                _ => format!("heartbeat rejected ({status})"),
-            });
-            Ok(None)
-        }
-    }
+    devices::heartbeat(api, &body).await
 }
 
 /// One heartbeat + apply + flush. Returns how long to sleep before the next.
-async fn tick(cfg: &Config, device_id: &str, state: &mut State, backoff: &mut Backoff) -> Duration {
+async fn tick(
+    cfg: &Config,
+    device_id: &mut String,
+    state: &mut State,
+    backoff: &mut Backoff,
+) -> Duration {
     let (reply, api) = match heartbeat(cfg, device_id, state).await {
         Ok(Some(ok)) => ok,
-        Ok(None) => return backoff.next_delay(),
+        Ok(None) => {
+            if state.limited {
+                tracing::warn!("{DEVICE_LIMIT_MSG}");
+            }
+            return backoff.next_delay();
+        }
         Err(e) => {
             let delay = backoff.next_delay();
             tracing::warn!("heartbeat failed, retrying in {}s: {e}", delay.as_secs());
@@ -441,6 +488,14 @@ async fn tick(cfg: &Config, device_id: &str, state: &mut State, backoff: &mut Ba
 
     let queue = queue::Queue::open(cfg);
     match queue::flush_to(&api, device_id, &queue).await {
+        Ok(f) if f.stalled.is_some() => tracing::warn!(
+            sent = f.sent,
+            "usage upload refused for this device ({}); kept queued until the next heartbeat",
+            f.stalled
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        ),
         Ok(f) if f.dropped > 0 => tracing::warn!(
             sent = f.sent,
             dropped = f.dropped,
@@ -472,6 +527,8 @@ fn error_chain(e: &crate::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OK_OFF: &str = r#"{"managed":true,"enabled":false,"heartbeat_interval_s":60}"#;
 
     #[test]
     fn backoff_doubles_to_cap_and_resets() {
@@ -511,12 +568,19 @@ mod tests {
     /// A one-route HTTP server: every request gets `status` + `body`; returns
     /// the base URL and the request lines it saw.
     fn serve(status: u16, body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        serve_seq(vec![(status, body)])
+    }
+
+    /// Like [`serve`], answering with `replies` in order (the last repeats);
+    /// each seen request is reported as `<request line>\n<body>`.
+    fn serve_seq(replies: Vec<(u16, &'static str)>) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for (n, stream) in listener.incoming().flatten().enumerate() {
+                let (status, body) = replies[n.min(replies.len() - 1)];
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -533,7 +597,11 @@ mod tests {
                 }
                 let mut buf = vec![0; len];
                 reader.read_exact(&mut buf).unwrap();
-                let _ = tx.send(line.trim().to_string());
+                let _ = tx.send(format!(
+                    "{}\n{}",
+                    line.trim(),
+                    String::from_utf8_lossy(&buf)
+                ));
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -569,12 +637,24 @@ mod tests {
         let shim = shim(&cfg);
         let mut state = State::default();
         let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
-        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await, REPORT_DELAY);
+        assert_eq!(
+            tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await,
+            REPORT_DELAY
+        );
         assert!(!shim.exists());
         assert_eq!(state.mode, Some(switch::Mode::Transparent));
         assert_eq!(state.enforced(), Some(false));
-        assert_eq!(rx.recv().unwrap(), "POST /v1/devices/heartbeat HTTP/1.1");
-        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await.as_secs(), 42);
+        assert!(
+            rx.recv()
+                .unwrap()
+                .starts_with("POST /v1/devices/heartbeat HTTP/1.1\n")
+        );
+        assert_eq!(
+            tick(&cfg, &mut "d".to_string(), &mut state, &mut b)
+                .await
+                .as_secs(),
+            42
+        );
     }
 
     #[tokio::test]
@@ -588,7 +668,12 @@ mod tests {
         let shim = shim(&cfg);
         let mut state = State::default();
         let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
-        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await.as_secs(), 60);
+        assert_eq!(
+            tick(&cfg, &mut "d".to_string(), &mut state, &mut b)
+                .await
+                .as_secs(),
+            60
+        );
         assert!(shim.exists());
         assert_eq!(state.enforced(), None);
         assert_eq!(state.mode, Some(switch::Mode::Condensing));
@@ -602,7 +687,7 @@ mod tests {
         let shim = shim(&cfg);
         let mut state = State::default();
         let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
-        tick(&cfg, "d", &mut state, &mut b).await;
+        tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
         assert!(shim.exists());
     }
 
@@ -618,10 +703,104 @@ mod tests {
             ..State::default()
         };
         let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
-        assert_eq!(tick(&cfg, "d", &mut state, &mut b).await, BACKOFF_MIN);
+        assert_eq!(
+            tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await,
+            BACKOFF_MIN
+        );
         assert_eq!(state.enforced(), None);
         assert!(shim.exists());
         assert!(state.last_error.unwrap().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn owned_elsewhere_regenerates_the_id_and_retries_once() {
+        let (url, rx) = serve_seq(vec![
+            (403, r#"{"detail":{"code":"device_owned_elsewhere"}}"#),
+            (200, OK_OFF),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let mut id = device::id(&cfg).unwrap();
+        let old = id.clone();
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        assert_eq!(tick(&cfg, &mut id, &mut state, &mut b).await.as_secs(), 60);
+        assert_ne!(id, old);
+        assert_eq!(device::load(&cfg).as_deref(), Some(id.as_str()));
+        assert!(rx.recv().unwrap().contains(&old));
+        assert!(rx.recv().unwrap().contains(&id));
+        assert_eq!(state.enforced(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn owned_elsewhere_twice_is_a_plain_rejection() {
+        let (url, rx) = serve(403, r#"{"detail":{"code":"device_owned_elsewhere"}}"#);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let mut id = device::id(&cfg).unwrap();
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        };
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        assert_eq!(tick(&cfg, &mut id, &mut state, &mut b).await, BACKOFF_MIN);
+        assert_eq!(rx.try_iter().count(), 2);
+        assert_eq!(state.enforced(), None);
+        assert!(state.last_error.unwrap().contains("device_owned_elsewhere"));
+    }
+
+    #[tokio::test]
+    async fn device_limit_stays_unmanaged_and_says_why() {
+        let (url, _rx) = serve(409, r#"{"detail":{"code":"device_limit"}}"#);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let shim = shim(&cfg);
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        };
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        assert_eq!(
+            tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await,
+            BACKOFF_MIN
+        );
+        assert!(shim.exists());
+        assert!(state.limited && state.enforced().is_none());
+        save(&cfg, &state);
+        let lines = status_lines(&cfg);
+        assert!(
+            lines
+                .iter()
+                .any(|(k, v)| *k == "switch" && v.starts_with("device limit reached"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_device_on_usage_keeps_the_batch() {
+        let (url, _rx) = serve_seq(vec![
+            (200, OK_OFF),
+            (404, r#"{"detail":{"code":"device_unknown"}}"#),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let q = queue::Queue::open(&cfg);
+        let rec = queue::UsageRecord {
+            cache_read: 0,
+            cache_write: 0,
+            input_tokens: 1,
+            message_id: "m".into(),
+            model: "x".into(),
+            occurred_at: "2026-10-28T00:00:00Z".into(),
+            output_tokens: 1,
+            session_ref: "s".into(),
+        };
+        q.push(&[rec]).unwrap();
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
+        assert_eq!(q.len(), 1);
     }
 
     #[test]
@@ -665,8 +844,8 @@ mod tests {
             ..State::default()
         };
         let mut b = Backoff::new(Duration::from_secs(5), Duration::from_secs(300));
-        let first = tick(&cfg, "d", &mut state, &mut b).await;
-        let second = tick(&cfg, "d", &mut state, &mut b).await;
+        let first = tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
+        let second = tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
         assert_eq!((first.as_secs(), second.as_secs()), (5, 10));
         assert_eq!(state.enabled, Some(false));
         assert!(state.last_error.is_some());

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::api::Api;
-use crate::api::devices::{self, Reply};
+use crate::api::devices::{self, DEVICE_OWNED_ELSEWHERE, DEVICE_UNKNOWN, Rejection, Reply};
 use crate::config::Config;
 use crate::error::Context;
 
@@ -24,6 +24,9 @@ pub struct Flushed {
     /// Records in batches the server rejected for good.
     pub dropped: usize,
     pub sent: usize,
+    /// The drain stopped on a refusal of the device itself (unknown, or bound
+    /// to another user); the batch stays queued for after a heartbeat.
+    pub stalled: Option<Rejection>,
 }
 
 pub struct Queue {
@@ -136,7 +139,7 @@ impl Queue {
 
 /// Drain the queue through `send`, one [`BATCH`] at a time. A batch leaves
 /// the queue once `send` returns `Ok` — accepted, or rejected for good — and
-/// stays (stopping the drain) on `Err`.
+/// stays (stopping the drain) on `Err` or a device-level refusal.
 pub async fn flush<F, Fut>(queue: &Queue, mut send: F) -> Result<Flushed>
 where
     F: FnMut(Vec<UsageRecord>) -> Fut,
@@ -154,11 +157,17 @@ where
         } else {
             Reply::Ok(())
         };
+        if let Reply::Rejected(r) = &reply
+            && (r.is(DEVICE_UNKNOWN) || r.is(DEVICE_OWNED_ELSEWHERE))
+        {
+            out.stalled = Some(r.clone());
+            return Ok(out);
+        }
         queue.drop_front(consumed)?;
         match reply {
             Reply::Ok(()) => out.sent += count,
-            Reply::Rejected(status) => {
-                tracing::warn!("server rejected {count} usage records ({status}); dropped them");
+            Reply::Rejected(r) => {
+                tracing::warn!("server rejected {count} usage records ({r}); dropped them");
                 out.dropped += count;
             }
         }
@@ -177,7 +186,7 @@ pub async fn flush_to(api: &Api, device_id: &str, queue: &Queue) -> Result<Flush
                 );
                 Reply::Ok(())
             }
-            Reply::Rejected(status) => Reply::Rejected(status),
+            Reply::Rejected(r) => Reply::Rejected(r),
         })
     })
     .await
@@ -317,7 +326,7 @@ mod tests {
             let first = calls == 1;
             async move {
                 Ok(if first {
-                    Reply::Rejected(422)
+                    Reply::Rejected(Rejection::new(422, None))
                 } else {
                     Reply::Ok(())
                 })
@@ -329,9 +338,30 @@ mod tests {
             out,
             Flushed {
                 dropped: 500,
-                sent: 200
+                sent: 200,
+                stalled: None
             }
         );
         assert_eq!(q.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn device_refusal_keeps_the_batch_queued() {
+        for code in [DEVICE_UNKNOWN, DEVICE_OWNED_ELSEWHERE] {
+            let dir = tempfile::tempdir().unwrap();
+            let q = Queue::at(dir.path().join("q.jsonl"), 5_000);
+            q.push(&records(0..700)).unwrap();
+            let mut calls = 0;
+            let out = flush(&q, |_| {
+                calls += 1;
+                async move { Ok(Reply::Rejected(Rejection::new(404, Some(code)))) }
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(out.sent + out.dropped, 0);
+            assert!(out.stalled.unwrap().is(code));
+            assert_eq!(q.len(), 700);
+        }
     }
 }

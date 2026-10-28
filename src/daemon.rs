@@ -7,6 +7,7 @@
 
 pub mod autostart;
 pub mod queue;
+pub mod routed;
 pub mod sessions;
 pub mod switch;
 

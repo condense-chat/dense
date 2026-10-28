@@ -89,7 +89,11 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     cmd.env("CONDENSE_URL", &cfg.api_base_url);
     cmd.args(args);
 
-    spawn_and_wait(&api, &session, &bin, cmd).await
+    // The proxy reports this child's usage; keep the daemon's disk reader off it.
+    let routed = (tool.kind() == "claude_code")
+        .then(|| crate::daemon::routed::Guard::open(cfg))
+        .flatten();
+    spawn_and_wait(&api, &session, &bin, cmd, routed).await
 }
 
 /// Run an already-configured child to completion under a condense session.
@@ -98,6 +102,7 @@ async fn spawn_and_wait(
     session: &Session,
     bin: &Path,
     mut cmd: tokio::process::Command,
+    routed: Option<crate::daemon::routed::Guard>,
 ) -> Result<()> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -108,6 +113,9 @@ async fn spawn_and_wait(
     let status = cmd.status().await;
     interrupts.abort();
     heartbeat.abort();
+    if let Some(g) = routed {
+        g.close();
+    }
     session.end(api).await;
 
     match status {

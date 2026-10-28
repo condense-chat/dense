@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::queue::{Queue, UsageRecord};
+use super::routed::Routed;
 use super::switch::Mode;
 use crate::Result;
 use crate::config::Config;
@@ -37,6 +38,13 @@ const WINDOW_RETENTION_MS: u64 = 35 * 24 * 3_600 * 1_000;
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Cursors {
     files: BTreeMap<String, Cursor>,
+}
+
+/// What the reader may report: inside a transparent window and outside every
+/// `dense claude` routed span.
+pub struct Filter<'a> {
+    pub routed: &'a Routed,
+    pub windows: &'a Windows,
 }
 
 /// A span (unix ms) during which the daemon had the machine `transparent`.
@@ -66,6 +74,7 @@ struct Cursor {
 
 #[derive(Deserialize)]
 struct Line {
+    cwd: Option<PathBuf>,
     message: Option<Message>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
@@ -174,13 +183,18 @@ impl Windows {
 /// Scan the session files and queue every new in-window message. Returns how
 /// many records were queued.
 pub fn report(cfg: &Config, windows: &Windows, now_ms: u64) -> Result<usize> {
+    let routed = Routed::load_and_prune(cfg, now_ms);
     if windows.is_empty() {
         return Ok(0);
     }
     let path = cfg.daemon_dir().join("sessions.json");
     let mut cursors = Cursors::load(&path);
     let roots = roots(cfg.home(), |k| std::env::var(k).ok());
-    let (records, dirty) = scan(&roots, &mut cursors, windows, now_ms);
+    let filter = Filter {
+        routed: &routed,
+        windows,
+    };
+    let (records, dirty) = scan(&roots, &mut cursors, &filter, now_ms);
     Queue::open(cfg).push(&records)?;
     if dirty {
         cursors.save(&path)?;
@@ -212,7 +226,7 @@ pub fn roots(home: &Path, env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> 
 pub fn scan(
     roots: &[PathBuf],
     cursors: &mut Cursors,
-    windows: &Windows,
+    filter: &Filter,
     now_ms: u64,
 ) -> (Vec<UsageRecord>, bool) {
     let mut files = Vec::new();
@@ -227,7 +241,7 @@ pub fn scan(
     for path in files {
         let key = path.to_string_lossy().into_owned();
         let cursor = cursors.files.entry(key.clone()).or_default();
-        match read_file(&path, cursor, windows, now_ms, &mut out) {
+        match read_file(&path, cursor, filter, now_ms, &mut out) {
             Ok(changed) => dirty |= changed,
             Err(e) => tracing::debug!("skipping {}: {e}", path.display()),
         }
@@ -243,7 +257,7 @@ pub fn scan(
         if let Some(mut cursor) = cursors.files.remove(&key) {
             let ids: Vec<String> = cursor.pending.keys().cloned().collect();
             for id in ids {
-                settle(&mut cursor, &id, windows, &mut out);
+                settle(&mut cursor, &id, filter, &mut out);
             }
         }
         dirty = true;
@@ -261,7 +275,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn handle_line(line: &[u8], cursor: &mut Cursor, windows: &Windows, out: &mut Vec<UsageRecord>) {
+fn handle_line(line: &[u8], cursor: &mut Cursor, filter: &Filter, out: &mut Vec<UsageRecord>) {
     if !contains(line, b"\"usage\"") {
         return;
     }
@@ -278,6 +292,12 @@ fn handle_line(line: &[u8], cursor: &mut Cursor, windows: &Windows, out: &mut Ve
         return;
     };
     if cursor.recent.contains(&id) {
+        return;
+    }
+    if !cursor.pending.contains_key(&id)
+        && parsed.cwd.is_some_and(|cwd| filter.routed.covers(&cwd, ts))
+    {
+        remember(cursor, id);
         return;
     }
     let entry = cursor.pending.entry(id.clone()).or_insert_with(|| Pending {
@@ -301,7 +321,7 @@ fn handle_line(line: &[u8], cursor: &mut Cursor, windows: &Windows, out: &mut Ve
         entry.first_at = at;
     }
     if msg.stop_reason.is_some() {
-        settle(cursor, &id, windows, out);
+        settle(cursor, &id, filter, out);
     } else if cursor.pending.len() > MAX_PENDING
         && let Some(oldest) = cursor
             .pending
@@ -309,7 +329,7 @@ fn handle_line(line: &[u8], cursor: &mut Cursor, windows: &Windows, out: &mut Ve
             .min_by_key(|(_, p)| p.first_ms)
             .map(|(k, _)| k.clone())
     {
-        settle(cursor, &oldest, windows, out);
+        settle(cursor, &oldest, filter, out);
     }
 }
 
@@ -412,7 +432,7 @@ fn read_line_bounded(
 fn read_file(
     path: &Path,
     cursor: &mut Cursor,
-    windows: &Windows,
+    filter: &Filter,
     now_ms: u64,
     out: &mut Vec<UsageRecord>,
 ) -> std::io::Result<bool> {
@@ -435,10 +455,14 @@ fn read_file(
     }
     let unchanged = !replaced && size == cursor.offset && mtime_ms == cursor.mtime_ms;
     if !unchanged {
-        if windows.earliest().is_some_and(|start| mtime_ms < start) {
+        if filter
+            .windows
+            .earliest()
+            .is_some_and(|start| mtime_ms < start)
+        {
             cursor.offset = size;
         } else {
-            read_from(&mut file, cursor, size, windows, out)?;
+            read_from(&mut file, cursor, size, filter, out)?;
         }
         cursor.head_len = cursor.offset.min(HEAD_BYTES);
         cursor.head = head_hash(&mut file, cursor.head_len)?;
@@ -453,7 +477,7 @@ fn read_file(
         .map(|(k, _)| k.clone())
         .collect();
     for id in stale {
-        settle(cursor, &id, windows, out);
+        settle(cursor, &id, filter, out);
     }
     Ok(!unchanged || replaced || before != (cursor.offset, cursor.pending.len()))
 }
@@ -462,7 +486,7 @@ fn read_from(
     file: &mut File,
     cursor: &mut Cursor,
     size: u64,
-    windows: &Windows,
+    filter: &Filter,
     out: &mut Vec<UsageRecord>,
 ) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(cursor.offset))?;
@@ -484,21 +508,25 @@ fn read_from(
         }
         cursor.offset += n;
         if !overlong {
-            handle_line(&buf, cursor, windows, out);
+            handle_line(&buf, cursor, filter, out);
         }
     }
 }
 
-fn settle(cursor: &mut Cursor, id: &str, windows: &Windows, out: &mut Vec<UsageRecord>) {
-    let Some(p) = cursor.pending.remove(id) else {
-        return;
-    };
-    cursor.recent.push_back(id.to_string());
+fn remember(cursor: &mut Cursor, id: String) {
+    cursor.recent.push_back(id);
     if cursor.recent.len() > RECENT_IDS {
         cursor.recent.pop_front();
     }
+}
+
+fn settle(cursor: &mut Cursor, id: &str, filter: &Filter, out: &mut Vec<UsageRecord>) {
+    let Some(p) = cursor.pending.remove(id) else {
+        return;
+    };
+    remember(cursor, id.to_string());
     let empty = p.input_tokens + p.output_tokens + p.cache_read + p.cache_write == 0;
-    if p.model == SYNTHETIC_MODEL || empty || !windows.contains(p.first_ms) {
+    if p.model == SYNTHETIC_MODEL || empty || !filter.windows.contains(p.first_ms) {
         return;
     }
     out.push(UsageRecord {
@@ -537,6 +565,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::daemon::routed::Span;
 
     const T0: u64 = 1_793_188_800_000; // 2026-10-28T12:00:00Z
     const SECRET: &str = "TOP-SECRET-PROMPT-TEXT";
@@ -567,7 +596,12 @@ mod tests {
         }
 
         fn scan(&self, cursors: &mut Cursors, windows: &Windows, now: u64) -> Vec<UsageRecord> {
-            scan(std::slice::from_ref(&self.root), cursors, windows, now).0
+            let routed = Routed::default();
+            let f = Filter {
+                routed: &routed,
+                windows,
+            };
+            scan(std::slice::from_ref(&self.root), cursors, &f, now).0
         }
     }
 
@@ -593,6 +627,58 @@ mod tests {
             }
         });
         format!("{line}\n")
+    }
+
+    fn in_cwd(line: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+        v["cwd"] = json!(cwd);
+        format!("{v}\n")
+    }
+
+    #[test]
+    fn messages_from_a_dense_routed_span_are_not_reported() {
+        let fx = Fx::new();
+        let mut c = Cursors::default();
+        let w = open_from(T0);
+        let routed = Routed(vec![Span {
+            cwd: "/w/routed".into(),
+            end_ms: Some(T0 + 100),
+            pid: 1,
+            seen_ms: T0 + 100,
+            start_ms: T0 + 10,
+        }]);
+        fx.append(
+            "-w-routed/s.jsonl",
+            &[
+                in_cwd(&assistant("routed", T0 + 20, 5, None), "/w/routed/sub"),
+                in_cwd(
+                    &assistant("routed", T0 + 120, 9, Some("end_turn")),
+                    "/w/routed",
+                ),
+                in_cwd(
+                    &assistant("before", T0 + 5, 5, Some("end_turn")),
+                    "/w/routed",
+                ),
+                in_cwd(
+                    &assistant("after", T0 + 100, 5, Some("end_turn")),
+                    "/w/routed",
+                ),
+                in_cwd(
+                    &assistant("other", T0 + 50, 5, Some("end_turn")),
+                    "/w/other",
+                ),
+                assistant("no_cwd", T0 + 50, 5, Some("end_turn")),
+            ]
+            .concat(),
+        );
+        let f = Filter {
+            routed: &routed,
+            windows: &w,
+        };
+        let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 200);
+        let mut got = ids(&got);
+        got.sort_unstable();
+        assert_eq!(got, ["after", "before", "no_cwd", "other"]);
     }
 
     fn ids(records: &[UsageRecord]) -> Vec<&str> {
@@ -704,7 +790,11 @@ mod tests {
             &assistant("msg_1", T0 + 1, 1, Some("end_turn")),
         );
         assert_eq!(ids(&fx.scan(&mut c, &w, T0 + 10)), ["msg_1"]);
-        let (none, dirty) = scan(std::slice::from_ref(&fx.root), &mut c, &w, T0 + 20);
+        let f = Filter {
+            routed: &Routed::default(),
+            windows: &w,
+        };
+        let (none, dirty) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 20);
         assert!(none.is_empty() && !dirty);
         fx.append(
             "-p/s.jsonl",

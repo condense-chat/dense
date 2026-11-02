@@ -327,7 +327,8 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
             Err(e) => result = result.and(Err(e)),
         }
     }
-    if routing.added_daemon {
+    // A managed device keeps the daemon: it carries the org's switch.
+    if routing.added_daemon && !daemon::State::load(cfg).is_managed() {
         result = result.and(daemon::remove_autostart(cfg));
     }
     result

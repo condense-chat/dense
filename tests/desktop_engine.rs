@@ -28,6 +28,7 @@ const FAKE_ENGINE: &str = r#"#!/bin/sh
   printf 'base=%s\n' "$ANTHROPIC_BASE_URL"
   printf 'token=%s\n' "$CLAUDE_CODE_OAUTH_TOKEN"
   printf 'kind=%s\n' "$(printf '%s' "$ANTHROPIC_CUSTOM_HEADERS" | grep -c x-condense-kind)"
+  printf 'device=%s\n' "$(printf '%s' "$ANTHROPIC_CUSTOM_HEADERS" | grep -c x-condense-device-id)"
   printf 'session=%s\n' "$CONDENSE_SESSION_ID"
   printf 'args=%s\n' "$*"
 } > "$ENGINE_REPORT"
@@ -317,6 +318,10 @@ impl Rig {
         fs::read_to_string(self.report()).expect("engine ran")
     }
 
+    fn data(&self) -> PathBuf {
+        self.home.path().join(".local/share/dense")
+    }
+
     fn routed_base(&self) -> String {
         format!("base=http://127.0.0.1:{}/anthropic", self.port)
     }
@@ -404,6 +409,53 @@ fn logged_in_routes_and_keeps_desktops_token() {
         report.contains("args=--output-format stream-json"),
         "{report}"
     );
+}
+
+#[test]
+fn routed_engine_carries_the_device_and_records_its_span() {
+    let rig = Rig::new();
+    rig.log_in();
+    let out = run(rig.command().args(["--output-format", "stream-json"]));
+
+    assert_eq!(out.status.code(), Some(3));
+    let report = rig.reported();
+    assert!(report.contains("device=1"), "{report}");
+    let device = fs::read_to_string(rig.creds().join("device")).expect("device id");
+    assert_eq!(device.trim().len(), 36);
+    let spans: Vec<_> = fs::read_dir(rig.data().join("routed"))
+        .expect("routed dir")
+        .flatten()
+        .collect();
+    assert_eq!(spans.len(), 1);
+    let span = fs::read_to_string(spans[0].path()).expect("span");
+    assert!(span.contains("\"end_ms\""), "{span}");
+}
+
+#[test]
+fn org_off_switch_runs_direct_until_it_is_back_on() {
+    let rig = Rig::new();
+    rig.log_in();
+    let state = rig.data().join("daemon/local/state.toml");
+    fs::create_dir_all(state.parent().expect("parent")).expect("mkdir");
+
+    fs::write(&state, "managed = true\nenabled = false\n").expect("write state");
+    let out = run(rig.command().args(["--output-format", "stream-json"]));
+    assert_eq!(out.status.code(), Some(3));
+    let report = rig.reported();
+    assert!(
+        report.contains("base=https://api.anthropic.com"),
+        "{report}"
+    );
+    assert!(report.contains("kind=0"), "{report}");
+    assert!(
+        rig.engine_log().contains("turned off"),
+        "{}",
+        rig.engine_log()
+    );
+
+    fs::write(&state, "managed = true\nenabled = true\n").expect("write state");
+    run(rig.command().args(["--output-format", "stream-json"]));
+    assert!(rig.reported().contains(&rig.routed_base()));
 }
 
 #[test]

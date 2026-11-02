@@ -200,8 +200,15 @@ mod tests {
             token: Some("t".into()),
             user_id: Some("u".into()),
         };
-        let h = harness::condense_headers(&cfg, &creds, "s", Claude { plugin_dir: None }.kind());
+        let h = harness::condense_headers(
+            &cfg,
+            &creds,
+            Some("d"),
+            "s",
+            Claude { plugin_dir: None }.kind(),
+        );
         assert!(h.contains(&("x-condense-kind".to_string(), "claude_code".to_string())));
+        assert!(h.contains(&("x-condense-device-id".to_string(), "d".to_string())));
     }
 
     #[test]

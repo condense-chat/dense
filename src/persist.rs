@@ -115,6 +115,26 @@ pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()
     Ok(())
 }
 
+/// Remove the targets' shims and drop them from the record. Prints nothing;
+/// returns `(tool, removed)` — `false` when it was not persisted.
+pub fn remove_shims(cfg: &Config, targets: &[String]) -> Result<Vec<(String, bool)>> {
+    let selected = select(targets)?;
+    let mut rec = load_record(cfg);
+    let mut out = Vec::new();
+    for spec in selected {
+        let path = shim_path(cfg, spec.name);
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).ctx(format!("removing {}", path.display())),
+        };
+        rec.tools.remove(spec.name);
+        out.push((spec.name.to_string(), removed));
+    }
+    save_record(cfg, &rec)?;
+    Ok(out)
+}
+
 /// Print the PATH-wiring follow-up for the standalone `dense persist`.
 pub fn report_wiring(cfg: &Config, wiring: &env_file::PathWiring) {
     match wiring {
@@ -145,27 +165,23 @@ pub fn shim_path(cfg: &Config, name: &str) -> PathBuf {
 }
 
 pub fn unpersist(cfg: &Config, targets: &[String]) -> Result<()> {
-    let selected = select(targets)?;
-    let mut rec = load_record(cfg);
-    for spec in selected {
-        let path = shim_path(cfg, spec.name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => println!("unpersisted {}", spec.name),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("{}: not persisted", spec.name);
-            }
-            Err(e) => return Err(e).ctx(format!("removing {}", path.display())),
+    for (name, removed) in remove_shims(cfg, targets)? {
+        if removed {
+            println!("unpersisted {name}");
+        } else {
+            println!("{name}: not persisted");
         }
-        rec.tools.remove(spec.name);
     }
-    save_record(cfg, &rec)?;
     Ok(())
 }
 
 fn save_record(cfg: &Config, rec: &Record) -> Result<()> {
     std::fs::create_dir_all(cfg.data_dir()).ctx("creating dense data dir")?;
     let body = toml::to_string_pretty(rec).ctx("serializing persist record")?;
-    std::fs::write(cfg.persist_file(), body).ctx("writing persist record")
+    let path = cfg.persist_file();
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body).ctx("writing persist record")?;
+    std::fs::rename(&tmp, &path).ctx("replacing persist record")
 }
 
 fn select(targets: &[String]) -> Result<Vec<&'static ToolSpec>> {

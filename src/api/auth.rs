@@ -159,7 +159,7 @@ async fn device_flow_inner(cfg: &Config) -> Result<()> {
         cfg.api_base_url
     )));
     let start: DeviceStart = api
-        .post_json("/v1/device/start", &serde_json::json!({}))
+        .post_json("/v1/device/start", &device_start_body(cfg))
         .await?;
 
     let scheme = hosts::default_scheme_for(&cfg.api_host);
@@ -196,6 +196,18 @@ async fn device_flow_inner(cfg: &Config) -> Result<()> {
         Err(e) => spinner.error(format!("{e}")),
     }
     result
+}
+
+/// Optional identity fields so the server can create the `devices` row on link.
+fn device_start_body(cfg: &Config) -> serde_json::Value {
+    match crate::device::id(cfg) {
+        Ok(id) => serde_json::json!({
+            "device_id": id,
+            "platform": crate::device::platform(),
+            "hostname": crate::device::hostname(),
+        }),
+        Err(_) => serde_json::json!({}),
+    }
 }
 
 fn maybe_open(cfg: &Config, url: &str) {

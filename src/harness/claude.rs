@@ -1,10 +1,12 @@
 //! Claude Code through condense (Anthropic dialect).
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::Result;
+use crate::api::auth::Creds;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
 use crate::harness::commands;
@@ -88,6 +90,11 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
         .map_err(|e| eprintln!("  warning: could not stage the /dense command: {e}"))
         .ok();
     harness::launch(cfg, Claude { plugin_dir }, args).await
+}
+
+/// Desktop's engine through the Anthropic proxy; see [`harness::launch_engine`].
+pub async fn run_engine(cfg: &Config, creds: &Creds, real: &Path, args: &[OsString]) -> Result<()> {
+    harness::launch_engine(cfg, Claude { plugin_dir: None }, creds, real, args).await
 }
 
 /// An Anthropic-only knob: `on` when we forward to Anthropic itself, `off`

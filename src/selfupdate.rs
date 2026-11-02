@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::api::Api;
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{Result, env_file, persist};
+use crate::{Result, daemon, desktop, env_file, persist};
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -24,6 +24,14 @@ struct Manifest {
 }
 
 pub fn uninstall(cfg: &Config) -> Result<()> {
+    if let Err(e) = desktop::uninstall(cfg, None) {
+        eprintln!("warning: could not restore Claude Desktop's engines ({e})");
+    }
+    if daemon::autostart::installed(cfg).is_some()
+        && let Err(e) = daemon::uninstall(cfg)
+    {
+        eprintln!("warning: could not remove the daemon autostart ({e})");
+    }
     for name in persist::load_record(cfg).tools.keys() {
         let _ = std::fs::remove_file(persist::shim_path(cfg, name));
     }
@@ -84,9 +92,26 @@ pub async fn update(cfg: &Config) -> Result<()> {
         )));
     }
 
+    // Resolved first: linux reports the running binary as deleted once replaced.
+    let exe = std::env::current_exe().ctx("locating the running binary")?;
     replace_self(&bytes)?;
     println!("updated to {}.", manifest.version);
+    if desktop::has_wrapped_engines(cfg) {
+        refresh_desktop_engines(&exe);
+    }
     Ok(())
+}
+
+/// The new binary re-copies itself over Desktop's engines.
+fn refresh_desktop_engines(exe: &std::path::Path) {
+    let done = std::process::Command::new(exe)
+        .args([desktop::COMMAND, "install", "--no-watch"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !done {
+        eprintln!("warning: run `dense claude-desktop install` to update Desktop's engines");
+    }
 }
 
 /// Release asset name for a platform key (e.g. `dense-linux-x86_64`).

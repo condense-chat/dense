@@ -4,6 +4,8 @@
 mod api;
 mod cli;
 mod config;
+mod daemon;
+mod desktop;
 mod doctor;
 mod env_file;
 mod error;
@@ -26,7 +28,7 @@ use color_eyre::Result as EyreResult;
 use tracing_subscriber::EnvFilter;
 
 use api::auth;
-use cli::{Cli, Command, SelfCommand};
+use cli::{Cli, Command, DaemonCommand, DesktopCommand, SelfCommand};
 use config::Config;
 
 fn init_tracing(verbose: u8) {
@@ -45,6 +47,9 @@ fn init_tracing(verbose: u8) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> EyreResult<()> {
+    if let Some(real) = desktop::engine::sibling_engine() {
+        return desktop::engine::run(&real).await.map_err(Into::into);
+    }
     color_eyre::install()?;
     let cli = Cli::parse();
     init_tracing(cli.verbose);
@@ -60,6 +65,11 @@ async fn main() -> EyreResult<()> {
             Ok(())
         }
         Command::Codex { args } => harness::codex::run(&cfg, &args).await,
+        Command::Daemon(DaemonCommand::Install) => {
+            daemon::install(&cfg).and_then(|()| desktop::keep_daemon(&cfg))
+        }
+        Command::Daemon(DaemonCommand::Run { once }) => daemon::run(&cfg, once).await,
+        Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg),
         Command::Login => auth::login(&cfg).await,
         Command::Logout => auth::logout(&cfg),
         Command::Claude { args } => harness::claude::run(&cfg, &args).await,
@@ -74,6 +84,13 @@ async fn main() -> EyreResult<()> {
             json,
             sub,
         } => usage::run(&cfg, &sub, json, attributed_only).await,
+        Command::ClaudeDesktop(command) => match command {
+            DesktopCommand::Install { data_dir, no_watch } => {
+                desktop::install(&cfg, data_dir, !no_watch)
+            }
+            DesktopCommand::Status { data_dir } => desktop::status(&cfg, data_dir),
+            DesktopCommand::Uninstall { data_dir } => desktop::uninstall(&cfg, data_dir),
+        },
         Command::Doctor => doctor::run(&cfg).await,
         Command::Setup => setup::run(&cfg).await,
         Command::Profile { name, url, list } => {
@@ -118,4 +135,7 @@ fn status(cfg: &Config) {
     println!("creds:   {}", cfg.cred_dir().display());
     println!("token:   {}", presence(creds.token.is_some()));
     println!("user:    {}", presence(creds.user_id.is_some()));
+    for (label, value) in daemon::status_lines(cfg) {
+        println!("{:<9}{value}", format!("{label}:"));
+    }
 }

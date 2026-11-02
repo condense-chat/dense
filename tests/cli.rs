@@ -38,6 +38,19 @@ fn help_smoke() {
     }
 }
 
+#[test]
+fn help_lists_claude_desktop() {
+    for args in [["--help"], ["help"]] {
+        let out = dense().args(args).output().expect("run");
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            help.contains("\n  claude-desktop "),
+            "claude-desktop is missing, got: {help}"
+        );
+    }
+}
+
 // HOME-keyed config resolution is unix-shaped; Windows uses known folders.
 #[cfg(unix)]
 #[test]

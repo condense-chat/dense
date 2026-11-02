@@ -9,18 +9,21 @@ pub mod codex;
 pub mod commands;
 pub mod opencode;
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::api::Api;
 use crate::api::auth::{self, Creds};
 use crate::api::dialect::Dialect;
 use crate::api::session::Session;
 use crate::config::Config;
-use crate::error::Error;
+use crate::error::{Context, Error};
 use crate::{Result, hosts, tool};
 
 pub const SESSION_ENV: &str = "CONDENSE_SESSION_ID";
+const SESSION_END_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An agent CLI routed through condense. A tool declares which dialects it
 /// wires — one (Claude/Codex) or several (OpenCode) — and configures the child
@@ -69,7 +72,54 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
         announce(cfg, tool.label());
     }
 
-    let headers = condense_headers(cfg, &creds, &session.id, tool.kind());
+    let mut cmd = routed_command(cfg, &tool, &creds, &session, &bin);
+    cmd.args(args);
+
+    spawn_and_wait(&api, &session, &bin, cmd).await
+}
+
+/// Run Desktop's real engine through condense. Unlike [`launch`] this never
+/// logs in or prints, and forwards stop signals, since Desktop owns the
+/// process and stdout carries its stream. Returns only if the spawn failed,
+/// so the caller can still run the engine directly.
+pub async fn launch_engine<T: Tool>(
+    cfg: &Config,
+    tool: T,
+    creds: &Creds,
+    bin: &Path,
+    args: &[OsString],
+) -> Result<()> {
+    let api = Api::authed(cfg, creds)?;
+    let session = Session::new();
+    let mut cmd = routed_command(cfg, &tool, creds, &session, bin);
+    cmd.args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let stops = stop_signals();
+    let mut child = cmd.spawn().ctx(format!("launching {}", bin.display()))?;
+    crate::desktop::engine::log(
+        cfg,
+        &format!("routed launch: session {} via {}", session.id, cfg.api_host),
+    );
+    let heartbeat = session.start_heartbeat(&api);
+    let signals = forward_signals(stops, child.id());
+    let status = child.wait().await;
+    signals.abort();
+    heartbeat.abort();
+    let _ = tokio::time::timeout(SESSION_END_TIMEOUT, session.end(&api)).await;
+    std::process::exit(status.map(|s| exit_code(&s)).unwrap_or(1))
+}
+
+fn routed_command<T: Tool>(
+    cfg: &Config,
+    tool: &T,
+    creds: &Creds,
+    session: &Session,
+    bin: &Path,
+) -> tokio::process::Command {
+    let headers = condense_headers(cfg, creds, &session.id, tool.kind());
     let targets: Vec<Target> = tool
         .dialects()
         .iter()
@@ -81,14 +131,12 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
         })
         .collect();
 
-    let mut cmd = tokio::process::Command::new(&bin);
+    let mut cmd = tokio::process::Command::new(bin);
     tool.apply(&mut cmd, &targets);
     cmd.env(SESSION_ENV, &session.id);
     // The child's `dense usage` must land on the same api as this session.
     cmd.env("CONDENSE_URL", &cfg.api_base_url);
-    cmd.args(args);
-
-    spawn_and_wait(&api, &session, &bin, cmd).await
+    cmd
 }
 
 /// Run an already-configured child to completion under a condense session.
@@ -177,4 +225,53 @@ fn swallow_interrupts() -> tokio::task::JoinHandle<()> {
             let _ = tokio::signal::ctrl_c().await;
         }
     })
+}
+
+/// Registered before the engine spawns: until a handler exists, a stop signal
+/// kills dense outright and orphans the engine.
+#[cfg(unix)]
+fn stop_signals() -> Option<[tokio::signal::unix::Signal; 3]> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    Some([
+        signal(SignalKind::terminate()).ok()?,
+        signal(SignalKind::interrupt()).ok()?,
+        signal(SignalKind::hangup()).ok()?,
+    ])
+}
+
+#[cfg(not(unix))]
+fn stop_signals() -> Option<()> {
+    None
+}
+
+/// Desktop stops the engine by signalling the process it spawned, which is us.
+#[cfg(unix)]
+fn forward_signals(
+    signals: Option<[tokio::signal::unix::Signal; 3]>,
+    child: Option<u32>,
+) -> tokio::task::JoinHandle<()> {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    tokio::spawn(async move {
+        let pid = child
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw);
+        let (Some(pid), Some([mut term, mut int, mut hup])) = (pid, signals) else {
+            return;
+        };
+        loop {
+            let sig = tokio::select! {
+                _ = term.recv() => Signal::TERM,
+                _ = int.recv() => Signal::INT,
+                _ = hup.recv() => Signal::HUP,
+            };
+            let _ = kill_process(pid, sig);
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn forward_signals(_signals: Option<()>, _child: Option<u32>) -> tokio::task::JoinHandle<()> {
+    swallow_interrupts()
 }

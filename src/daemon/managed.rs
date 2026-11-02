@@ -543,7 +543,7 @@ fn reported_mode(cfg: &Config, state: &State) -> switch::Mode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -615,7 +615,10 @@ mod tests {
 
     /// A one-route HTTP server: every request gets `status` + `body`; returns
     /// the base URL and the request lines it saw.
-    fn serve(status: u16, body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    pub(crate) fn serve(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         serve_seq(vec![(status, body)])
     }
 

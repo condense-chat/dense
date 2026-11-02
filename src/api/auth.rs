@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::error::{Context, Error};
 use crate::{Result, hosts, ui};
 
+const CODE_EXPIRED: &str = "the login code expired; run `dense login` again";
 const EXPIRES_FALLBACK_SECS: u64 = 600;
 const POLL_FALLBACK_SECS: u64 = 2;
 
@@ -232,7 +233,7 @@ async fn poll_device(cfg: &Config, api: &Api, start: &DeviceStart) -> Result<()>
         tokio::time::sleep(interval).await;
         remaining = remaining.saturating_sub(interval.as_secs());
         if remaining == 0 {
-            return Err(Error::Auth("authorization timed out".into()));
+            return Err(Error::Auth(CODE_EXPIRED.into()));
         }
         let resp = api
             .post_response(
@@ -243,6 +244,9 @@ async fn poll_device(cfg: &Config, api: &Api, start: &DeviceStart) -> Result<()>
         // 4xx (except 429) means the server will never accept this code —
         // fail now instead of polling out the clock. 5xx/network: retry.
         let poll: DevicePoll = match resp {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                return Err(Error::Auth(CODE_EXPIRED.into()));
+            }
             Ok(r) if r.status().is_client_error() && r.status().as_u16() != 429 => {
                 return Err(Error::Auth(format!(
                     "device/poll rejected ({})",
@@ -268,11 +272,7 @@ async fn poll_device(cfg: &Config, api: &Api, start: &DeviceStart) -> Result<()>
                 }
                 return Ok(());
             }
-            "expired" => {
-                return Err(Error::Auth(
-                    "device code expired before authorization".into(),
-                ));
-            }
+            "expired" => return Err(Error::Auth(CODE_EXPIRED.into())),
             _ => {}
         }
     }
@@ -325,6 +325,22 @@ fn write_secret(path: &std::path::Path, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_code_the_server_no_longer_knows_asks_for_a_new_login() {
+        let (url, _rx) = crate::daemon::managed::tests::serve(404, r#"{"detail":"unknown"}"#);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), &url);
+        let start = DeviceStart {
+            device_code: "code".into(),
+            expires_in: Some(60),
+            interval: Some(1),
+            user_code: "AAAA-BBBB".into(),
+        };
+        let api = Api::anonymous(&url).unwrap();
+        let err = poll_device(&cfg, &api, &start).await.unwrap_err();
+        assert_eq!(err.to_string(), CODE_EXPIRED);
+    }
 
     #[test]
     fn explicit_auth_required_wins() {

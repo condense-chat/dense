@@ -67,6 +67,7 @@ async fn body_in(cwd: &Path, session_id: &str, remotes: &mut RemoteCache) -> ser
         Some((sha, branch)) => (branch.to_string(), Some(sha.to_string())),
         None => (String::new(), None),
     };
+    let head_sha = head_sha.filter(|_| cfg!(feature = "session-repo"));
     let key = (cwd.to_path_buf(), branch.clone());
     if remotes.key.as_ref() != Some(&key) {
         let tracked = Some(branch.as_str()).filter(|b| !b.is_empty() && *b != "HEAD");
@@ -213,6 +214,18 @@ mod tests {
         assert_eq!(p("./a:b"), None);
     }
 
+    #[cfg(not(feature = "session-repo"))]
+    #[tokio::test]
+    async fn a_build_without_session_repo_sends_no_repo_fields() {
+        let dir = repo();
+        let p = dir.path();
+        sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
+        let body = body_in(p, "s", &mut RemoteCache::default()).await;
+        assert_eq!(body["branch"], "main");
+        assert!(body.get("git_remote").is_none() && body.get("head_sha").is_none());
+    }
+
+    #[cfg(feature = "session-repo")]
     #[tokio::test]
     async fn body_carries_repo_sha_and_version() {
         let dir = repo();
@@ -237,6 +250,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "session-repo")]
     #[tokio::test]
     async fn remote_is_looked_up_again_only_when_cwd_or_branch_changes() {
         let dir = repo();

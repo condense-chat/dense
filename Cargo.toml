@@ -12,6 +12,25 @@ readme = "README.md"
 name = "dense"
 path = "src/main.rs"
 
+[features]
+default = [
+    "desktop-switch",
+    "login-autostart",
+    "offline-usage",
+    "remote-control",
+    "session-repo",
+]
+# Claude Desktop's wrapped engines follow the org's off switch.
+desktop-switch = ["remote-control"]
+# `dense login` installs the daemon when the org manages the device.
+login-autostart = []
+# Managed devices report usage from Claude Code's session files.
+offline-usage = []
+# The daemon applies the org's on/off switch to routing.
+remote-control = []
+# Session heartbeats carry the git remote and HEAD.
+session-repo = []
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "process", "signal"] }

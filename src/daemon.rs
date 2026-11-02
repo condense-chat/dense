@@ -22,6 +22,9 @@ use crate::config::Config;
 use crate::error::{Context, Error};
 use crate::{Result, desktop, device};
 
+const LOCK_ATTEMPTS: u32 = 10;
+const LOCK_RETRY: Duration = Duration::from_millis(20);
+
 /// Background work. A tick does one pass and returns how long to wait before the
 /// next, so a job sets its own cadence and backoff.
 // ponytail: jobs take turns on one thread, so a slow tick delays the others;
@@ -175,7 +178,10 @@ pub fn running(cfg: &Config) -> bool {
     let Ok(file) = File::options().write(true).open(lock_file(cfg)) else {
         return false;
     };
-    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    matches!(
+        file.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    )
 }
 
 /// `dense status` lines for the daemon and device.
@@ -232,11 +238,17 @@ fn lock(cfg: &Config) -> Result<Option<File>> {
         .write(true)
         .open(&path)
         .ctx(format!("opening {}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e).ctx(format!("locking {}", path.display())),
+    // `running` has to lock to look, so a free lock can read as held for a moment.
+    for _ in 0..LOCK_ATTEMPTS {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(LOCK_RETRY),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).ctx(format!("locking {}", path.display()));
+            }
+        }
     }
+    Ok(None)
 }
 
 /// Only a daemon holding the lock has a pid worth signalling: a stale one could
@@ -286,6 +298,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             !running(&cfg)
         }));
+    }
+
+    #[test]
+    fn a_status_probe_does_not_turn_a_starting_daemon_away() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        let probe = lock(&cfg).unwrap().unwrap();
+        let done = std::thread::spawn(move || {
+            std::thread::sleep(LOCK_RETRY);
+            drop(probe);
+        });
+        assert!(lock(&cfg).unwrap().is_some());
+        done.join().unwrap();
     }
 
     #[test]

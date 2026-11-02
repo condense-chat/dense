@@ -1024,6 +1024,40 @@ fn a_daemon_on_a_new_build_replaces_older_wrappers() {
 }
 
 #[test]
+fn a_managed_on_appends_to_a_profile_it_cannot_decode() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.tool("claude", "exit 0");
+    rig.reply_to_heartbeats(MANAGED_ON);
+    let profile = rig.home.path().join(".zshrc");
+    fs::write(&profile, b"export NAME=Jos\xE9\n").expect("profile");
+
+    rig.once();
+
+    let wired = fs::read(&profile).expect("profile");
+    assert!(wired.starts_with(b"export NAME=Jos\xE9\n"));
+    assert!(String::from_utf8_lossy(&wired).contains("# >>> dense >>>"));
+}
+
+#[test]
+fn a_managed_on_respects_no_modify_path() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.tool("claude", "exit 0");
+    rig.tool("codex", "exit 0");
+    rig.reply_to_heartbeats(MANAGED_ON);
+    let profile = rig.home.path().join(".zshrc");
+    fs::write(&profile, "export FOO=1\n").expect("profile");
+    let persisted = run(rig.dense().args(["persist", "--no-modify-path", "claude"]));
+    assert!(persisted.status.success(), "{}", stderr(&persisted));
+
+    rig.once();
+
+    assert!(rig.data_dir().join("bin/codex").exists());
+    assert_eq!(fs::read(&profile).expect("profile"), b"export FOO=1\n");
+}
+
+#[test]
 fn setup_offers_desktop_before_it_is_installed_and_defaults_to_no() {
     let rig = Rig::new();
     rig.log_in();

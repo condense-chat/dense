@@ -33,6 +33,9 @@ const TOOLS: &[ToolSpec] = &[
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Record {
+    /// The user refused PATH wiring, which the daemon has to respect too.
+    #[serde(default)]
+    pub no_modify_path: bool,
     pub tools: BTreeMap<String, String>,
 }
 
@@ -87,6 +90,11 @@ pub fn install_shims(cfg: &Config, targets: &[String]) -> Result<ShimReport> {
     Ok(report)
 }
 
+/// Whether the user allows dense to wire PATH.
+pub fn may_modify_path(cfg: &Config) -> bool {
+    !load_record(cfg).no_modify_path
+}
+
 pub fn load_record(cfg: &Config) -> Record {
     std::fs::read_to_string(cfg.persist_file())
         .ok()
@@ -102,6 +110,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()> {
     let wiring = env_file::ensure_env(cfg, modify_path)?;
     let report = install_shims(cfg, targets)?;
+    remember_path_choice(cfg, modify_path)?;
     for (name, shim) in &report.persisted {
         println!("persisted {name} -> {}", shim.display());
     }
@@ -113,6 +122,12 @@ pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()
     }
     report_wiring(cfg, &wiring);
     Ok(())
+}
+
+pub fn remember_path_choice(cfg: &Config, modify_path: bool) -> Result<()> {
+    let mut rec = load_record(cfg);
+    rec.no_modify_path = !modify_path;
+    save_record(cfg, &rec)
 }
 
 /// Remove the targets' shims and drop them from the record. Prints nothing;

@@ -33,8 +33,12 @@ impl Session {
         let id = self.id.clone();
         tokio::spawn(async move {
             loop {
-                api.post_forget("/v1/sessions/heartbeat", &heartbeat_body(&id))
-                    .await;
+                let session_id = id.clone();
+                // Off this thread: `git` can be slow, and stop signals share it.
+                let body = tokio::task::spawn_blocking(move || heartbeat_body(&session_id));
+                if let Ok(body) = body.await {
+                    api.post_forget("/v1/sessions/heartbeat", &body).await;
+                }
                 tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)).await;
             }
         })

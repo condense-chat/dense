@@ -19,6 +19,7 @@ use crate::profile::Profile;
 pub const DEFAULT_API_URL: &str = "https://api.condense.chat";
 pub const DEFAULT_RELEASE_URL: &str = "https://github.com/condense-chat/dense";
 
+#[derive(Clone)]
 pub struct Config {
     /// Condense api base, e.g. `https://api.condense.chat`.
     pub api_base_url: String,
@@ -57,6 +58,28 @@ impl Config {
         }
     }
 
+    /// A config rooted at `root` for an ad-hoc `url`, independent of the
+    /// process env — tests must not touch the real home.
+    #[cfg(test)]
+    pub fn for_test(root: &Path, url: &str) -> Self {
+        let profile = profile_for_url(&root.join("config"), url);
+        Self {
+            api_base_url: profile.api_url.clone(),
+            api_host: crate::hosts::host_of(&profile.api_url),
+            auth_required: profile.auth_required,
+            codex_websocket: true,
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            home: root.to_path_buf(),
+            open_links: false,
+            profile_name: profile.name,
+            profile_url: None,
+            release_url: None,
+            session_id: None,
+            upstream: None,
+        }
+    }
+
     /// Directory the `dense` binary itself is installed to (and put on PATH).
     #[cfg(not(windows))]
     pub fn bin_dir(&self) -> PathBuf {
@@ -90,6 +113,11 @@ impl Config {
     /// `prod`, a per-profile subdir otherwise.
     pub fn cred_dir(&self) -> PathBuf {
         cred_dir_for(&self.config_dir, &self.profile_name)
+    }
+
+    /// The one daemon's lock, state and log, shared by every profile.
+    pub fn daemon_dir(&self) -> PathBuf {
+        self.data_dir.join("daemon")
     }
 
     pub fn data_dir(&self) -> PathBuf {

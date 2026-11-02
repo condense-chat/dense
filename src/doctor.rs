@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::api::auth;
 use crate::config::Config;
-use crate::{Result, persist, tool, ui};
+use crate::{Result, daemon, desktop, persist, tool, ui};
 
 pub async fn run(cfg: &Config) -> Result<()> {
     println!(
@@ -47,6 +47,18 @@ pub async fn run(cfg: &Config) -> Result<()> {
             "token valid (/v1/me)",
             &format!("status {status}"),
         );
+    }
+
+    if desktop::in_use(cfg) {
+        for version in desktop::unwrapped_versions(cfg) {
+            warn("Claude Desktop engine not routed", &version);
+        }
+        if !daemon::running(cfg) {
+            warn(
+                "dense daemon not running",
+                "new Claude Desktop engines won't route — run `dense claude-desktop install`",
+            );
+        }
     }
 
     for name in persist::load_record(cfg).tools.keys() {

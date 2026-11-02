@@ -1,5 +1,7 @@
 //! Command-line surface.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -34,6 +36,9 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
+    /// Route Claude Desktop's local engine through condense.
+    #[command(subcommand)]
+    ClaudeDesktop(DesktopCommand),
     /// Launch Codex routed through condense.
     #[command(disable_help_flag = true)]
     Codex {
@@ -44,6 +49,9 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
+    /// Background service: runs dense's jobs on this machine.
+    #[command(subcommand, hide = true)]
+    Daemon(DaemonCommand),
     /// Verify the install is wired correctly.
     Doctor,
     /// Account, lifetime savings, and — given a session — that session's context and spend.
@@ -117,6 +125,42 @@ pub enum Command {
         json: bool,
         #[arg(value_name = "SUB", default_value = "claude", value_parser = ["claude", "codex"])]
         sub: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Start the daemon at login (launchd / systemd user unit / Startup folder).
+    Install,
+    /// Run the daemon loop in the foreground.
+    Run {
+        /// Run every job once and exit.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Remove the autostart entry.
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+pub enum DesktopCommand {
+    /// Put dense in front of Desktop's engine, and keep new versions wrapped.
+    Install {
+        #[arg(long, hide = true, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Wrap what's installed now, without the background daemon.
+        #[arg(long)]
+        no_watch: bool,
+    },
+    /// Show which of Desktop's engine versions are routed.
+    Status {
+        #[arg(long, hide = true, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Restore Desktop's original engine and stop wrapping new ones.
+    Uninstall {
+        #[arg(long, hide = true, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
     },
 }
 

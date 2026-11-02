@@ -1029,6 +1029,7 @@ fn a_daemon_on_a_new_build_replaces_older_wrappers() {
     assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
 }
 
+#[cfg(feature = "remote-control")]
 #[test]
 fn a_managed_on_appends_to_a_profile_it_cannot_decode() {
     let rig = Rig::new();
@@ -1045,6 +1046,7 @@ fn a_managed_on_appends_to_a_profile_it_cannot_decode() {
     assert!(String::from_utf8_lossy(&wired).contains("# >>> dense >>>"));
 }
 
+#[cfg(feature = "remote-control")]
 #[test]
 fn a_managed_on_respects_no_modify_path() {
     let rig = Rig::new();

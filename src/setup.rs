@@ -20,7 +20,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     cfg.remember_profile()?;
     if daemon::managed::after_login(cfg).await && cfg!(feature = "managed-setup") {
-        let wiring = env_file::ensure_env(cfg, true)?;
+        let wiring = env_file::ensure_env(cfg, persist::may_modify_path(cfg))?;
         persist::report_wiring(cfg, &wiring);
         println!("this device is managed by your organization: there is nothing else to set up");
         return Ok(());
@@ -221,6 +221,7 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
     };
 
     let wiring = env_file::ensure_env(cfg, modify_path)?;
+    persist::remember_path_choice(cfg, modify_path)?;
     if let env_file::PathWiring::Manual(notes) = &wiring {
         warn(interactive, &notes.join("\n"));
     }

@@ -9,7 +9,7 @@ use crate::api::auth;
 use crate::api::devices::{self, Heartbeat, HeartbeatReply, Reply};
 use crate::config::Config;
 use crate::error::Error;
-use crate::{Result, desktop, device};
+use crate::{Result, desktop, device, persist};
 
 const DEVICE_LIMIT_MSG: &str =
     "device limit reached: remove old devices in the dashboard (this device stays unmanaged)";
@@ -282,7 +282,8 @@ pub async fn report_uninstall(cfg: &Config) {
 
 /// Apply `enabled`, logging (never propagating) a failure.
 fn apply(cfg: &Config, state: &mut State, enabled: bool) -> bool {
-    match switch::apply(cfg, enabled, &switch::installed(cfg), true) {
+    let wire_path = persist::may_modify_path(cfg);
+    match switch::apply(cfg, enabled, &switch::installed(cfg), wire_path) {
         Ok(outcome) => {
             if outcome.changed {
                 tracing::info!(enabled, mode = outcome.mode.as_str(), "switch applied");

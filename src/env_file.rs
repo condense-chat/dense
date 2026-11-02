@@ -153,16 +153,23 @@ pub fn unwire(cfg: &Config) -> Result<()> {
 
 #[cfg(not(windows))]
 fn add_block(path: &std::path::Path, block: &str) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if existing.contains(BEGIN) {
+    use std::io::Write;
+
+    let existing = read_profile(path)?;
+    if has_block(&existing) {
         return Ok(());
     }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(block);
-    std::fs::write(path, next)
+    let separator = if existing.is_empty() || existing.ends_with(b"\n") {
+        ""
+    } else {
+        "\n"
+    };
+    // Only ever appended to: a shell profile can hold any bytes, and it isn't ours.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?
+        .write_all(format!("{separator}{block}").as_bytes())
 }
 
 /// Returns the manual-action notes for anything that couldn't be wired —
@@ -209,6 +216,19 @@ fn fish_conf_path(cfg: &Config) -> Option<std::path::PathBuf> {
     let fish = cfg.home().join(".config").join("fish");
     fish.is_dir()
         .then(|| fish.join("conf.d").join("dense.fish"))
+}
+
+#[cfg(not(windows))]
+fn has_block(profile: &[u8]) -> bool {
+    profile.windows(BEGIN.len()).any(|w| w == BEGIN.as_bytes())
+}
+
+#[cfg(not(windows))]
+fn read_profile(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        read => read,
+    }
 }
 
 #[cfg(not(windows))]
@@ -260,27 +280,39 @@ fn set_user_path(dirs: &[std::path::PathBuf], add: bool) -> Result<()> {
 
 #[cfg(not(windows))]
 fn strip_block(path: &std::path::Path) -> Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if !existing.contains(BEGIN) {
+    let existing = read_profile(path).ctx(format!("reading {}", path.display()))?;
+    if !has_block(&existing) {
         return Ok(());
     }
-    let mut out = String::new();
+    let mut out = Vec::with_capacity(existing.len());
     let mut skipping = false;
-    for line in existing.lines() {
-        if line.trim() == BEGIN {
+    for line in existing.split_inclusive(|b| *b == b'\n') {
+        if line.trim_ascii() == BEGIN.as_bytes() {
             skipping = true;
-            continue;
-        }
-        if line.trim() == END {
+        } else if line.trim_ascii() == END.as_bytes() {
             skipping = false;
-            continue;
-        }
-        if !skipping {
-            out.push_str(line);
-            out.push('\n');
+        } else if !skipping {
+            out.extend_from_slice(line);
         }
     }
-    std::fs::write(path, out).ctx(format!("updating {}", path.display()))
+    swap_profile(path, &out).ctx(format!("updating {}", path.display()))
+}
+
+/// Replace a profile in one step, on the file a dotfile manager's symlink points at.
+#[cfg(not(windows))]
+fn swap_profile(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let real = std::fs::canonicalize(path)?;
+    let mut tmp = real.clone().into_os_string();
+    tmp.push(format!(".dense-{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    let swapped = std::fs::metadata(&real)
+        .and_then(|m| std::fs::set_permissions(&tmp, m.permissions()))
+        .and_then(|()| std::fs::rename(&tmp, &real));
+    if swapped.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    swapped
 }
 
 #[cfg(not(windows))]
@@ -332,6 +364,67 @@ mod tests {
 
         strip_block(&profile).expect("strip");
         assert_eq!(std::fs::read_to_string(&profile).expect("read"), original);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_profile_that_is_not_utf8_keeps_every_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join(".zshrc");
+        let original = b"export NAME=Jos\xE9\r\nalias ll='ls -l'";
+        std::fs::write(&profile, original).expect("seed profile");
+
+        let block = format!("{BEGIN}\nline\n{END}\n");
+        add_block(&profile, &block).expect("add");
+        let wired = std::fs::read(&profile).expect("read");
+        assert!(wired.starts_with(original));
+        assert!(has_block(&wired));
+
+        strip_block(&profile).expect("strip");
+        let mut expected = original.to_vec();
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&profile).expect("read"), expected);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_profile_that_cannot_be_read_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join(".zshrc");
+        std::fs::write(&profile, "export FOO=1\n").expect("seed profile");
+        let mode = |m| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&profile, mode(0o200)).expect("write-only");
+        if std::fs::read(&profile).is_ok() {
+            return; // root reads anything
+        }
+
+        assert!(add_block(&profile, "block\n").is_err());
+        std::fs::set_permissions(&profile, mode(0o600)).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(&profile).expect("read"),
+            "export FOO=1\n"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stripping_keeps_a_dotfile_symlink_and_its_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("dotfiles-zshrc");
+        std::fs::write(&real, format!("a\n{BEGIN}\nline\n{END}\nb\n")).expect("seed");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).expect("mode");
+        let link = dir.path().join(".zshrc");
+        symlink(&real, &link).expect("link");
+
+        strip_block(&link).expect("strip");
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).expect("read"), "a\nb\n");
+        let mode = std::fs::metadata(&real).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
     }
 
     #[cfg(not(windows))]

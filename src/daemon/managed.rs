@@ -15,6 +15,8 @@ const DEVICE_LIMIT_MSG: &str =
     "device limit reached: remove old devices in the dashboard (this device stays unmanaged)";
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
+/// The most a first launch waits on the once-only enrolment check.
+const ENROLL_WAIT: Duration = Duration::from_secs(3);
 const INTERVAL_MAX_S: u64 = 3_600;
 const INTERVAL_MIN_S: u64 = 5;
 /// How often a logged-out daemon looks for a login; Desktop's pass already wakes it this often.
@@ -149,6 +151,25 @@ pub fn note_forced(cfg: &Config) {
     }
 }
 
+/// A login from before device management never went through [`after_login`],
+/// so an already logged-in device checks once, at its first launch.
+pub async fn enroll_once(cfg: &Config) {
+    if State::load(cfg).last_ok_at.is_none() {
+        let _ = tokio::time::timeout(ENROLL_WAIT, after_login(cfg)).await;
+    }
+}
+
+/// Whether a server told this device it isn't managed. Unknown (`None`, as after
+/// a rejected heartbeat) is no answer, so nothing may be undone on it.
+pub fn no_longer_managed(cfg: &Config) -> bool {
+    State::load(cfg).managed == Some(false)
+}
+
+/// Session heartbeats name the repo on managed devices only.
+pub fn sends_repo(cfg: &Config) -> bool {
+    cfg!(feature = "session-repo") && State::load(cfg).is_managed()
+}
+
 /// Whether routed Claude Code runs need a span for the session-file reader.
 pub fn collects_usage(cfg: &Config) -> bool {
     State::load(cfg).collects_usage()
@@ -158,6 +179,9 @@ pub fn collects_usage(cfg: &Config) -> bool {
 /// daemon so the switch applies without anyone running `dense daemon install`.
 /// True when the device is managed, so there is nothing left to set up.
 pub async fn after_login(cfg: &Config) -> bool {
+    if !cfg!(feature = "login-autostart") {
+        return false;
+    }
     sessions::remember_root(cfg);
     if let Some(user) = auth::load_creds(cfg).user_id {
         match device::bind_user(cfg, &user) {
@@ -180,13 +204,15 @@ pub async fn after_login(cfg: &Config) -> bool {
         }
         Err(e) => {
             tracing::debug!("post-login heartbeat failed: {e}");
-            state.is_managed()
+            switch_for_login(cfg).is_some()
         }
     };
-    if !managed || !cfg!(feature = "login-autostart") || autostart::installed(cfg).is_some() {
+    if state.owned_by(cfg) {
+        save(cfg, &state);
+    }
+    if !managed || autostart::installed(cfg).is_some() {
         return managed;
     }
-    save(cfg, &state);
     match autostart::install(cfg) {
         Ok(_) => {
             println!("this device is managed by your organization; the dense daemon is installed")
@@ -244,7 +270,7 @@ pub fn status_lines(cfg: &Config, state: &State) -> Vec<(&'static str, String)> 
         ("mode", reported_mode(cfg, state).as_str().to_string()),
     ];
     if desktop::in_use(cfg) {
-        lines.push(("desktop", desktop::summary(cfg)));
+        lines.push(("desktop", desktop::summary(cfg, &state.rewraps, now())));
     }
     if state.collects_usage() {
         lines.push((
@@ -325,7 +351,7 @@ fn last_seen_ms(state: &State) -> u64 {
     state.last_attempt_at.map_or_else(now_ms, |s| s * 1_000)
 }
 
-fn now() -> u64 {
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -657,7 +683,9 @@ pub(crate) mod tests {
 
     /// Like [`serve`], answering with `replies` in order (the last repeats);
     /// each seen request is reported as `<request line>\n<body>`.
-    fn serve_seq(replies: Vec<(u16, &'static str)>) -> (String, std::sync::mpsc::Receiver<String>) {
+    pub(crate) fn serve_seq(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1046,6 +1074,42 @@ pub(crate) mod tests {
         assert!(!after_login(&cfg).await);
     }
 
+    #[tokio::test]
+    async fn a_failed_check_at_login_never_trusts_another_logins_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), "http://127.0.0.1:9");
+        State {
+            enabled: Some(true),
+            managed: Some(true),
+            user: Some("another-login".into()),
+            ..State::default()
+        }
+        .save(&cfg)
+        .unwrap();
+        assert!(!after_login(&cfg).await);
+    }
+
+    #[tokio::test]
+    async fn a_login_on_another_profile_leaves_the_daemons_state_alone() {
+        let (url, _rx) = serve(
+            200,
+            r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        State {
+            enabled: Some(false),
+            managed: Some(true),
+            profile: Some("the-daemons".into()),
+            ..State::default()
+        }
+        .save(&cfg)
+        .unwrap();
+        after_login(&cfg).await;
+        let state = State::load(&cfg);
+        assert_eq!((state.managed, state.enabled), (Some(true), Some(false)));
+    }
+
     #[cfg(feature = "managed-setup")]
     #[test]
     fn only_the_daemons_own_login_forces_desktop_on() {
@@ -1066,6 +1130,24 @@ pub(crate) mod tests {
         state.user = Some("another-login".into());
         state.save(&cfg).unwrap();
         assert!(!forced_on(&cfg));
+    }
+
+    #[test]
+    fn only_a_managed_device_sends_repo_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        assert!(!sends_repo(&cfg));
+        let saved = |managed| {
+            let state = State {
+                managed,
+                ..State::default()
+            };
+            state.save(&cfg).unwrap();
+        };
+        saved(Some(false));
+        assert!(!sends_repo(&cfg));
+        saved(Some(true));
+        assert_eq!(sends_repo(&cfg), cfg!(feature = "session-repo"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ desktop-switch = ["remote-control"]
 # `dense login` installs the daemon when the org manages the device.
 login-autostart = []
 # A managed device needs no setup: `on` routes Desktop and the installed tools.
-managed-setup = ["login-autostart", "remote-control"]
+managed-setup = ["desktop-switch", "login-autostart", "remote-control"]
 # Managed devices report usage from Claude Code's session files.
 offline-usage = []
 # The daemon applies the org's on/off switch to routing.

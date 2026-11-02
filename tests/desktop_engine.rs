@@ -47,6 +47,7 @@ const MANAGED_ON: &str = r#"{"managed":true,"enabled":true,"heartbeat_interval_s
 const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
 const REGULAR: &str = r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#;
+const REJECTED: &str = "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
 /// A local condense api that says yes to everything until it's killed.
 struct Api {
@@ -364,6 +365,9 @@ fn exec_lock() -> MutexGuard<'static, ()> {
 }
 
 fn json_reply(body: &str) -> String {
+    if body == REJECTED {
+        return body.to_string();
+    }
     format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
          connection: close\r\n\r\n{body}",
@@ -890,6 +894,8 @@ fn a_managed_on_routes_desktop_and_a_manual_uninstall_comes_back() {
     rig.once();
     assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
     assert!(!rig.routing_file().exists());
+    let status = run(rig.dense().args(["claude-desktop", "status"]));
+    assert!(!stream(&status).contains("watcher: disabled"));
 
     let out = run(rig.dense().args(["claude-desktop", "uninstall"]));
     assert!(out.status.success(), "{}", stderr(&out));
@@ -1055,6 +1061,106 @@ fn a_managed_on_respects_no_modify_path() {
 
     assert!(rig.data_dir().join("bin/codex").exists());
     assert_eq!(fs::read(&profile).expect("profile"), b"export FOO=1\n");
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn leaving_the_org_restores_what_the_org_wrapped() {
+    let rig = Rig::new();
+    rig.log_in();
+    let dir = rig.publish_desktop("2.1.309");
+    rig.reply_to_heartbeats(MANAGED_ON);
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+
+    rig.reply_to_heartbeats(REGULAR);
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude")).expect("engine"), ENGINE);
+    assert!(!dir.join("claude.real").exists());
+    assert!(!rig.data_dir().join("desktop-forced").exists());
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn a_rejected_heartbeat_is_no_reason_to_restore_anything() {
+    let rig = Rig::new();
+    rig.log_in();
+    let dir = rig.publish_desktop("2.1.309");
+    rig.reply_to_heartbeats(MANAGED_ON);
+    rig.once();
+
+    rig.reply_to_heartbeats(REJECTED);
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+    assert!(rig.data_dir().join("desktop-forced").exists());
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn leaving_the_org_keeps_routing_the_user_chose() {
+    let rig = Rig::new();
+    rig.fake_service_manager();
+    rig.log_in();
+    let dir = rig.publish_desktop("2.1.309");
+    rig.reply_to_heartbeats(MANAGED_ON);
+    rig.once();
+    let out = run(rig.dense().args(["claude-desktop", "install"]));
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    rig.reply_to_heartbeats(REGULAR);
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn a_laptop_back_after_leaving_the_org_wraps_nothing_new() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_ON);
+    rig.once();
+
+    let dir = rig.publish_desktop("2.1.309");
+    rig.reply_to_heartbeats(REGULAR);
+    rig.once();
+    assert!(!dir.join("claude.real").exists());
+}
+
+#[cfg(feature = "login-autostart")]
+#[test]
+fn a_login_from_before_device_management_enrols_at_the_first_launch() {
+    let rig = Rig::new();
+    rig.fake_service_manager();
+    rig.tool("claude", "exit 0");
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_ON);
+    let launch = || run(rig.dense().args(["claude", "-p", "hi"]));
+    assert!(launch().status.success());
+    assert!(rig.entry().exists());
+}
+
+#[cfg(feature = "login-autostart")]
+#[test]
+fn a_regular_user_enrols_nothing_and_checks_only_once() {
+    let rig = Rig::new();
+    rig.fake_service_manager();
+    rig.tool("claude", "exit 0");
+    rig.log_in();
+    rig.reply_to_heartbeats(REGULAR);
+    assert!(
+        run(rig.dense().args(["claude", "-p", "hi"]))
+            .status
+            .success()
+    );
+    assert!(!rig.entry().exists());
+    let state = rig.data_dir().join("daemon/state.toml");
+    let checked = fs::read(&state).expect("state");
+    assert!(
+        run(rig.dense().args(["claude", "-p", "hi"]))
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&state).expect("state"), checked);
 }
 
 #[test]

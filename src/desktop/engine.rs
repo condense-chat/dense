@@ -159,9 +159,7 @@ async fn route(cfg: &Config, real: &Path, args: &[OsString]) -> Result<()> {
         return Err(Error::msg("Desktop is set up for another provider"));
     }
     if cfg!(feature = "desktop-switch") && crate::daemon::managed::switched_off(cfg) {
-        return Err(Error::msg(
-            "dense is turned off for this device by your organization",
-        ));
+        return Err(Error::msg("dense is turned off by your organization"));
     }
     let creds = auth::load_creds(cfg);
     if !creds.is_authenticated() {

@@ -55,6 +55,9 @@ pub struct State {
     /// The profile the daemon runs for. The switch, windows and queue are that
     /// profile's login, whichever profile the process reading them resolved to.
     pub profile: Option<String>,
+    /// Engine folders whose wrapper keeps disappearing.
+    #[serde(default, skip_serializing_if = "desktop::Rewraps::is_empty")]
+    pub rewraps: desktop::Rewraps,
     /// When no condense routing was applied: the only spans whose
     /// session-file usage the daemon reports (the proxy reports the rest).
     #[serde(default)]
@@ -65,17 +68,19 @@ pub struct State {
 
 impl Job {
     fn all(cfg: &Config, state: &mut State) -> Vec<Self> {
-        let mut jobs = vec![Self::DesktopEngines(desktop::Watcher::default())];
+        // Device first: a pass acts on the switch, so it needs a fresh one.
+        let mut jobs = Vec::new();
         match managed::Device::start(cfg, state) {
             Ok(job) => jobs.push(Self::Device(job)),
             Err(e) => tracing::warn!("device management off: no device id ({e})"),
         }
+        jobs.push(Self::DesktopEngines(desktop::Watcher::default()));
         jobs
     }
 
     async fn tick(&mut self, cfg: &Config, state: &mut State) -> Duration {
         match self {
-            Self::DesktopEngines(watcher) => desktop::watch(cfg, watcher).await,
+            Self::DesktopEngines(watcher) => desktop::watch(cfg, watcher, &mut state.rewraps).await,
             Self::Device(job) => job.tick(cfg, state).await,
         }
     }
@@ -142,6 +147,13 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     save(cfg, &state);
 
     loop {
+        // Before any tick: on a replaced binary `current_exe` no longer names a file.
+        // A failure exit, because the Windows launcher only restarts on one.
+        if !once && modified(&exe) != started_from {
+            return Err(Error::msg(
+                "dense was updated; restarting on the new binary",
+            ));
+        }
         for (job, due) in &mut jobs {
             if *due <= Instant::now() {
                 let mut wait = job.tick(cfg, &mut state).await;
@@ -155,11 +167,8 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
         if once {
             return Ok(());
         }
-        // A failure exit, because the Windows launcher only restarts on one.
         if modified(&exe) != started_from {
-            return Err(Error::msg(
-                "dense was updated; restarting on the new binary",
-            ));
+            continue;
         }
         let Some(next) = jobs.iter().map(|(_, due)| *due).min() else {
             return Ok(());

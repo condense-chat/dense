@@ -229,8 +229,21 @@ fn shim_body(dense: &str, name: &str) -> String {
     format!("@\"{dense}\" {name} %*\r\n")
 }
 
+/// A replaced binary reports a path like `dense (deleted)`, and a shim to that
+/// would break the tool until someone ran `dense persist` again.
+fn target_exists(dense: &std::path::Path) -> Result<()> {
+    if dense.exists() {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "not writing a shim: {} is gone",
+        dense.display()
+    )))
+}
+
 fn write_shim(cfg: &Config, name: &str) -> Result<()> {
     let dense = std::env::current_exe().ctx("locating the dense binary")?;
+    target_exists(&dense)?;
     std::fs::create_dir_all(cfg.shim_dir()).ctx("creating dense shim dir")?;
     let path = shim_path(cfg, name);
 
@@ -252,6 +265,15 @@ fn write_shim(cfg: &Config, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shim_never_points_at_a_binary_that_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("dense");
+        std::fs::write(&live, "").unwrap();
+        assert!(target_exists(&live).is_ok());
+        assert!(target_exists(&dir.path().join("dense (deleted)")).is_err());
+    }
 
     #[cfg(not(windows))]
     #[test]

@@ -67,13 +67,14 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     let bin = tool::resolve_real(cfg, tool.binary())?;
     if crate::daemon::managed::switched_off(cfg) {
         eprintln!(
-            "dense is turned off for this device by your organization; running {} directly",
+            "dense is turned off by your organization; running {} directly",
             tool.label()
         );
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         return run_direct(&bin, &args);
     }
     let creds = auth::ensure_auth(cfg).await?;
+    crate::daemon::managed::enroll_once(cfg).await;
     let api = Api::authed(cfg, &creds)?;
     let session = Session::new();
 
@@ -85,7 +86,8 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     let routed = routed_span(cfg, tool.kind(), Pin::of(args), &mut cmd);
     cmd.args(args);
 
-    spawn_and_wait(&api, &session, &bin, cmd, routed).await
+    let repo = crate::daemon::managed::sends_repo(cfg);
+    spawn_and_wait(&api, &session, repo, &bin, cmd, routed).await
 }
 
 /// Replace this process with `real` (Unix) or run it and exit with its status.
@@ -137,7 +139,8 @@ pub async fn launch_engine<T: Tool>(
         cfg,
         &format!("routed launch: session {} via {}", session.id, cfg.api_host),
     );
-    let heartbeat = session.start_heartbeat(&api);
+    let repo = crate::daemon::managed::sends_repo(cfg);
+    let heartbeat = session.start_heartbeat(&api, repo);
     let signals = forward_signals(stops, child.id());
     let status = child.wait().await;
     signals.abort();
@@ -204,6 +207,7 @@ fn routed_span(
 async fn spawn_and_wait(
     api: &Api,
     session: &Session,
+    repo: bool,
     bin: &Path,
     mut cmd: tokio::process::Command,
     routed: Option<Guard>,
@@ -212,7 +216,7 @@ async fn spawn_and_wait(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let heartbeat = session.start_heartbeat(api);
+    let heartbeat = session.start_heartbeat(api, repo);
     let interrupts = swallow_interrupts();
     let status = cmd.status().await;
     interrupts.abort();

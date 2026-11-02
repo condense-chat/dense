@@ -65,7 +65,7 @@ pub async fn ensure_auth(cfg: &Config) -> Result<Creds> {
         match probe_token(cfg, token).await {
             401 | 403 => {
                 tracing::warn!("stored token rejected; re-running login");
-                login(cfg).await?;
+                login_and_enroll(cfg).await?;
             }
             _ => {}
         }
@@ -74,7 +74,7 @@ pub async fn ensure_auth(cfg: &Config) -> Result<Creds> {
     if creds.user_id.is_some() {
         return Ok(creds);
     }
-    login(cfg).await?;
+    login_and_enroll(cfg).await?;
     Ok(load_creds(cfg))
 }
 
@@ -225,6 +225,12 @@ fn mode_for(auth_required: bool) -> AuthMode {
     }
 }
 
+async fn login_and_enroll(cfg: &Config) -> Result<()> {
+    login(cfg).await?;
+    let _ = crate::daemon::managed::after_login(cfg).await;
+    Ok(())
+}
+
 /// Poll `/v1/device/poll` until the code is consumed, expired, or rejected.
 async fn poll_device(cfg: &Config, api: &Api, start: &DeviceStart) -> Result<()> {
     let interval = Duration::from_secs(start.interval.unwrap_or(POLL_FALLBACK_SECS).max(1));
@@ -325,6 +331,29 @@ fn write_secret(path: &std::path::Path, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "login-autostart")]
+    #[tokio::test]
+    async fn a_login_after_a_rejected_token_goes_through_enrolment() {
+        let (url, rx) = crate::daemon::managed::tests::serve_seq(vec![
+            (401, ""),
+            (200, "new-user"),
+            (
+                200,
+                r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#,
+            ),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_test(root.path(), &url);
+        cfg.auth_required = Some(false);
+        write_secret(&cfg.token_file(), "rejected").unwrap();
+        ensure_auth(&cfg).await.unwrap();
+        let next = || rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(next().starts_with("GET /v1/me"));
+        assert!(next().starts_with("POST /v1/register"));
+        assert!(next().starts_with("POST /v1/devices/heartbeat"));
+        assert_eq!(load_creds(&cfg).user_id.as_deref(), Some("new-user"));
+    }
 
     #[tokio::test]
     async fn a_code_the_server_no_longer_knows_asks_for_a_new_login() {

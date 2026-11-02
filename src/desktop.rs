@@ -30,6 +30,9 @@ const BIN: &str = if cfg!(windows) {
 };
 const BUNDLE: &str = "claude.app";
 const DISPLACED_PREFIX: &str = "claude.dense-old-";
+const FORCED_FILE: &str = "desktop-forced";
+/// How long a folder is left alone once its wrapper keeps disappearing.
+const HOLD_SECS: u64 = 3_600;
 const LOCK_FILE: &str = "desktop.lock";
 const POLL: Duration = Duration::from_secs(15);
 const REAL: &str = if cfg!(windows) {
@@ -38,11 +41,14 @@ const REAL: &str = if cfg!(windows) {
     "claude.real"
 };
 const REAL_BUNDLE: &str = "claude.real.app";
+/// Wraps in a row, with no pass finding the last one still there, before a hold.
+const REWRAP_LIMIT: u32 = 3;
 /// How long an engine left unrouted waits, unchanged, before another full check.
 const RETRY: Duration = Duration::from_secs(300);
 const ROUTING_FILE: &str = "desktop.toml";
 const TMP: &str = "claude.dense-tmp";
 
+pub type Rewraps = BTreeMap<String, Rewrap>;
 /// Size and mtime of an engine's files: a stat, where a full check costs a hash
 /// and a signature.
 type Seen = Vec<Option<(u64, SystemTime)>>;
@@ -52,6 +58,14 @@ enum Outcome {
     Current,
     Skipped(String),
     Wrapped,
+}
+
+/// A folder dense wrapped again before any pass found its last wrapper in place,
+/// as when security software removes it or Desktop downloads the engine again.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Rewrap {
+    count: u32,
+    held_until: u64,
 }
 
 /// One published engine: `<root>/<version>/[<build>/]` holding `.verified`.
@@ -257,10 +271,16 @@ pub fn routes_every_engine(cfg: &Config) -> bool {
     !all.is_empty() && all.iter().all(Install::is_wrapped)
 }
 
-pub fn summary(cfg: &Config) -> String {
+pub fn summary(cfg: &Config, rewraps: &Rewraps, now: u64) -> String {
     let all = installs(&roots_or_default(recorded_or(cfg, None)));
     let routed = all.iter().filter(|i| i.is_wrapped()).count();
+    let held = rewraps.values().filter(|r| r.held_until > now).count();
     match all.len() {
+        _ if held > 0 => format!(
+            "{routed} of {} engines routed; {held} left alone for now: its wrapper keeps \
+             disappearing, possibly removed by security software",
+            all.len()
+        ),
         0 => "no engine yet; the next one Desktop downloads is routed".to_string(),
         n if n == routed => format!("{n} of {n} engines routed"),
         n => format!("{routed} of {n} engines routed; the daemon keeps trying"),
@@ -318,7 +338,8 @@ pub fn status(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
         };
         println!("  {}: {state}", found.label());
     }
-    let watcher = match (Routing::load(cfg).is_some(), daemon::running(cfg)) {
+    let wanted = Routing::load(cfg).is_some() || daemon::managed::forced_on(cfg);
+    let watcher = match (wanted, daemon::running(cfg)) {
         (false, _) => "disabled",
         (true, false) => "registered, not running",
         (true, true) => "running",
@@ -337,6 +358,7 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
     let _lock = lock(cfg)?;
     // Inside the lock, so a pass waiting on it finds routing off and wraps nothing.
     let routing = Routing::take(cfg).unwrap_or_default();
+    let _ = std::fs::remove_file(forced_file(cfg));
     let mut result = Ok(());
     for found in installs(&roots_or_default(data_dir.or(routing.data_dir))) {
         match found.unwrap_engine() {
@@ -359,20 +381,24 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
 /// and updates, and uninstalls, wrapping each engine it publishes. The first
 /// pass after a start also replaces wrappers from an older dense, since the
 /// daemon restarts whenever its binary changes.
-pub async fn watch(cfg: &Config, watcher: &mut Watcher) -> Duration {
+pub async fn watch(cfg: &Config, watcher: &mut Watcher, rewraps: &mut Rewraps) -> Duration {
     let Ok(exe) = std::env::current_exe() else {
         return POLL;
     };
     let cfg = cfg.clone();
     let mut state = std::mem::take(watcher);
+    let mut held = std::mem::take(rewraps);
     // Off the daemon's thread: the lock can wait on an `install`, and hashing
     // and `codesign` take seconds.
     let pass = tokio::task::spawn_blocking(move || {
-        wrap_new(&cfg, &exe, &mut state);
-        state
+        wrap_new(&cfg, &exe, &mut state, &mut held);
+        (state, held)
     });
     match pass.await {
-        Ok(state) => *watcher = state,
+        Ok((state, held)) => {
+            *watcher = state;
+            *rewraps = held;
+        }
         Err(e) => tracing::warn!("Desktop engine pass failed: {e}"),
     }
     POLL
@@ -449,6 +475,10 @@ fn packaged_roots(local: &Path) -> Vec<PathBuf> {
                 .join("claude-code")
         });
     current.chain(legacy).collect()
+}
+
+fn forced_file(cfg: &Config) -> PathBuf {
+    cfg.data_dir().join(FORCED_FILE)
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
@@ -568,6 +598,10 @@ pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Rep
     let _lock = lock(cfg)?;
     let data_dir = recorded_or(cfg, data_dir);
     let exe = std::env::current_exe().ctx("locating the dense binary")?;
+    if watch {
+        // The user's own choice now, so leaving an org won't undo it.
+        let _ = std::fs::remove_file(forced_file(cfg));
+    }
     let found = installs(&roots_or_default(data_dir.clone()));
     let mut report = Report::default();
     let mut failed = None;
@@ -720,13 +754,22 @@ fn sweep_displaced(bin: &Path) {
     }
 }
 
-fn wrap_new(cfg: &Config, exe: &Path, watcher: &mut Watcher) {
+fn wrap_new(cfg: &Config, exe: &Path, watcher: &mut Watcher, rewraps: &mut Rewraps) {
     let Ok(_lock) = lock(cfg).inspect_err(|e| tracing::warn!("no Desktop engine pass: {e}")) else {
         return;
     };
-    let forced = || daemon::managed::forced_on(cfg).then(Routing::default);
-    let Some(routing) = Routing::load(cfg).or_else(forced) else {
-        return;
+    let routing = match Routing::load(cfg) {
+        Some(routing) => routing,
+        None if daemon::managed::forced_on(cfg) => {
+            // Written first: what can't be undone later must not be wrapped now.
+            if let Err(e) = std::fs::write(forced_file(cfg), "") {
+                tracing::warn!("not routing Desktop: {e}");
+                return;
+            }
+            Routing::default()
+        }
+        None if daemon::managed::no_longer_managed(cfg) => return restore_forced(cfg),
+        None => return,
     };
     let refresh = !watcher.refreshed;
     let found = installs(&roots_or_default(routing.data_dir));
@@ -734,13 +777,32 @@ fn wrap_new(cfg: &Config, exe: &Path, watcher: &mut Watcher) {
     watcher
         .unrouted
         .retain(|dir, _| found.iter().any(|f| &f.dir == dir));
+    rewraps.retain(|dir, _| found.iter().any(|f| f.dir.display().to_string() == *dir));
+    let now = daemon::managed::now();
     for found in &found {
-        if !watcher.due(&found.dir, &found.seen(), Instant::now()) {
+        let key = found.dir.display().to_string();
+        if rewraps.get(&key).is_some_and(|r| r.held_until > now)
+            || !watcher.due(&found.dir, &found.seen(), Instant::now())
+        {
             continue;
         }
         let why = match found.wrap(exe, refresh, bundle::CODESIGNED) {
-            Ok(Outcome::Current | Outcome::Wrapped) => {
+            Ok(Outcome::Current) => {
                 watcher.unrouted.remove(&found.dir);
+                rewraps.remove(&key);
+                continue;
+            }
+            Ok(Outcome::Wrapped) => {
+                watcher.unrouted.remove(&found.dir);
+                let rewrap = rewraps.entry(key).or_default();
+                rewrap.count += 1;
+                if rewrap.count >= REWRAP_LIMIT {
+                    rewrap.held_until = now + HOLD_SECS;
+                    tracing::warn!(
+                        "{}: its wrapper keeps disappearing; leaving it alone for an hour",
+                        found.label()
+                    );
+                }
                 continue;
             }
             Ok(Outcome::Skipped(why)) => why,
@@ -752,6 +814,25 @@ fn wrap_new(cfg: &Config, exe: &Path, watcher: &mut Watcher) {
             .insert(found.dir.clone(), (found.seen(), Instant::now()));
     }
     watcher.refreshed = true;
+}
+
+/// The org's forcing ended, so the engines go back. Routing the user chose
+/// themselves never gets here: that has a [`Routing`] file.
+fn restore_forced(cfg: &Config) {
+    if !forced_file(cfg).exists() {
+        return;
+    }
+    let mut clean = true;
+    for found in installs(&default_roots()) {
+        if let Err(e) = found.unwrap_engine() {
+            tracing::warn!("could not restore {}: {e}", found.label());
+            clean = false;
+        }
+    }
+    if clean {
+        tracing::info!("this device is no longer managed: Desktop's engines are restored");
+        let _ = std::fs::remove_file(forced_file(cfg));
+    }
 }
 
 #[cfg(test)]
@@ -996,7 +1077,10 @@ mod tests {
         let root = tmp.path().join("engines");
         let found = published(&root, ENGINE);
         // The job wraps with this test binary, so the payload check is the real one.
-        assert_eq!(watch(&cfg, &mut Watcher::default()).await, POLL);
+        assert_eq!(
+            watch(&cfg, &mut Watcher::default(), &mut Rewraps::new()).await,
+            POLL
+        );
         assert!(!found.is_wrapped());
 
         Routing {
@@ -1005,7 +1089,7 @@ mod tests {
         }
         .save(&cfg)
         .unwrap();
-        watch(&cfg, &mut Watcher::default()).await;
+        watch(&cfg, &mut Watcher::default(), &mut Rewraps::new()).await;
         assert!(found.is_wrapped());
         assert_eq!(std::fs::read(&found.real).unwrap(), ENGINE);
     }
@@ -1031,7 +1115,8 @@ mod tests {
             drop(held);
         };
         let mut watcher = Watcher::default();
-        tokio::join!(watch(&cfg, &mut watcher), release);
+        let mut rewraps = Rewraps::new();
+        tokio::join!(watch(&cfg, &mut watcher, &mut rewraps), release);
         assert!(!found.is_wrapped());
     }
 
@@ -1100,7 +1185,7 @@ mod tests {
         let exe = exe(tmp.path());
         let mut watcher = Watcher::default();
 
-        wrap_new(&cfg, &exe, &mut watcher);
+        wrap_new(&cfg, &exe, &mut watcher, &mut Rewraps::new());
         assert!(!found.is_wrapped());
         assert!(!watcher.due(&found.dir, &found.seen(), Instant::now()));
 
@@ -1111,7 +1196,7 @@ mod tests {
         )
         .unwrap();
         assert!(watcher.due(&found.dir, &found.seen(), Instant::now()));
-        wrap_new(&cfg, &exe, &mut watcher);
+        wrap_new(&cfg, &exe, &mut watcher, &mut Rewraps::new());
         assert!(found.is_wrapped());
         assert!(watcher.unrouted.is_empty());
     }
@@ -1137,11 +1222,11 @@ mod tests {
         let found = published(&root, b"something else");
         routed_at(&cfg, &root);
         let mut watcher = Watcher::default();
-        wrap_new(&cfg, &exe(tmp.path()), &mut watcher);
+        wrap_new(&cfg, &exe(tmp.path()), &mut watcher, &mut Rewraps::new());
         assert_eq!(watcher.unrouted.len(), 1);
 
         std::fs::remove_dir_all(&found.dir).unwrap();
-        wrap_new(&cfg, &exe(tmp.path()), &mut watcher);
+        wrap_new(&cfg, &exe(tmp.path()), &mut watcher, &mut Rewraps::new());
         assert!(watcher.unrouted.is_empty());
     }
 
@@ -1157,13 +1242,56 @@ mod tests {
         std::fs::write(&exe, b"newer dense").unwrap();
 
         let mut watcher = Watcher::default();
-        wrap_new(&cfg, &exe, &mut watcher);
+        wrap_new(&cfg, &exe, &mut watcher, &mut Rewraps::new());
         assert_eq!(std::fs::read(&found.bin).unwrap(), b"newer dense");
 
         std::fs::write(&exe, b"newest dense").unwrap();
-        wrap_new(&cfg, &exe, &mut watcher);
+        wrap_new(&cfg, &exe, &mut watcher, &mut Rewraps::new());
         assert_eq!(std::fs::read(&found.bin).unwrap(), b"newer dense");
         assert_eq!(std::fs::read(&found.real).unwrap(), ENGINE);
+    }
+
+    #[test]
+    fn a_wrapper_that_keeps_disappearing_is_left_alone_for_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let root = tmp.path().join("engines");
+        let found = published(&root, ENGINE);
+        routed_at(&cfg, &root);
+        let exe = exe(tmp.path());
+        let mut watcher = Watcher::default();
+        let mut rewraps = Rewraps::new();
+        for _ in 0..REWRAP_LIMIT {
+            wrap_new(&cfg, &exe, &mut watcher, &mut rewraps);
+            std::fs::remove_file(&found.bin).unwrap();
+        }
+        wrap_new(&cfg, &exe, &mut watcher, &mut rewraps);
+        assert!(!found.bin.exists());
+        let until = rewraps.values().next().unwrap().held_until;
+        let now = daemon::managed::now();
+        assert!(until > now + HOLD_SECS - 60);
+        assert!(summary(&cfg, &rewraps, now).contains("left alone for now"));
+        assert!(!summary(&cfg, &rewraps, until).contains("left alone for now"));
+
+        rewraps.values_mut().next().unwrap().held_until = 0;
+        wrap_new(&cfg, &exe, &mut watcher, &mut rewraps);
+        assert!(found.bin.exists());
+    }
+
+    #[test]
+    fn an_engine_that_stays_wrapped_leaves_no_count_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let root = tmp.path().join("engines");
+        published(&root, ENGINE);
+        routed_at(&cfg, &root);
+        let exe = exe(tmp.path());
+        let mut watcher = Watcher::default();
+        let mut rewraps = Rewraps::new();
+        wrap_new(&cfg, &exe, &mut watcher, &mut rewraps);
+        assert_eq!(rewraps.len(), 1);
+        wrap_new(&cfg, &exe, &mut watcher, &mut rewraps);
+        assert!(rewraps.is_empty());
     }
 
     #[test]
@@ -1178,20 +1306,20 @@ mod tests {
         .save(&cfg)
         .unwrap();
         assert!(!routes_every_engine(&cfg));
-        assert!(summary(&cfg).starts_with("no engine yet"));
+        assert!(summary(&cfg, &Rewraps::new(), 0).starts_with("no engine yet"));
 
         published(&root, ENGINE)
             .wrap(&exe(tmp.path()), false, default_bundles())
             .unwrap();
         assert!(routes_every_engine(&cfg));
-        assert_eq!(summary(&cfg), "1 of 1 engines routed");
+        assert_eq!(summary(&cfg, &Rewraps::new(), 0), "1 of 1 engines routed");
 
         let newer = root.join("2.1.310");
         std::fs::create_dir_all(&newer).unwrap();
         std::fs::write(newer.join(BIN), ENGINE).unwrap();
         std::fs::write(newer.join(".verified"), "manifest-checksum").unwrap();
         assert!(!routes_every_engine(&cfg));
-        assert!(summary(&cfg).starts_with("1 of 2"));
+        assert!(summary(&cfg, &Rewraps::new(), 0).starts_with("1 of 2"));
     }
 
     #[test]

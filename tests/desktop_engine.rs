@@ -436,12 +436,12 @@ fn routed_engine_carries_the_device_and_records_its_span() {
 fn org_off_switch_runs_direct_until_it_is_back_on() {
     let rig = Rig::new();
     rig.log_in();
-    let state = rig.data().join("daemon/local/state.toml");
+    let state = rig.data().join("daemon/state.toml");
     fs::create_dir_all(state.parent().expect("parent")).expect("mkdir");
 
     let user = {
         use sha2::{Digest, Sha256};
-        hex::encode(&Sha256::digest(b"test-user")[..8])
+        hex::encode(&Sha256::digest(b"local\ntest-user")[..8])
     };
     fs::write(
         &state,
@@ -492,9 +492,9 @@ fn dense_claude_runs_the_tool_directly_while_switched_off() {
     .expect("copy");
     let user = {
         use sha2::{Digest, Sha256};
-        hex::encode(&Sha256::digest(b"test-user")[..8])
+        hex::encode(&Sha256::digest(b"local\ntest-user")[..8])
     };
-    let state = rig.data().join("daemon/local/state.toml");
+    let state = rig.data().join("daemon/state.toml");
     fs::create_dir_all(state.parent().expect("parent")).expect("mkdir");
     fs::write(
         &state,

@@ -49,6 +49,9 @@ pub struct State {
     pub member_enabled: Option<bool>,
     pub mode: Option<switch::Mode>,
     pub pid: Option<u32>,
+    /// The profile the daemon runs for. The switch, windows and queue are that
+    /// profile's login, whichever profile the process reading them resolved to.
+    pub profile: Option<String>,
     /// When no condense routing was applied: the only spans whose
     /// session-file usage the daemon reports (the proxy reports the rest).
     #[serde(default)]
@@ -124,6 +127,7 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     let exe = std::env::current_exe().ctx("locating the dense binary")?;
     let started_from = modified(&exe);
     let mut state = State::load(cfg);
+    state.profile = Some(cfg.profile().to_string());
     if !once {
         state.pid = Some(std::process::id());
     }
@@ -187,7 +191,10 @@ pub fn status_lines(cfg: &Config) -> Vec<(&'static str, String)> {
         (false, _) => "not running".into(),
     };
     let mut lines = vec![("daemon", format!("{running}; {autostart}"))];
-    lines.extend(managed::status_lines(cfg, &state));
+    match state.profile.as_deref().filter(|_| !state.owned_by(cfg)) {
+        Some(owner) => lines.push(("device", format!("managed by the daemon for `{owner}`"))),
+        None => lines.extend(managed::status_lines(cfg, &state)),
+    }
     lines
 }
 

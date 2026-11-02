@@ -64,19 +64,18 @@ pub(crate) fn with_v1(base: &str) -> String {
 /// Run `tool` through condense, resolving one [`Target`] per declared dialect.
 /// Exits with the child's status; only a launch failure returns.
 pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<()> {
+    let bin = tool::resolve_real(cfg, tool.binary())?;
     if crate::daemon::managed::switched_off(cfg) {
         eprintln!(
             "dense is turned off for this device by your organization; running {} directly",
             tool.label()
         );
-        let bin = tool::resolve_real(cfg, tool.binary())?;
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         return run_direct(&bin, &args);
     }
     let creds = auth::ensure_auth(cfg).await?;
     let api = Api::authed(cfg, &creds)?;
     let session = Session::new();
-    let bin = tool::resolve_real(cfg, tool.binary())?;
 
     if args.is_empty() {
         announce(cfg, tool.label());

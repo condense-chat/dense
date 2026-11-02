@@ -29,6 +29,25 @@ fn version_smoke() {
 }
 
 #[test]
+fn a_tool_that_is_gone_says_so_before_any_login() {
+    let home = tempfile::tempdir().expect("home");
+    let out = dense()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("PATH", home.path())
+        .env_remove("CONDENSE_URL")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .args(["--url", "http://127.0.0.1:9", "claude", "-p", "hi"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("`claude` was not found on PATH"), "{err}");
+}
+
+#[test]
 fn errors_are_for_people_not_for_rust_developers() {
     let out = dense()
         .env_remove("RUST_BACKTRACE")

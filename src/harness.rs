@@ -99,6 +99,17 @@ pub async fn launch_engine<T: Tool>(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    let lossy: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    // Desktop's argv is its own; a session it did not name is bound by cwd.
+    let pin = match Pin::of(&lossy) {
+        Pin::Inject(_) => Pin::Unknown,
+        pin => pin,
+    };
+    let routed = routed_span(cfg, tool.kind(), pin, &mut cmd);
+
     let stops = stop_signals();
     let mut child = cmd.spawn().ctx(format!("launching {}", bin.display()))?;
     crate::desktop::engine::log(
@@ -110,6 +121,9 @@ pub async fn launch_engine<T: Tool>(
     let status = child.wait().await;
     signals.abort();
     heartbeat.abort();
+    if let Some(g) = routed {
+        g.close().await;
+    }
     let _ = tokio::time::timeout(SESSION_END_TIMEOUT, session.end(&api)).await;
     std::process::exit(status.map(|s| exit_code(&s)).unwrap_or(1))
 }

@@ -9,7 +9,7 @@ use crate::api::auth;
 use crate::api::devices::{self, Heartbeat, HeartbeatReply, Reply};
 use crate::config::Config;
 use crate::error::Error;
-use crate::{Result, device};
+use crate::{Result, desktop, device};
 
 const DEVICE_LIMIT_MSG: &str =
     "device limit reached: remove old devices in the dashboard (this device stays unmanaged)";
@@ -112,6 +112,12 @@ impl Device {
     }
 }
 
+/// Whether the org turned dense off on this device. Routing entry points
+/// (shims are removed by the daemon; wrapped Desktop engines ask here) honour it.
+pub fn switched_off(cfg: &Config) -> bool {
+    State::load(cfg).enforced() == Some(false)
+}
+
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
 pub async fn after_login(cfg: &Config) {
@@ -194,7 +200,7 @@ pub fn status_lines(cfg: &Config, state: &State) -> Vec<(&'static str, String)> 
     vec![
         ("device", format!("{device}; {beat}")),
         ("switch", switch),
-        ("mode", switch::observe(cfg).as_str().to_string()),
+        ("mode", reported_mode(cfg, state).as_str().to_string()),
         (
             "queue",
             format!("{} usage records pending", queue::Queue::open(cfg).len()),
@@ -345,7 +351,7 @@ async fn heartbeat(
     let mut retried = false;
     let rejection = loop {
         let api = Api::authed(cfg, &creds)?;
-        match send_heartbeat(cfg, &api, device_id).await? {
+        match send_heartbeat(cfg, &api, device_id, state).await? {
             Reply::Ok(reply) => {
                 state.record(&reply);
                 return Ok(Some((reply, api)));
@@ -379,13 +385,18 @@ async fn heartbeat(
     Ok(None)
 }
 
-async fn send_heartbeat(cfg: &Config, api: &Api, device_id: &str) -> Result<Reply<HeartbeatReply>> {
+async fn send_heartbeat(
+    cfg: &Config,
+    api: &Api,
+    device_id: &str,
+    state: &State,
+) -> Result<Reply<HeartbeatReply>> {
     let hostname = device::hostname();
     let body = Heartbeat {
         app_version: env!("CARGO_PKG_VERSION"),
         device_id,
         hostname: &hostname,
-        mode: Some(switch::observe(cfg)),
+        mode: Some(reported_mode(cfg, state)),
         platform: device::platform(),
     };
     devices::heartbeat(api, &body).await
@@ -461,6 +472,17 @@ fn error_chain(e: &crate::error::Error) -> String {
     out
 }
 
+/// The mode the server is told: shims on disk, or wrapped Desktop engines that
+/// the switch has not turned off. Offline windows follow the shims alone; a
+/// routed Desktop session is excluded by its routed span instead.
+fn reported_mode(cfg: &Config, state: &State) -> switch::Mode {
+    let desktop_routed = || state.enforced() != Some(false) && desktop::has_wrapped_engines(cfg);
+    match switch::observe(cfg) {
+        switch::Mode::Transparent if desktop_routed() => switch::Mode::Condensing,
+        mode => mode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +504,27 @@ mod tests {
         assert_eq!(clamp_interval(0).as_secs(), INTERVAL_MIN_S);
         assert_eq!(clamp_interval(60).as_secs(), 60);
         assert_eq!(clamp_interval(1_000_000).as_secs(), INTERVAL_MAX_S);
+    }
+
+    #[test]
+    fn only_a_managed_off_switch_turns_desktop_routing_off() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        assert!(!switched_off(&cfg));
+        for (managed, enabled, off) in [
+            (Some(true), Some(false), true),
+            (Some(true), Some(true), false),
+            (Some(false), Some(false), false),
+            (None, Some(false), false),
+        ] {
+            let state = State {
+                managed,
+                enabled,
+                ..State::default()
+            };
+            state.save(&cfg).unwrap();
+            assert_eq!(switched_off(&cfg), off, "{managed:?} {enabled:?}");
+        }
     }
 
     #[test]

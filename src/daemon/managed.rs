@@ -94,6 +94,7 @@ impl Device {
         let device_id = device::id(cfg)?;
         sessions::remember_root(cfg);
         tracing::info!(device = %device_id, "device management job started");
+        track_user(cfg, state);
         if switch::observe(cfg) == switch::Mode::Condensing {
             state.transparent_windows.close(last_seen_ms(state));
         }
@@ -291,6 +292,24 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Follow the logged-in user. On any change nothing of the previous user's
+/// carries over: not their windows, queued usage, or org switch.
+fn track_user(cfg: &Config, state: &mut State) -> Option<String> {
+    let user = user_ref(&auth::load_creds(cfg));
+    if state.user != user {
+        if state.user.is_some() {
+            state.transparent_windows = sessions::Windows::default();
+            drop_usage(cfg);
+            state.forget_switch();
+        }
+        if user.is_none() {
+            state.forget_switch();
+        }
+        state.user.clone_from(&user);
+    }
+    user
+}
+
 /// Queue session-file usage for the transparent windows. Runs before the
 /// heartbeat so it works offline; the queue carries it to the next upload.
 /// The window follows the shims actually on disk: unmanaged devices without
@@ -298,19 +317,7 @@ fn now_ms() -> u64 {
 /// their routed spans instead).
 fn report_offline_usage(cfg: &Config, state: &mut State) {
     let now = now_ms();
-    let user = user_ref(&auth::load_creds(cfg));
-    if state.user != user {
-        // Nothing from before the change may be reported or uploaded as the new user.
-        if state.user.is_some() {
-            state.transparent_windows = sessions::Windows::default();
-            drop_usage(cfg);
-        }
-        if user.is_none() {
-            state.forget_switch();
-        }
-        state.user.clone_from(&user);
-    }
-    if user.is_none() {
+    if track_user(cfg, state).is_none() {
         state.transparent_windows = sessions::Windows::default();
         return;
     }
@@ -853,7 +860,7 @@ mod tests {
         assert!(state.user.is_some() && state.user != a);
         assert!(!state.transparent_windows.contains(1_500));
         assert_eq!(q.len(), 0);
-        assert_eq!(state.enforced(), Some(false));
+        assert_eq!(state.enforced(), None);
 
         std::fs::remove_file(cfg.user_file()).unwrap();
         q.push(&[usage_record("m2")]).unwrap();
@@ -861,6 +868,31 @@ mod tests {
         assert_eq!((state.user.as_deref(), state.enforced()), (None, None));
         assert!(!state.transparent_windows.contains(now_ms()));
         assert_eq!(q.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn previous_users_off_switch_is_not_applied_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), "http://127.0.0.1:9");
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        };
+        track_user(&cfg, &mut state);
+        state.save(&cfg).unwrap();
+        assert!(switched_off(&cfg));
+
+        std::fs::write(cfg.user_file(), "someone-else\n").unwrap();
+        let shim = shim(&cfg);
+        let mut state = State::load(&cfg);
+        let mut job = Device::start(&cfg, &mut state).unwrap();
+        state.save(&cfg).unwrap();
+        assert!(shim.exists());
+        assert!(!switched_off(&cfg));
+        job.tick(&cfg, &mut state).await;
+        assert_eq!(state.enforced(), None);
+        assert!(shim.exists());
     }
 
     fn usage_record(id: &str) -> queue::UsageRecord {

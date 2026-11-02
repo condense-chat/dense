@@ -5,6 +5,11 @@
 //! lock and state are machine-wide.
 
 pub mod autostart;
+pub mod managed;
+pub mod queue;
+pub mod routed;
+pub mod sessions;
+pub mod switch;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -15,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{Result, desktop};
+use crate::{Result, desktop, device};
 
 /// Background work. A tick does one pass and returns how long to wait before the
 /// next, so a job sets its own cadence and backoff.
@@ -23,21 +28,49 @@ use crate::{Result, desktop};
 // give each job its own task if one must run during another's network call.
 enum Job {
     DesktopEngines(desktop::Watcher),
+    /// Heartbeat, the org's on/off switch, and offline usage upload.
+    Device(managed::Device),
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct State {
+    pub device_enabled: Option<bool>,
+    /// The last switch the server returned — what an offline restart applies.
+    pub enabled: Option<bool>,
+    pub interval_s: Option<u64>,
+    pub last_attempt_at: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_ok_at: Option<u64>,
+    /// The server refused this device for the user's device cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub limited: bool,
+    /// Whether the switch is ours to apply; unknown is treated as not.
+    pub managed: Option<bool>,
+    pub member_enabled: Option<bool>,
+    pub mode: Option<switch::Mode>,
     pub pid: Option<u32>,
+    /// When no condense routing was applied: the only spans whose
+    /// session-file usage the daemon reports (the proxy reports the rest).
+    #[serde(default)]
+    pub transparent_windows: sessions::Windows,
+    /// Hash of the credentials the windows and queue belong to.
+    pub user: Option<String>,
 }
 
 impl Job {
-    fn all() -> Vec<Self> {
-        vec![Self::DesktopEngines(desktop::Watcher::default())]
+    fn all(cfg: &Config, state: &mut State) -> Vec<Self> {
+        let mut jobs = vec![Self::DesktopEngines(desktop::Watcher::default())];
+        match managed::Device::start(cfg, state) {
+            Ok(job) => jobs.push(Self::Device(job)),
+            Err(e) => tracing::warn!("device management off: no device id ({e})"),
+        }
+        jobs
     }
 
-    async fn tick(&mut self, cfg: &Config) -> Duration {
+    async fn tick(&mut self, cfg: &Config, state: &mut State) -> Duration {
         match self {
             Self::DesktopEngines(watcher) => desktop::watch(cfg, watcher).await,
+            Self::Device(job) => job.tick(cfg, state).await,
         }
     }
 }
@@ -64,16 +97,20 @@ impl State {
 }
 
 pub fn install(cfg: &Config) -> Result<()> {
+    sessions::remember_root(cfg);
+    let device_id = device::id(cfg)?;
     let report = autostart::install(cfg)?;
     println!("daemon autostart installed -> {}", report.path.display());
+    println!("device {device_id}");
     for note in &report.notes {
         eprintln!("warning: {note}");
     }
     Ok(())
 }
 
-/// The daemon loop. `once` runs every job a single time and exits, leaving a
-/// running daemon's pid alone.
+/// The daemon loop. `once` runs every job a single time (a job that changed
+/// something and asks to report it soon gets one more pass) and exits, leaving
+/// a running daemon's pid alone.
 pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     let Some(_lock) = lock(cfg)? else {
         let msg = "another dense daemon is already running";
@@ -90,19 +127,22 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     if !once {
         state.pid = Some(std::process::id());
     }
-    if let Err(e) = state.save(cfg) {
-        tracing::warn!("could not save daemon state: {e}");
-    }
     tracing::info!(profile = cfg.profile(), "dense daemon started");
-
-    let mut jobs: Vec<(Job, Instant)> = Job::all()
+    let mut jobs: Vec<(Job, Instant)> = Job::all(cfg, &mut state)
         .into_iter()
         .map(|job| (job, Instant::now()))
         .collect();
+    save(cfg, &state);
+
     loop {
         for (job, due) in &mut jobs {
             if *due <= Instant::now() {
-                *due = Instant::now() + job.tick(cfg).await;
+                let mut wait = job.tick(cfg, &mut state).await;
+                if once && wait == managed::REPORT_DELAY {
+                    wait = job.tick(cfg, &mut state).await;
+                }
+                save(cfg, &state);
+                *due = Instant::now() + managed::jitter(wait);
             }
         }
         if once {
@@ -134,21 +174,32 @@ pub fn running(cfg: &Config) -> bool {
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
-/// `dense status` lines for the daemon.
+/// `dense status` lines for the daemon and device.
 pub fn status_lines(cfg: &Config) -> Vec<(&'static str, String)> {
+    let state = State::load(cfg);
     let autostart = match autostart::installed(cfg) {
         Some(p) => format!("autostart installed ({})", p.display()),
         None => "autostart not installed".into(),
     };
-    let running = match (running(cfg), State::load(cfg).pid) {
+    let running = match (running(cfg), state.pid) {
         (true, Some(pid)) => format!("running (pid {pid})"),
         (true, None) => "running".into(),
         (false, _) => "not running".into(),
     };
-    vec![("daemon", format!("{running}; {autostart}"))]
+    let mut lines = vec![("daemon", format!("{running}; {autostart}"))];
+    lines.extend(managed::status_lines(cfg, &state));
+    lines
 }
 
-pub fn uninstall(cfg: &Config) -> Result<()> {
+/// Remove the one autostart entry and tell condense this device is gone.
+/// Routing (shims, wrapped Desktop engines) stays as it is.
+pub async fn uninstall(cfg: &Config) -> Result<()> {
+    remove_autostart(cfg)?;
+    managed::report_uninstall(cfg).await;
+    Ok(())
+}
+
+pub fn remove_autostart(cfg: &Config) -> Result<()> {
     match autostart::uninstall(cfg, live_pid(cfg))? {
         Some(report) => {
             println!("daemon autostart removed ({})", report.path.display());
@@ -197,6 +248,12 @@ fn modified(exe: &Path) -> Option<SystemTime> {
     std::fs::metadata(exe).and_then(|m| m.modified()).ok()
 }
 
+fn save(cfg: &Config, state: &State) {
+    if let Err(e) = state.save(cfg) {
+        tracing::warn!("could not save daemon state: {e}");
+    }
+}
+
 fn state_file(cfg: &Config) -> PathBuf {
     cfg.daemon_dir().join("state.toml")
 }
@@ -224,7 +281,12 @@ mod tests {
     fn state_round_trips_the_pid() {
         let root = tempfile::tempdir().unwrap();
         let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
-        State { pid: Some(7) }.save(&cfg).unwrap();
+        State {
+            pid: Some(7),
+            ..State::default()
+        }
+        .save(&cfg)
+        .unwrap();
         assert_eq!(State::load(&cfg).pid, Some(7));
     }
 
@@ -233,7 +295,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let installed_from = Config::for_test(root.path(), "http://127.0.0.1:9");
         let other = Config::for_test(root.path(), "http://127.0.0.1:8");
-        State { pid: Some(7) }.save(&installed_from).unwrap();
+        State {
+            pid: Some(7),
+            ..State::default()
+        }
+        .save(&installed_from)
+        .unwrap();
         assert_eq!(live_pid(&other), None);
 
         let _held = lock(&installed_from).unwrap();

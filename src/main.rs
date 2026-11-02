@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod daemon;
 mod desktop;
+mod device;
 mod doctor;
 mod env_file;
 mod error;
@@ -64,14 +65,20 @@ async fn main() -> EyreResult<()> {
             status(&cfg);
             Ok(())
         }
-        Command::Codex { args } => harness::codex::run(&cfg, &args).await,
         Command::Daemon(DaemonCommand::Install) => {
             daemon::install(&cfg).and_then(|()| desktop::keep_daemon(&cfg))
         }
         Command::Daemon(DaemonCommand::Run { once }) => daemon::run(&cfg, once).await,
-        Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg),
-        Command::Login => auth::login(&cfg).await,
-        Command::Logout => auth::logout(&cfg),
+        Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg).await,
+        Command::Codex { args } => harness::codex::run(&cfg, &args).await,
+        Command::Login => match auth::login(&cfg).await {
+            Ok(()) => {
+                daemon::managed::after_login(&cfg).await;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        Command::Logout => auth::logout(&cfg).inspect(|()| daemon::managed::forget_switch(&cfg)),
         Command::Claude { args } => harness::claude::run(&cfg, &args).await,
         Command::Opencode { args } => harness::opencode::run(&cfg, &args).await,
         Command::Persist {
@@ -104,7 +111,7 @@ async fn main() -> EyreResult<()> {
             }
         }
         Command::SelfCmd(SelfCommand::Update) => selfupdate::update(&cfg).await,
-        Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg),
+        Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg).await,
         Command::Info {
             bar,
             json,

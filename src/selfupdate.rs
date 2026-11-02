@@ -23,15 +23,16 @@ struct Manifest {
     version: String,
 }
 
-pub fn uninstall(cfg: &Config) -> Result<()> {
+pub async fn uninstall(cfg: &Config) -> Result<()> {
     if let Err(e) = desktop::uninstall(cfg, None) {
         eprintln!("warning: could not restore Claude Desktop's engines ({e})");
     }
     if daemon::autostart::installed(cfg).is_some()
-        && let Err(e) = daemon::uninstall(cfg)
+        && let Err(e) = daemon::remove_autostart(cfg)
     {
         eprintln!("warning: could not remove the daemon autostart ({e})");
     }
+    daemon::managed::report_uninstall(cfg).await;
     for name in persist::load_record(cfg).tools.keys() {
         let _ = std::fs::remove_file(persist::shim_path(cfg, name));
     }

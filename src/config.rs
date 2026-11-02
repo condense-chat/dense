@@ -115,13 +115,18 @@ impl Config {
         cred_dir_for(&self.config_dir, &self.profile_name)
     }
 
-    /// The one daemon's lock, state and log, shared by every profile.
+    /// The one daemon's lock, state, usage queue and log, shared by every profile.
     pub fn daemon_dir(&self) -> PathBuf {
         self.data_dir.join("daemon")
     }
 
     pub fn data_dir(&self) -> PathBuf {
         self.data_dir.clone()
+    }
+
+    /// The device identity — a UUID generated once per credential dir.
+    pub fn device_file(&self) -> PathBuf {
+        self.cred_dir().join("device")
     }
 
     pub fn env_file(&self) -> PathBuf {

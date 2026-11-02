@@ -19,6 +19,7 @@ use crate::api::auth::{self, Creds};
 use crate::api::dialect::Dialect;
 use crate::api::session::Session;
 use crate::config::Config;
+use crate::daemon::routed::{Guard, Pin};
 use crate::error::{Context, Error};
 use crate::{Result, hosts, tool};
 
@@ -73,9 +74,10 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     }
 
     let mut cmd = routed_command(cfg, &tool, &creds, &session, &bin);
+    let routed = routed_span(cfg, tool.kind(), Pin::of(args), &mut cmd);
     cmd.args(args);
 
-    spawn_and_wait(&api, &session, &bin, cmd).await
+    spawn_and_wait(&api, &session, &bin, cmd, routed).await
 }
 
 /// Run Desktop's real engine through condense. Unlike [`launch`] this never
@@ -119,7 +121,8 @@ fn routed_command<T: Tool>(
     session: &Session,
     bin: &Path,
 ) -> tokio::process::Command {
-    let headers = condense_headers(cfg, creds, &session.id, tool.kind());
+    let device_id = crate::device::id(cfg).ok();
+    let headers = condense_headers(cfg, creds, device_id.as_deref(), &session.id, tool.kind());
     let targets: Vec<Target> = tool
         .dialects()
         .iter()
@@ -139,12 +142,36 @@ fn routed_command<T: Tool>(
     cmd
 }
 
+/// The proxy reports a routed Claude Code child's usage; record its span so the
+/// daemon's disk reader skips it.
+fn routed_span(
+    cfg: &Config,
+    kind: &str,
+    pin: Pin,
+    cmd: &mut tokio::process::Command,
+) -> Option<Guard> {
+    if kind != "claude_code" {
+        return None;
+    }
+    crate::daemon::sessions::remember_root(cfg);
+    let session_id = match pin {
+        Pin::Inject(id) => {
+            cmd.args(["--session-id", &id]);
+            Some(id)
+        }
+        Pin::Known(id) => Some(id),
+        Pin::Unknown => None,
+    };
+    Guard::open(cfg, session_id)
+}
+
 /// Run an already-configured child to completion under a condense session.
 async fn spawn_and_wait(
     api: &Api,
     session: &Session,
     bin: &Path,
     mut cmd: tokio::process::Command,
+    routed: Option<Guard>,
 ) -> Result<()> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -155,6 +182,9 @@ async fn spawn_and_wait(
     let status = cmd.status().await;
     interrupts.abort();
     heartbeat.abort();
+    if let Some(g) = routed {
+        g.close().await;
+    }
     session.end(api).await;
 
     match status {
@@ -179,11 +209,12 @@ fn announce(cfg: &Config, label: &str) {
     eprintln!();
 }
 
-/// The `x-condense-*` headers on every request — auth/user/session, the
-/// harness kind, plus the optional upstream override.
+/// The `x-condense-*` headers on every request — auth/user/device/session,
+/// the harness kind, plus the optional upstream override.
 fn condense_headers(
     cfg: &Config,
     creds: &Creds,
+    device_id: Option<&str>,
     session_id: &str,
     kind: &str,
 ) -> Vec<(String, String)> {
@@ -193,6 +224,9 @@ fn condense_headers(
     }
     if let Some(user) = &creds.user_id {
         h.push(("x-condense-user-id".to_string(), user.clone()));
+    }
+    if let Some(device) = device_id {
+        h.push((crate::device::HEADER.to_string(), device.to_string()));
     }
     h.push(("x-condense-session-id".to_string(), session_id.to_string()));
     if let Some(upstream) = cfg.upstream() {

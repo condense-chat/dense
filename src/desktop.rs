@@ -328,7 +328,7 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
         }
     }
     if routing.added_daemon {
-        result = result.and(daemon::uninstall(cfg));
+        result = result.and(daemon::remove_autostart(cfg));
     }
     result
 }
@@ -1024,7 +1024,12 @@ mod tests {
         }
         .save(&cfg)
         .unwrap();
-        daemon::State { pid: Some(7) }.save(&cfg).unwrap();
+        daemon::State {
+            pid: Some(7),
+            ..daemon::State::default()
+        }
+        .save(&cfg)
+        .unwrap();
 
         daemon::run(&cfg, true).await.unwrap();
         assert!(found.is_wrapped());

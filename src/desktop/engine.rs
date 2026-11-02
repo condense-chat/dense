@@ -263,8 +263,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         assert!(reachable(&url).await);
 
-        drop(listener);
-        assert!(!reachable(&url).await);
+        assert!(!reachable("http://127.0.0.1:1").await);
         assert!(!reachable("not a url").await);
     }
 

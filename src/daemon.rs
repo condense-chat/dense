@@ -281,7 +281,11 @@ mod tests {
         assert!(running(&cfg));
 
         drop(held);
-        assert!(!running(&cfg));
+        // A parallel test's fork shares the lock until its child execs.
+        assert!((0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            !running(&cfg)
+        }));
     }
 
     #[test]

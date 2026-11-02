@@ -191,6 +191,12 @@ impl Config {
         self.write_target(&self.profile_name)
     }
 
+    /// The url a command line asks for: `--url`, else `$CONDENSE_URL` unless
+    /// `--env` named a target.
+    pub fn cli_url(flag: Option<String>, env: Option<&str>) -> Option<String> {
+        flag.or_else(|| env_value("CONDENSE_URL").filter(|_| env.is_none()))
+    }
+
     /// Resolve the active profile in precedence order: explicit `--url` (an
     /// ad-hoc profile named after its host), then `--env <name>` (a registered
     /// profile), then the persisted `target` pointer, then the baked `prod`
@@ -414,12 +420,20 @@ fn resolve_profile(
         return Ok(profile_for_url(config_dir, &url));
     }
     if let Some(env) = env_override {
-        return load_named(config_dir, &env).ok_or_else(|| {
-            Error::Profile(format!(
-                "unknown profile `{env}` — register it with `dense profile {env} --url <zone>`, \
-                 or install dense from that environment"
-            ))
-        });
+        if let Some(p) = load_named(config_dir, &env) {
+            return Ok(p);
+        }
+        if env.contains('.') && !env.contains('/') {
+            let scheme = crate::hosts::default_scheme_for(&env);
+            return Ok(profile_for_url(
+                config_dir,
+                &format!("{scheme}://api.{env}"),
+            ));
+        }
+        return Err(Error::Profile(format!(
+            "unknown profile `{env}` — register it with `dense profile {env} --url <zone>`, \
+             or install dense from that environment"
+        )));
     }
     if let Some(target) = read_target(config_dir) {
         if let Some(p) = load_named(config_dir, &target) {
@@ -460,6 +474,15 @@ mod tests {
         let p = profile_for_url(dir.path(), "https://api.condense.chat/");
         assert_eq!(p.name, "prod");
         assert_eq!(p.auth_required, Some(true));
+    }
+
+    #[test]
+    fn bare_zone_targets_its_api_host_and_a_plain_name_must_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zone = "dev-foo.condense.localhost".to_string();
+        let p = resolve_profile(dir.path(), None, Some(zone)).expect("zone");
+        assert_eq!(p.api_url, "http://api.dev-foo.condense.localhost");
+        assert!(resolve_profile(dir.path(), None, Some("nosuch".into())).is_err());
     }
 
     #[test]

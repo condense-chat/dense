@@ -15,8 +15,9 @@ pub struct Cli {
     #[arg(short = 'e', long = "env", global = true, value_name = "ENV")]
     pub environment: Option<String>,
 
-    /// Condense api base URL (overrides --env, $CONDENSE_URL, and the default).
-    #[arg(long, global = true, env = "CONDENSE_URL")]
+    /// Condense api base URL (overrides --env and the default). $CONDENSE_URL
+    /// sets it too, unless --env is given.
+    #[arg(long, global = true)]
     pub url: Option<String>,
 
     /// Increase log verbosity (-v debug, -vv trace).

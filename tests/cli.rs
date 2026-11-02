@@ -29,6 +29,17 @@ fn version_smoke() {
 }
 
 #[test]
+fn env_flag_beats_condense_url() {
+    let out = dense()
+        .env("CONDENSE_URL", "http://127.0.0.1:9")
+        .args(["-e", "nosuch", "status"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown profile `nosuch`"));
+}
+
+#[test]
 fn help_smoke() {
     let out = dense().arg("--help").output().expect("run");
     assert!(out.status.success());

@@ -1,7 +1,7 @@
 //! A live condense session: a heartbeat posted while a tool runs, and an end
 //! signal when it exits, so usage and presence track the real process.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -13,6 +13,13 @@ use crate::api::Api;
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 const HEARTBEAT_SECS: u64 = 30;
+
+/// The remote for the last (cwd, branch) seen; looked up again only when either changes.
+#[derive(Default)]
+struct RemoteCache {
+    key: Option<(PathBuf, String)>,
+    remote: Option<String>,
+}
 
 pub struct Session {
     pub id: String,
@@ -37,9 +44,11 @@ impl Session {
         let api = api.clone();
         let id = self.id.clone();
         tokio::spawn(async move {
+            let mut remotes = RemoteCache::default();
             loop {
-                api.post_forget("/v1/sessions/heartbeat", &heartbeat_body(&id).await)
-                    .await;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let body = body_in(&cwd, &id, &mut remotes).await;
+                api.post_forget("/v1/sessions/heartbeat", &body).await;
                 tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)).await;
             }
         })
@@ -52,20 +61,31 @@ impl Default for Session {
     }
 }
 
-async fn body_in(cwd: &Path, session_id: &str) -> serde_json::Value {
-    let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-    let head_sha = git(cwd, &["rev-parse", "HEAD"]).await;
-    let remote = git_remote(cwd, branch.as_deref().filter(|b| *b != "HEAD")).await;
+async fn body_in(cwd: &Path, session_id: &str, remotes: &mut RemoteCache) -> serde_json::Value {
+    let head = git(cwd, &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"]).await;
+    let (branch, head_sha) = match head.as_deref().and_then(|h| h.split_once('\n')) {
+        Some((sha, branch)) => (branch.to_string(), Some(sha.to_string())),
+        None => (String::new(), None),
+    };
+    let key = (cwd.to_path_buf(), branch.clone());
+    if remotes.key.as_ref() != Some(&key) {
+        let tracked = Some(branch.as_str()).filter(|b| !b.is_empty() && *b != "HEAD");
+        remotes.remote = match head_sha {
+            Some(_) => git_remote(cwd, tracked).await,
+            None => None,
+        };
+        remotes.key = Some(key);
+    }
     let mut body = json!({
         "session_id": session_id,
         "cwd": cwd.display().to_string(),
-        "branch": branch.unwrap_or_default(),
+        "branch": branch,
         "pid": std::process::id(),
         "host": gethostname::gethostname().to_string_lossy().into_owned(),
         "dense_version": env!("CARGO_PKG_VERSION"),
     });
-    if let Some(remote) = remote {
-        body["git_remote"] = remote.into();
+    if let Some(remote) = &remotes.remote {
+        body["git_remote"] = remote.as_str().into();
     }
     if let Some(sha) = head_sha {
         body["head_sha"] = sha.into();
@@ -80,6 +100,9 @@ async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(test)]
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
         .ok()?
@@ -90,40 +113,40 @@ async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 
 /// The branch's upstream remote, else `origin`, else the first remote.
 async fn git_remote(cwd: &Path, branch: Option<&str>) -> Option<String> {
-    let upstream = match branch {
-        Some(b) => git(cwd, &["config", "--get", &format!("branch.{b}.remote")]).await,
-        None => None,
-    };
-    let first = || async {
-        git(cwd, &["remote"])
-            .await
-            .and_then(|r| r.lines().next().map(str::to_string))
-    };
-    for name in [upstream, Some("origin".into()), first().await]
-        .into_iter()
-        .flatten()
-    {
-        if let Some(url) = git(cwd, &["remote", "get-url", &name]).await {
-            return Some(strip_userinfo(&url));
+    if let Some(b) = branch {
+        let key = format!("branch.{b}.remote");
+        if let Some(name) = git(cwd, &["config", "--get", &key]).await
+            && let Some(url) = remote_url(cwd, &name).await
+        {
+            return Some(url);
         }
     }
-    None
-}
-
-async fn heartbeat_body(session_id: &str) -> serde_json::Value {
-    body_in(&std::env::current_dir().unwrap_or_default(), session_id).await
-}
-
-/// Drop `user:token@` from an http(s) remote; scp-style `git@host:` stays.
-fn strip_userinfo(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let host_end = rest.find('/').unwrap_or(rest.len());
-    match rest[..host_end].rfind('@') {
-        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
-        None => url.to_string(),
+    if let Some(url) = remote_url(cwd, "origin").await {
+        return Some(url);
     }
+    let names = git(cwd, &["remote"]).await?;
+    remote_url(cwd, names.lines().next()?).await
+}
+
+async fn remote_url(cwd: &Path, name: &str) -> Option<String> {
+    public_remote(&git(cwd, &["remote", "get-url", name]).await?)
+}
+
+/// A network remote with credentials, query and fragment removed. Local paths
+/// and `file://` remotes are dropped: they name directories, not repos.
+fn public_remote(url: &str) -> Option<String> {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        let host = rest[..host_end].rsplit('@').next().unwrap_or_default();
+        return (!host.is_empty()).then(|| format!("{scheme}://{host}{}", &rest[host_end..]));
+    }
+    let (host, _) = url.split_once(':')?;
+    let scp = !host.is_empty() && !host.contains(['/', '\\']) && host.len() > 1;
+    scp.then(|| url.to_string())
 }
 
 #[cfg(test)]
@@ -165,16 +188,29 @@ mod tests {
     }
 
     #[test]
-    fn userinfo_is_stripped_from_http_remotes_only() {
+    fn only_network_remotes_go_out_and_without_secrets() {
+        let p = |u| public_remote(u);
         assert_eq!(
-            strip_userinfo("https://u:tok@git.example/o/r.git"),
-            "https://git.example/o/r.git"
+            p("https://u:tok@git.example/o/r.git").as_deref(),
+            Some("https://git.example/o/r.git")
         );
         assert_eq!(
-            strip_userinfo("git@github.com:o/r.git"),
-            "git@github.com:o/r.git"
+            p("https://git.example/o/r.git?private_token=x#frag").as_deref(),
+            Some("https://git.example/o/r.git")
         );
-        assert_eq!(strip_userinfo("ssh://git@host/o/r@x"), "ssh://host/o/r@x");
+        assert_eq!(
+            p("git@github.com:o/r.git").as_deref(),
+            Some("git@github.com:o/r.git")
+        );
+        assert_eq!(
+            p("ssh://git@host/o/r@x").as_deref(),
+            Some("ssh://host/o/r@x")
+        );
+        assert_eq!(p("/home/u/clients/acme/repo.git"), None);
+        assert_eq!(p("../sibling"), None);
+        assert_eq!(p("file:///home/u/repo.git"), None);
+        assert_eq!(p("C:\\src\\repo"), None);
+        assert_eq!(p("./a:b"), None);
     }
 
     #[tokio::test]
@@ -182,7 +218,7 @@ mod tests {
         let dir = repo();
         let p = dir.path();
         sh(p, &["remote", "add", "zeta", "https://u:t@z.example/z.git"]);
-        let body = body_in(p, "s").await;
+        let body = body_in(p, "s", &mut RemoteCache::default()).await;
         assert_eq!(body["git_remote"], "https://z.example/z.git");
         assert_eq!(body["head_sha"].as_str().unwrap().len(), 40);
         assert_eq!(body["branch"], "main");
@@ -190,21 +226,43 @@ mod tests {
 
         sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
         assert_eq!(
-            body_in(p, "s").await["git_remote"],
+            body_in(p, "s", &mut RemoteCache::default()).await["git_remote"],
             "https://o.example/o.git"
         );
 
         sh(p, &["config", "branch.main.remote", "zeta"]);
         assert_eq!(
-            body_in(p, "s").await["git_remote"],
+            body_in(p, "s", &mut RemoteCache::default()).await["git_remote"],
             "https://z.example/z.git"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_is_looked_up_again_only_when_cwd_or_branch_changes() {
+        let dir = repo();
+        let p = dir.path();
+        sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
+        let mut cache = RemoteCache::default();
+        body_in(p, "s", &mut cache).await;
+        sh(
+            p,
+            &["remote", "set-url", "origin", "https://n.example/n.git"],
+        );
+        assert_eq!(
+            body_in(p, "s", &mut cache).await["git_remote"],
+            "https://o.example/o.git"
+        );
+        sh(p, &["checkout", "-q", "-b", "other"]);
+        assert_eq!(
+            body_in(p, "s", &mut cache).await["git_remote"],
+            "https://n.example/n.git"
         );
     }
 
     #[tokio::test]
     async fn outside_a_repo_the_git_fields_are_omitted() {
         let dir = tempfile::tempdir().unwrap();
-        let body = body_in(dir.path(), "s").await;
+        let body = body_in(dir.path(), "s", &mut RemoteCache::default()).await;
         assert!(body.get("git_remote").is_none() && body.get("head_sha").is_none());
         assert_eq!(body["session_id"], "s");
         assert_eq!(body["branch"], "");

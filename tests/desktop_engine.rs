@@ -283,6 +283,7 @@ impl Rig {
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("CONDENSE_AUTH_REQUIRED")
+            .env_remove("CONDENSE_URL")
             .stdin(Stdio::null());
         cmd
     }
@@ -438,7 +439,23 @@ fn org_off_switch_runs_direct_until_it_is_back_on() {
     let state = rig.data().join("daemon/local/state.toml");
     fs::create_dir_all(state.parent().expect("parent")).expect("mkdir");
 
-    fs::write(&state, "managed = true\nenabled = false\n").expect("write state");
+    let user = {
+        use sha2::{Digest, Sha256};
+        hex::encode(&Sha256::digest(b"test-user")[..8])
+    };
+    fs::write(
+        &state,
+        "managed = true\nenabled = false\nuser = \"someone-else\"\n",
+    )
+    .expect("write state");
+    run(rig.command().args(["--output-format", "stream-json"]));
+    assert!(rig.reported().contains(&rig.routed_base()));
+
+    fs::write(
+        &state,
+        format!("managed = true\nenabled = false\nuser = \"{user}\"\n"),
+    )
+    .expect("write state");
     let out = run(rig.command().args(["--output-format", "stream-json"]));
     assert_eq!(out.status.code(), Some(3));
     let report = rig.reported();
@@ -453,9 +470,61 @@ fn org_off_switch_runs_direct_until_it_is_back_on() {
         rig.engine_log()
     );
 
-    fs::write(&state, "managed = true\nenabled = true\n").expect("write state");
+    fs::write(
+        &state,
+        format!("managed = true\nenabled = true\nuser = \"{user}\"\n"),
+    )
+    .expect("write state");
     run(rig.command().args(["--output-format", "stream-json"]));
     assert!(rig.reported().contains(&rig.routed_base()));
+}
+
+#[test]
+fn dense_claude_runs_the_tool_directly_while_switched_off() {
+    let rig = Rig::new();
+    rig.log_in();
+    let bin = rig.home.path().join("bin");
+    fs::create_dir(&bin).expect("mkdir");
+    fs::copy(
+        rig.home.path().join("engine/claude.real"),
+        bin.join("claude"),
+    )
+    .expect("copy");
+    let user = {
+        use sha2::{Digest, Sha256};
+        hex::encode(&Sha256::digest(b"test-user")[..8])
+    };
+    let state = rig.data().join("daemon/local/state.toml");
+    fs::create_dir_all(state.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &state,
+        format!("managed = true\nenabled = false\nuser = \"{user}\"\n"),
+    )
+    .expect("write state");
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cmd = rig.command();
+    let mut dense = Command::new(env!("CARGO_BIN_EXE_dense"));
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => dense.env(k, v),
+            None => dense.env_remove(k),
+        };
+    }
+    let out = run(dense
+        .env("PATH", path)
+        .args(["claude", "-p", "hi"])
+        .stdin(Stdio::null()));
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("turned off"));
+    let report = rig.reported();
+    assert!(report.contains("kind=0"), "{report}");
+    assert!(report.contains("args=-p hi"), "{report}");
+    assert!(!rig.data().join("routed").exists());
 }
 
 #[test]

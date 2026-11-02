@@ -6,7 +6,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpStream;
@@ -15,7 +14,7 @@ use crate::Result;
 use crate::api::auth;
 use crate::config::Config;
 use crate::error::Error;
-use crate::harness::claude;
+use crate::harness::{claude, run_direct};
 
 use super::{BIN, BUNDLE, REAL, REAL_BUNDLE, bundle};
 
@@ -175,18 +174,6 @@ async fn route(cfg: &Config, real: &Path, args: &[OsString]) -> Result<()> {
         probe(cfg, token).await?;
     }
     claude::run_engine(cfg, &creds, real, args).await
-}
-
-#[cfg(unix)]
-fn run_direct(real: &Path, args: &[OsString]) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    Err(Command::new(real).args(args).exec().into())
-}
-
-#[cfg(not(unix))]
-fn run_direct(real: &Path, args: &[OsString]) -> Result<()> {
-    let status = Command::new(real).args(args).status()?;
-    std::process::exit(status.code().unwrap_or(1))
 }
 
 fn stamp_is_fresh(stamp: &Path, key: &str) -> bool {

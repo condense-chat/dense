@@ -113,10 +113,12 @@ impl Device {
     }
 }
 
-/// Whether the org turned dense off on this device. Routing entry points
-/// (shims are removed by the daemon; wrapped Desktop engines ask here) honour it.
+/// Whether the org turned dense off on this device for the logged-in user.
+/// Routing entry points (`dense <tool>`, wrapped Desktop engines) honour it.
+/// Fails open: an unreadable state file routes until the next heartbeat.
 pub fn switched_off(cfg: &Config) -> bool {
-    State::load(cfg).enforced() == Some(false)
+    let state = State::load(cfg);
+    state.enforced() == Some(false) && state.user == user_ref(&auth::load_creds(cfg))
 }
 
 /// After `dense login`: if the account's org manages devices, install the
@@ -868,6 +870,19 @@ mod tests {
         assert_eq!((state.user.as_deref(), state.enforced()), (None, None));
         assert!(!state.transparent_windows.contains(now_ms()));
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn unreadable_state_fails_open() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), "http://127.0.0.1:9");
+        std::fs::create_dir_all(cfg.daemon_dir()).unwrap();
+        std::fs::write(
+            cfg.daemon_dir().join("state.toml"),
+            "managed = true\nenabled = fal",
+        )
+        .unwrap();
+        assert!(!switched_off(&cfg));
     }
 
     #[tokio::test]

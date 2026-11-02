@@ -64,6 +64,15 @@ pub(crate) fn with_v1(base: &str) -> String {
 /// Run `tool` through condense, resolving one [`Target`] per declared dialect.
 /// Exits with the child's status; only a launch failure returns.
 pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<()> {
+    if crate::daemon::managed::switched_off(cfg) {
+        eprintln!(
+            "dense is turned off for this device by your organization; running {} directly",
+            tool.label()
+        );
+        let bin = tool::resolve_real(cfg, tool.binary())?;
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        return run_direct(&bin, &args);
+    }
     let creds = auth::ensure_auth(cfg).await?;
     let api = Api::authed(cfg, &creds)?;
     let session = Session::new();
@@ -78,6 +87,19 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     cmd.args(args);
 
     spawn_and_wait(&api, &session, &bin, cmd, routed).await
+}
+
+/// Replace this process with `real` (Unix) or run it and exit with its status.
+#[cfg(unix)]
+pub fn run_direct(real: &Path, args: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    Err(std::process::Command::new(real).args(args).exec().into())
+}
+
+#[cfg(not(unix))]
+pub fn run_direct(real: &Path, args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new(real).args(args).status()?;
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 /// Run Desktop's real engine through condense. Unlike [`launch`] this never

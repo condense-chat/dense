@@ -186,7 +186,7 @@ fn routed_span(
     pin: Pin,
     cmd: &mut tokio::process::Command,
 ) -> Option<Guard> {
-    if kind != "claude_code" {
+    if kind != "claude_code" || !crate::daemon::managed::collects_usage(cfg) {
         return None;
     }
     crate::daemon::sessions::remember_root(cfg);

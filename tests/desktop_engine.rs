@@ -412,10 +412,13 @@ fn logged_in_routes_and_keeps_desktops_token() {
     );
 }
 
+#[cfg(feature = "offline-usage")]
 #[test]
 fn routed_engine_carries_the_device_and_records_its_span() {
     let rig = Rig::new();
     rig.log_in();
+    fs::create_dir_all(rig.data().join("daemon")).expect("daemon dir");
+    fs::write(rig.data().join("daemon/state.toml"), "managed = true\n").expect("state");
     let out = run(rig.command().args(["--output-format", "stream-json"]));
 
     assert_eq!(out.status.code(), Some(3));
@@ -432,6 +435,7 @@ fn routed_engine_carries_the_device_and_records_its_span() {
     assert!(span.contains("\"end_ms\""), "{span}");
 }
 
+#[cfg(feature = "desktop-switch")]
 #[test]
 fn org_off_switch_runs_direct_until_it_is_back_on() {
     let rig = Rig::new();
@@ -479,6 +483,7 @@ fn org_off_switch_runs_direct_until_it_is_back_on() {
     assert!(rig.reported().contains(&rig.routed_base()));
 }
 
+#[cfg(feature = "remote-control")]
 #[test]
 fn dense_claude_runs_the_tool_directly_while_switched_off() {
     let rig = Rig::new();
@@ -524,6 +529,17 @@ fn dense_claude_runs_the_tool_directly_while_switched_off() {
     let report = rig.reported();
     assert!(report.contains("kind=0"), "{report}");
     assert!(report.contains("args=-p hi"), "{report}");
+    assert!(!rig.data().join("routed").exists());
+}
+
+#[test]
+fn a_device_that_is_not_managed_records_no_span() {
+    let rig = Rig::new();
+    rig.log_in();
+    let out = run(rig.command().args(["--output-format", "stream-json"]));
+
+    assert_eq!(out.status.code(), Some(3));
+    assert!(rig.reported().contains("device=1"));
     assert!(!rig.data().join("routed").exists());
 }
 

@@ -244,9 +244,10 @@ pub fn roots(home: &Path, env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> 
 /// Remember this process's `CLAUDE_CONFIG_DIR` for the daemon, whose
 /// supervisor environment does not carry it.
 pub fn remember_root(cfg: &Config) {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+    if cfg!(feature = "offline-usage")
+        && let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
     {
         remember_dir(cfg, dir);
     }
@@ -692,7 +693,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Write;
 
     use serde_json::json;
@@ -738,7 +739,7 @@ mod tests {
         }
     }
 
-    fn assistant(id: &str, at_ms: u64, out: u64, stop: Option<&str>) -> String {
+    pub(crate) fn assistant(id: &str, at_ms: u64, out: u64, stop: Option<&str>) -> String {
         let line = json!({
             "type": "assistant",
             "sessionId": "sess-1",

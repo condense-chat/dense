@@ -158,7 +158,7 @@ async fn route(cfg: &Config, real: &Path, args: &[OsString]) -> Result<()> {
     if !env_is_routable(|key| std::env::var(key).ok()) {
         return Err(Error::msg("Desktop is set up for another provider"));
     }
-    if crate::daemon::managed::switched_off(cfg) {
+    if cfg!(feature = "desktop-switch") && crate::daemon::managed::switched_off(cfg) {
         return Err(Error::msg(
             "dense is turned off for this device by your organization",
         ));

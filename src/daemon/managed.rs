@@ -56,7 +56,13 @@ impl Backoff {
 impl State {
     /// The switch to enforce, if this device is managed and one is known.
     pub fn enforced(&self) -> Option<bool> {
-        self.enabled.filter(|_| self.is_managed())
+        self.enabled
+            .filter(|_| cfg!(feature = "remote-control") && self.is_managed())
+    }
+
+    /// Session files are read and uploaded on managed devices only.
+    pub fn collects_usage(&self) -> bool {
+        cfg!(feature = "offline-usage") && self.is_managed()
     }
 
     pub fn is_managed(&self) -> bool {
@@ -77,7 +83,9 @@ impl State {
 
     fn observed(&mut self, mode: switch::Mode) {
         self.mode = Some(mode);
-        self.transparent_windows.note(mode, now_ms());
+        if self.collects_usage() {
+            self.transparent_windows.note(mode, now_ms());
+        }
     }
 
     fn record(&mut self, reply: &HeartbeatReply) {
@@ -128,6 +136,11 @@ pub fn switched_off(cfg: &Config) -> bool {
     state.enforced() == Some(false) && state.user == user_ref(owner.as_ref().unwrap_or(cfg))
 }
 
+/// Whether routed Claude Code runs need a span for the session-file reader.
+pub fn collects_usage(cfg: &Config) -> bool {
+    State::load(cfg).collects_usage()
+}
+
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
 pub async fn after_login(cfg: &Config) {
@@ -147,7 +160,7 @@ pub async fn after_login(cfg: &Config) {
     };
     let mut state = State::load(cfg);
     match heartbeat(cfg, &mut device_id, &mut state).await {
-        Ok(Some((reply, _))) if reply.managed => {}
+        Ok(Some((reply, _))) if reply.managed && cfg!(feature = "login-autostart") => {}
         Ok(_) => {
             if state.limited {
                 eprintln!("warning: {DEVICE_LIMIT_MSG}");
@@ -210,15 +223,18 @@ pub fn status_lines(cfg: &Config, state: &State) -> Vec<(&'static str, String)> 
         ),
         (_, None) => "unknown (no heartbeat yet)".into(),
     };
-    vec![
+    let mut lines = vec![
         ("device", format!("{device}; {beat}")),
         ("switch", switch),
         ("mode", reported_mode(cfg, state).as_str().to_string()),
-        (
+    ];
+    if state.collects_usage() {
+        lines.push((
             "queue",
             format!("{} usage records pending", queue::Queue::open(cfg).len()),
-        ),
-    ]
+        ));
+    }
+    lines
 }
 
 /// Tell condense this device is gone (`POST /v1/devices/uninstall`); warns,
@@ -324,13 +340,15 @@ fn track_user(cfg: &Config, state: &mut State) -> Option<String> {
 
 /// Queue session-file usage for the transparent windows. Runs before the
 /// heartbeat so it works offline; the queue carries it to the next upload.
-/// The window follows the shims actually on disk: unmanaged devices without
-/// shims are transparent throughout (`dense claude` runs are excluded by
-/// their routed spans instead).
+/// The window follows the shims actually on disk (`dense claude` runs are
+/// excluded by their routed spans instead).
 fn report_offline_usage(cfg: &Config, state: &mut State) {
     let now = now_ms();
     if track_user(cfg, state).is_none() {
         state.transparent_windows = sessions::Windows::default();
+        return;
+    }
+    if !state.collects_usage() {
         return;
     }
     match switch::observe(cfg) {
@@ -456,8 +474,27 @@ async fn tick(
         }
     };
 
+    let more = if state.collects_usage() {
+        upload_usage(cfg, &api, device_id).await
+    } else {
+        state.transparent_windows = sessions::Windows::default();
+        drop_usage(cfg);
+        false
+    };
+
+    if changed {
+        REPORT_DELAY
+    } else if more {
+        BACKOFF_MIN
+    } else {
+        clamp_interval(reply.heartbeat_interval_s)
+    }
+}
+
+/// Flush the queue, logging the outcome. True when a backlog remains to send.
+async fn upload_usage(cfg: &Config, api: &Api, device_id: &str) -> bool {
     let queue = queue::Queue::open(cfg);
-    let flushed = queue::flush_to(&api, device_id, &queue).await;
+    let flushed = queue::flush_to(api, device_id, &queue).await;
     let more = flushed
         .as_ref()
         .is_ok_and(|f| f.more && f.stalled.is_none());
@@ -479,14 +516,7 @@ async fn tick(
         Ok(_) => {}
         Err(e) => tracing::warn!("usage upload failed, kept queued: {e}"),
     }
-
-    if changed {
-        REPORT_DELAY
-    } else if more {
-        BACKOFF_MIN
-    } else {
-        clamp_interval(reply.heartbeat_interval_s)
-    }
+    more
 }
 
 fn error_chain(e: &crate::error::Error) -> String {
@@ -504,7 +534,8 @@ fn error_chain(e: &crate::error::Error) -> String {
 /// the switch has not turned off. Offline windows follow the shims alone; a
 /// routed Desktop session is excluded by its routed span instead.
 fn reported_mode(cfg: &Config, state: &State) -> switch::Mode {
-    let desktop_routed = || state.enforced() != Some(false) && desktop::has_wrapped_engines(cfg);
+    let desktop_off = cfg!(feature = "desktop-switch") && state.enforced() == Some(false);
+    let desktop_routed = || !desktop_off && desktop::has_wrapped_engines(cfg);
     match switch::observe(cfg) {
         switch::Mode::Transparent if desktop_routed() => switch::Mode::Condensing,
         mode => mode,
@@ -534,6 +565,7 @@ mod tests {
         assert_eq!(clamp_interval(1_000_000).as_secs(), INTERVAL_MAX_S);
     }
 
+    #[cfg(feature = "remote-control")]
     #[test]
     fn only_a_managed_off_switch_turns_desktop_routing_off() {
         let root = tempfile::tempdir().unwrap();
@@ -574,7 +606,7 @@ mod tests {
         let back = State::load(&cfg);
         assert_eq!(back.enabled, Some(false));
         assert_eq!(back.device_enabled, Some(false));
-        assert_eq!(back.enforced(), Some(false));
+        assert!(back.is_managed());
         assert_eq!(back.transparent_windows, s.transparent_windows);
         assert!(
             back.transparent_windows.contains(1_500) && !back.transparent_windows.contains(2_500)
@@ -642,6 +674,7 @@ mod tests {
         path
     }
 
+    #[cfg(feature = "remote-control")]
     #[tokio::test]
     async fn managed_off_switch_unpersists() {
         let (url, rx) = serve(
@@ -745,7 +778,7 @@ mod tests {
         assert_eq!(device::load(&cfg).as_deref(), Some(id.as_str()));
         assert!(rx.recv().unwrap().contains(&old));
         assert!(rx.recv().unwrap().contains(&id));
-        assert_eq!(state.enforced(), Some(false));
+        assert_eq!(state.enabled, Some(false));
     }
 
     #[tokio::test]
@@ -793,6 +826,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "offline-usage")]
     #[tokio::test]
     async fn unknown_device_on_usage_keeps_the_batch() {
         let (url, _rx) = serve_seq(vec![
@@ -839,6 +873,98 @@ mod tests {
         assert_eq!(q.len(), 0);
     }
 
+    #[tokio::test]
+    async fn a_device_that_is_not_managed_collects_nothing() {
+        collects_nothing_on(r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#).await;
+    }
+
+    #[cfg(not(feature = "offline-usage"))]
+    #[tokio::test]
+    async fn a_build_without_offline_usage_collects_nothing_on_a_managed_device() {
+        collects_nothing_on(OK_OFF).await;
+    }
+
+    #[cfg(not(feature = "remote-control"))]
+    #[tokio::test]
+    async fn a_build_without_remote_control_leaves_routing_to_the_user() {
+        let (url, _rx) = serve(200, OK_OFF);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        let shim = shim(&cfg);
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
+        state.save(&cfg).unwrap();
+        assert!(shim.exists());
+        assert!(!switched_off(&cfg));
+    }
+
+    #[tokio::test]
+    async fn a_v0_11_daemon_updated_in_place_changes_nothing_for_a_regular_user() {
+        let replies = [
+            (
+                200,
+                r#"{"managed":false,"enabled":false,"heartbeat_interval_s":60}"#,
+            ),
+            (409, r#"{"detail":{"code":"device_limit"}}"#),
+        ];
+        for ((status, body), shimmed) in replies.into_iter().flat_map(|r| [(r, true), (r, false)]) {
+            let (url, seen) = serve(status, body);
+            let root = tempfile::tempdir().unwrap();
+            let cfg = logged_in(root.path(), &url);
+            let shim = shimmed.then(|| shim(&cfg));
+            std::fs::create_dir_all(cfg.daemon_dir()).unwrap();
+            std::fs::write(cfg.daemon_dir().join("state.toml"), "pid = 7\n").unwrap();
+
+            let mut state = State::load(&cfg);
+            assert_eq!(state.pid, Some(7));
+            let mut job = Device::start(&cfg, &mut state).unwrap();
+            job.tick(&cfg, &mut state).await;
+
+            let session = root.path().join(".claude/projects/-work/s.jsonl");
+            std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+            let line = sessions::tests::assistant("m", now_ms(), 5, Some("end_turn"));
+            std::fs::write(&session, line).unwrap();
+            job.tick(&cfg, &mut state).await;
+            job.tick(&cfg, &mut state).await;
+            state.save(&cfg).unwrap();
+
+            assert!(shim.is_none_or(|s| s.exists()));
+            assert_eq!(State::load(&cfg).pid, Some(7));
+            assert_eq!(state.enforced(), None);
+            assert!(!switched_off(&cfg));
+            assert!(state.transparent_windows.is_empty());
+            assert_eq!(queue::Queue::open(&cfg).len(), 0);
+            assert!(!cfg.data_dir().join("daemon/sessions.json").exists());
+            let seen: Vec<_> = seen.try_iter().collect();
+            assert_eq!(seen.len(), 3, "{seen:?}");
+            assert!(seen.iter().all(|r| r.contains("/v1/devices/heartbeat")));
+        }
+    }
+
+    async fn collects_nothing_on(reply: &'static str) {
+        let (url, seen) = serve(200, reply);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        queue::Queue::open(&cfg)
+            .push(&[usage_record("m1")])
+            .unwrap();
+        let mut state = State::default();
+        state
+            .transparent_windows
+            .note(switch::Mode::Transparent, 1_000);
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
+        tick(&cfg, &mut "d".to_string(), &mut state, &mut b).await;
+
+        assert!(state.transparent_windows.is_empty());
+        assert_eq!(queue::Queue::open(&cfg).len(), 0);
+        assert!(!cfg.data_dir().join("daemon/sessions.json").exists());
+        let seen: Vec<_> = seen.try_iter().collect();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen.iter().all(|r| r.contains("/v1/devices/heartbeat")));
+    }
+
     #[test]
     fn logged_out_daemon_reads_no_sessions_and_closes_its_window() {
         let root = tempfile::tempdir().unwrap();
@@ -852,6 +978,7 @@ mod tests {
         assert!(!cfg.data_dir().join("daemon/sessions.json").exists());
     }
 
+    #[cfg(feature = "offline-usage")]
     #[test]
     fn user_change_never_carries_windows_queue_or_switch_over() {
         let root = tempfile::tempdir().unwrap();
@@ -891,6 +1018,7 @@ mod tests {
         assert_eq!(q.len(), 0);
     }
 
+    #[cfg(feature = "remote-control")]
     #[test]
     fn the_daemons_switch_binds_every_profile() {
         let root = tempfile::tempdir().unwrap();
@@ -927,11 +1055,11 @@ mod tests {
         queue.push(&[usage_record("kept")]).unwrap();
 
         forget_switch(&other);
-        assert_eq!(State::load(&daemon).enforced(), Some(false));
+        assert_eq!(State::load(&daemon).enabled, Some(false));
         assert_eq!(queue.len(), 1);
 
         forget_switch(&daemon);
-        assert_eq!(State::load(&daemon).enforced(), None);
+        assert_eq!(State::load(&daemon).enabled, None);
         assert_eq!(queue.len(), 0);
     }
 
@@ -963,6 +1091,7 @@ mod tests {
         assert!(!switched_off(&cfg));
     }
 
+    #[cfg(feature = "remote-control")]
     #[tokio::test]
     async fn previous_users_off_switch_is_not_applied_after_a_restart() {
         let root = tempfile::tempdir().unwrap();

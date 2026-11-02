@@ -59,6 +59,10 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Clippy without optional features
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Test without optional features
+        run: cargo test --locked --no-default-features
 
   deny:
     runs-on: ubuntu-latest

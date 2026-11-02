@@ -246,7 +246,25 @@ pub fn detected() -> bool {
 
 /// Routing outlives the wrapped engines, which Desktop can replace all at once.
 pub fn in_use(cfg: &Config) -> bool {
-    Routing::load(cfg).is_some() || has_wrapped_engines(cfg)
+    Routing::load(cfg).is_some()
+        || has_wrapped_engines(cfg)
+        || (daemon::managed::forced_on(cfg) && detected())
+}
+
+/// False with no engines: nothing is routed yet, whatever happens later.
+pub fn routes_every_engine(cfg: &Config) -> bool {
+    let all = installs(&roots_or_default(recorded_or(cfg, None)));
+    !all.is_empty() && all.iter().all(Install::is_wrapped)
+}
+
+pub fn summary(cfg: &Config) -> String {
+    let all = installs(&roots_or_default(recorded_or(cfg, None)));
+    let routed = all.iter().filter(|i| i.is_wrapped()).count();
+    match all.len() {
+        0 => "no engine yet; the next one Desktop downloads is routed".to_string(),
+        n if n == routed => format!("{n} of {n} engines routed"),
+        n => format!("{routed} of {n} engines routed; the daemon keeps trying"),
+    }
 }
 
 pub fn install(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<()> {
@@ -328,7 +346,10 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
         }
     }
     // A managed device keeps the daemon: it carries the org's switch.
-    if routing.added_daemon && !daemon::State::load(cfg).is_managed() {
+    if routing.added_daemon
+        && !daemon::State::load(cfg).is_managed()
+        && daemon::autostart::installed(cfg).is_some()
+    {
         result = result.and(daemon::remove_autostart(cfg));
     }
     result
@@ -703,7 +724,8 @@ fn wrap_new(cfg: &Config, exe: &Path, watcher: &mut Watcher) {
     let Ok(_lock) = lock(cfg).inspect_err(|e| tracing::warn!("no Desktop engine pass: {e}")) else {
         return;
     };
-    let Some(routing) = Routing::load(cfg) else {
+    let forced = || daemon::managed::forced_on(cfg).then(Routing::default);
+    let Some(routing) = Routing::load(cfg).or_else(forced) else {
         return;
     };
     let refresh = !watcher.refreshed;
@@ -1142,6 +1164,34 @@ mod tests {
         wrap_new(&cfg, &exe, &mut watcher);
         assert_eq!(std::fs::read(&found.bin).unwrap(), b"newer dense");
         assert_eq!(std::fs::read(&found.real).unwrap(), ENGINE);
+    }
+
+    #[test]
+    fn one_unwrapped_engine_means_desktop_is_not_routed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let root = tmp.path().join("engines");
+        Routing {
+            added_daemon: false,
+            data_dir: Some(root.clone()),
+        }
+        .save(&cfg)
+        .unwrap();
+        assert!(!routes_every_engine(&cfg));
+        assert!(summary(&cfg).starts_with("no engine yet"));
+
+        published(&root, ENGINE)
+            .wrap(&exe(tmp.path()), false, default_bundles())
+            .unwrap();
+        assert!(routes_every_engine(&cfg));
+        assert_eq!(summary(&cfg), "1 of 1 engines routed");
+
+        let newer = root.join("2.1.310");
+        std::fs::create_dir_all(&newer).unwrap();
+        std::fs::write(newer.join(BIN), ENGINE).unwrap();
+        std::fs::write(newer.join(".verified"), "manifest-checksum").unwrap();
+        assert!(!routes_every_engine(&cfg));
+        assert!(summary(&cfg).starts_with("1 of 2"));
     }
 
     #[test]

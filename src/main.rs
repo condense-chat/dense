@@ -77,7 +77,7 @@ async fn main() -> EyreResult<()> {
         Command::Codex { args } => harness::codex::run(&cfg, &args).await,
         Command::Login => match auth::login(&cfg).await {
             Ok(()) => {
-                daemon::managed::after_login(&cfg).await;
+                let _ = daemon::managed::after_login(&cfg).await;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -88,8 +88,11 @@ async fn main() -> EyreResult<()> {
         Command::Persist {
             targets,
             no_modify_path,
-        } => persist::persist(&cfg, &targets, !no_modify_path),
-        Command::Unpersist { targets } => persist::unpersist(&cfg, &targets),
+        } => persist::persist(&cfg, &targets, !no_modify_path)
+            .inspect(|()| daemon::managed::note_forced(&cfg)),
+        Command::Unpersist { targets } => {
+            persist::unpersist(&cfg, &targets).inspect(|()| daemon::managed::note_forced(&cfg))
+        }
         Command::Usage {
             attributed_only,
             json,
@@ -98,9 +101,12 @@ async fn main() -> EyreResult<()> {
         Command::ClaudeDesktop(command) => match command {
             DesktopCommand::Install { data_dir, no_watch } => {
                 desktop::install(&cfg, data_dir, !no_watch)
+                    .inspect(|()| daemon::managed::note_forced(&cfg))
             }
             DesktopCommand::Status { data_dir } => desktop::status(&cfg, data_dir),
-            DesktopCommand::Uninstall { data_dir } => desktop::uninstall(&cfg, data_dir),
+            DesktopCommand::Uninstall { data_dir } => {
+                desktop::uninstall(&cfg, data_dir).inspect(|()| daemon::managed::note_forced(&cfg))
+            }
         },
         Command::Doctor => doctor::run(&cfg).await,
         Command::Setup => setup::run(&cfg).await,

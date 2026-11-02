@@ -29,6 +29,19 @@ fn version_smoke() {
 }
 
 #[test]
+fn errors_are_for_people_not_for_rust_developers() {
+    let out = dense()
+        .env_remove("RUST_BACKTRACE")
+        .args(["-e", "nosuch", "status"])
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown profile `nosuch`"));
+    assert!(!err.contains("Location:"), "{err}");
+    assert!(!err.contains("RUST_BACKTRACE"), "{err}");
+}
+
+#[test]
 fn env_flag_beats_condense_url() {
     let out = dense()
         .env("CONDENSE_URL", "http://127.0.0.1:9")

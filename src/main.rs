@@ -51,7 +51,10 @@ async fn main() -> EyreResult<()> {
     if let Some(real) = desktop::engine::sibling_engine() {
         return desktop::engine::run(&real).await.map_err(Into::into);
     }
-    color_eyre::install()?;
+    color_eyre::config::HookBuilder::default()
+        .display_env_section(false)
+        .display_location_section(false)
+        .install()?;
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 

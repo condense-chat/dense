@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.11.0] - 2026-11-02
+
+### Features
+- Route Claude Desktop's engine through condense
+
 ## [0.10.0] - 2026-09-20
 
 ### Bug Fixes

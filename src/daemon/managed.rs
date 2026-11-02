@@ -133,9 +133,20 @@ impl Device {
 /// every profile: the switch is the device's, and the device has one daemon.
 /// Fails open: an unreadable state file routes until the next heartbeat.
 pub fn switched_off(cfg: &Config) -> bool {
-    let state = State::load(cfg);
-    let owner = state.profile.as_deref().map(|p| cfg.on_profile(p));
-    state.enforced() == Some(false) && state.user == user_ref(owner.as_ref().unwrap_or(cfg))
+    switch_for_login(cfg) == Some(false)
+}
+
+/// Whether the org forces this device through condense, so Desktop is routed
+/// and manual changes don't stick.
+pub fn forced_on(cfg: &Config) -> bool {
+    cfg!(feature = "managed-setup") && switch_for_login(cfg) == Some(true)
+}
+
+/// Say so when a manual routing change is the org's to make.
+pub fn note_forced(cfg: &Config) {
+    if cfg!(feature = "managed-setup") && switch_for_login(cfg).is_some() {
+        println!("this device is managed by your organization: its switch decides what routes");
+    }
 }
 
 /// Whether routed Claude Code runs need a span for the session-file reader.
@@ -145,7 +156,8 @@ pub fn collects_usage(cfg: &Config) -> bool {
 
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
-pub async fn after_login(cfg: &Config) {
+/// True when the device is managed, so there is nothing left to set up.
+pub async fn after_login(cfg: &Config) -> bool {
     sessions::remember_root(cfg);
     if let Some(user) = auth::load_creds(cfg).user_id {
         match device::bind_user(cfg, &user) {
@@ -154,25 +166,25 @@ pub async fn after_login(cfg: &Config) {
             Err(e) => tracing::warn!("could not bind the device id to this user: {e}"),
         }
     }
-    if autostart::installed(cfg).is_some() {
-        return;
-    }
     let Ok(mut device_id) = device::id(cfg) else {
-        return;
+        return false;
     };
     let mut state = State::load(cfg);
-    match heartbeat(cfg, &mut device_id, &mut state).await {
-        Ok(Some((reply, _))) if reply.managed && cfg!(feature = "login-autostart") => {}
-        Ok(_) => {
+    let managed = match heartbeat(cfg, &mut device_id, &mut state).await {
+        Ok(Some((reply, _))) => reply.managed,
+        Ok(None) => {
             if state.limited {
                 eprintln!("warning: {DEVICE_LIMIT_MSG}");
             }
-            return;
+            false
         }
         Err(e) => {
             tracing::debug!("post-login heartbeat failed: {e}");
-            return;
+            state.is_managed()
         }
+    };
+    if !managed || !cfg!(feature = "login-autostart") || autostart::installed(cfg).is_some() {
+        return managed;
     }
     save(cfg, &state);
     match autostart::install(cfg) {
@@ -184,6 +196,7 @@ pub async fn after_login(cfg: &Config) {
             error_chain(&e)
         ),
     }
+    true
 }
 
 /// Clear the cached switch (on logout): a later account must not inherit it,
@@ -230,6 +243,9 @@ pub fn status_lines(cfg: &Config, state: &State) -> Vec<(&'static str, String)> 
         ("switch", switch),
         ("mode", reported_mode(cfg, state).as_str().to_string()),
     ];
+    if desktop::in_use(cfg) {
+        lines.push(("desktop", desktop::summary(cfg)));
+    }
     if state.collects_usage() {
         lines.push((
             "queue",
@@ -368,6 +384,15 @@ fn report_offline_usage(cfg: &Config, state: &mut State) {
 }
 
 /// One login on one profile: the same id on another profile is a user change.
+/// The switch, while it belongs to the login that started the daemon.
+fn switch_for_login(cfg: &Config) -> Option<bool> {
+    let state = State::load(cfg);
+    let owner = state.profile.as_deref().map(|p| cfg.on_profile(p));
+    state
+        .enforced()
+        .filter(|_| state.user == user_ref(owner.as_ref().unwrap_or(cfg)))
+}
+
 fn user_ref(cfg: &Config) -> Option<String> {
     use sha2::{Digest, Sha256};
     let creds = auth::load_creds(cfg);
@@ -542,7 +567,7 @@ fn error_chain(e: &crate::error::Error) -> String {
 /// routed Desktop session is excluded by its routed span instead.
 fn reported_mode(cfg: &Config, state: &State) -> switch::Mode {
     let desktop_off = cfg!(feature = "desktop-switch") && state.enforced() == Some(false);
-    let desktop_routed = || !desktop_off && desktop::has_wrapped_engines(cfg);
+    let desktop_routed = || !desktop_off && desktop::routes_every_engine(cfg);
     match switch::observe(cfg) {
         switch::Mode::Transparent if desktop_routed() => switch::Mode::Condensing,
         mode => mode,
@@ -1000,6 +1025,46 @@ pub(crate) mod tests {
         );
         assert_eq!(state.last_error, None);
         assert!(rx.recv().unwrap().starts_with("POST /v1/devices/heartbeat"));
+    }
+
+    #[tokio::test]
+    async fn login_asks_the_server_instead_of_trusting_the_last_users_state() {
+        let (url, _rx) = serve(
+            200,
+            r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        State {
+            managed: Some(true),
+            enabled: Some(true),
+            ..State::default()
+        }
+        .save(&cfg)
+        .unwrap();
+        assert!(!after_login(&cfg).await);
+    }
+
+    #[cfg(feature = "managed-setup")]
+    #[test]
+    fn only_the_daemons_own_login_forces_desktop_on() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), "http://127.0.0.1:9");
+        assert!(!forced_on(&cfg));
+        let mut state = State {
+            enabled: Some(true),
+            managed: Some(false),
+            user: user_ref(&cfg),
+            ..State::default()
+        };
+        state.save(&cfg).unwrap();
+        assert!(!forced_on(&cfg));
+        state.managed = Some(true);
+        state.save(&cfg).unwrap();
+        assert!(forced_on(&cfg));
+        state.user = Some("another-login".into());
+        state.save(&cfg).unwrap();
+        assert!(!forced_on(&cfg));
     }
 
     #[test]

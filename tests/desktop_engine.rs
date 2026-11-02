@@ -41,11 +41,17 @@ fi
 exit 3
 "#;
 
+#[cfg(feature = "managed-setup")]
+const MANAGED_OFF: &str = r#"{"managed":true,"enabled":false,"heartbeat_interval_s":60}"#;
+const MANAGED_ON: &str = r#"{"managed":true,"enabled":true,"heartbeat_interval_s":60}"#;
 const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+const REGULAR: &str = r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#;
 
 /// A local condense api that says yes to everything until it's killed.
 struct Api {
     addr: SocketAddr,
+    heartbeat: Arc<Mutex<Option<&'static str>>>,
     server: JoinHandle<()>,
     stop: Arc<AtomicBool>,
 }
@@ -62,16 +68,32 @@ impl Api {
         let addr = listener.local_addr().expect("addr");
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
+        let heartbeat = Arc::new(Mutex::new(None));
+        let beat = Arc::clone(&heartbeat);
         let server = std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
                 if stopping.load(Ordering::SeqCst) {
                     return;
                 }
-                let _ = stream.read(&mut [0; 4096]);
-                let _ = stream.write_all(OK);
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let body = *beat.lock().expect("heartbeat");
+                match body.filter(|_| buf[..n].starts_with(b"POST /v1/devices/heartbeat")) {
+                    Some(body) => {
+                        let _ = stream.write_all(json_reply(body).as_bytes());
+                    }
+                    None => {
+                        let _ = stream.write_all(OK);
+                    }
+                }
             }
         });
-        Self { addr, server, stop }
+        Self {
+            addr,
+            heartbeat,
+            server,
+            stop,
+        }
     }
 
     fn kill(self) {
@@ -241,6 +263,15 @@ impl Rig {
         dir
     }
 
+    fn reply_to_heartbeats(&self, body: &'static str) {
+        let api = self.api.borrow();
+        *api.as_ref()
+            .expect("api")
+            .heartbeat
+            .lock()
+            .expect("heartbeat") = Some(body);
+    }
+
     fn record_routing(&self, added_daemon: bool) {
         fs::create_dir_all(self.data_dir()).expect("mkdir");
         let engines = self.engines();
@@ -330,6 +361,14 @@ impl Rig {
 
 fn exec_lock() -> MutexGuard<'static, ()> {
     EXEC.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn json_reply(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn run(cmd: &mut Command) -> Output {
@@ -800,6 +839,27 @@ fn uninstall_finishes_everything_after_a_failed_restore() {
 }
 
 #[test]
+fn self_uninstall_stops_the_daemon_before_it_unwraps() {
+    let rig = Rig::new();
+    let dir = rig.publish_wrapped("2.1.309");
+    rig.record_routing(true);
+    rig.register_autostart();
+    let seen = rig.home.path().join("wrapped-at-stop");
+    let stop = format!(
+        "[ -e {:?} ] && : > {seen:?}\nexit 0",
+        dir.join("claude.real")
+    );
+    rig.tool("systemctl", &stop);
+    rig.tool("launchctl", &stop);
+    let exe = rig.own_dense();
+
+    let out = run(rig.dense_at(&exe).args(["self", "uninstall"]));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(seen.exists());
+    assert_eq!(fs::read(dir.join("claude")).expect("engine"), ENGINE);
+}
+
+#[test]
 fn self_uninstall_warns_and_carries_on() {
     let rig = Rig::new();
     let exe = rig.own_dense();
@@ -816,6 +876,92 @@ fn self_uninstall_warns_and_carries_on() {
     assert!(!rig.entry().exists());
     assert!(!rig.data_dir().exists());
     assert!(!exe.exists());
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn a_managed_on_routes_desktop_and_a_manual_uninstall_comes_back() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_ON);
+    let dir = rig.publish_desktop("2.1.309");
+
+    rig.once();
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+    assert!(!rig.routing_file().exists());
+
+    let out = run(rig.dense().args(["claude-desktop", "uninstall"]));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("managed by your organization"));
+    assert_eq!(fs::read(dir.join("claude")).expect("engine"), ENGINE);
+
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn a_managed_off_keeps_wrapped_engines_and_wraps_no_new_one() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_ON);
+    let wrapped = rig.publish_desktop("2.1.309");
+    rig.once();
+    rig.once();
+
+    rig.reply_to_heartbeats(MANAGED_OFF);
+    rig.once();
+    let new = rig.publish_desktop("2.1.310");
+    rig.once();
+    assert_eq!(
+        fs::read(wrapped.join("claude.real")).expect("engine"),
+        ENGINE
+    );
+    assert_eq!(fs::read(new.join("claude")).expect("engine"), ENGINE);
+    assert!(!new.join("claude.real").exists());
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn setup_on_a_managed_device_asks_nothing() {
+    let rig = Rig::new();
+    rig.fake_service_manager();
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_ON);
+    rig.publish_desktop("2.1.309");
+
+    let out = run(rig.dense().arg("setup"));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(said.contains("nothing else to set up"), "{said}");
+    assert!(!said.contains("Which tools"), "{said}");
+    assert!(!said.contains("Route Claude Desktop"), "{said}");
+    assert!(rig.entry().exists());
+}
+
+#[test]
+fn a_device_the_org_does_not_manage_is_only_ever_wrapped_by_hand() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(REGULAR);
+    let dir = rig.publish_desktop("2.1.309");
+    rig.once();
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude")).expect("engine"), ENGINE);
+    assert!(!dir.join("claude.real").exists());
+}
+
+#[cfg(not(feature = "managed-setup"))]
+#[test]
+fn a_build_without_managed_setup_leaves_desktop_to_the_user() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_ON);
+    let dir = rig.publish_desktop("2.1.309");
+    rig.once();
+    rig.once();
+    assert!(!dir.join("claude.real").exists());
 }
 
 #[test]
@@ -881,6 +1027,7 @@ fn a_daemon_on_a_new_build_replaces_older_wrappers() {
 fn setup_offers_desktop_before_it_is_installed_and_defaults_to_no() {
     let rig = Rig::new();
     rig.log_in();
+    rig.reply_to_heartbeats(REGULAR);
     let out = run(rig.dense().arg("setup"));
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -896,6 +1043,7 @@ fn setup_offers_desktop_before_it_is_installed_and_defaults_to_no() {
 fn setup_offers_an_installed_desktop_and_leaves_it_alone_by_default() {
     let rig = Rig::new();
     rig.log_in();
+    rig.reply_to_heartbeats(REGULAR);
     let dir = rig.publish_desktop("2.1.309");
     let out = run(rig.dense().arg("setup"));
     let said = String::from_utf8_lossy(&out.stdout);

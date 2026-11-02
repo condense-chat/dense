@@ -10,13 +10,20 @@ use std::path::Path;
 
 use crate::api::auth;
 use crate::config::Config;
-use crate::{Result, desktop, env_file, persist, tool, ui};
+use crate::{Result, daemon, desktop, env_file, persist, tool, ui};
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     // Login runs in its own frame so the code is the first thing on screen.
     if !auth::load_creds(cfg).is_authenticated() {
         auth::login(cfg).await?;
+    }
+    cfg.remember_profile()?;
+    if daemon::managed::after_login(cfg).await && cfg!(feature = "managed-setup") {
+        let wiring = env_file::ensure_env(cfg, true)?;
+        persist::report_wiring(cfg, &wiring);
+        println!("this device is managed by your organization: there is nothing else to set up");
+        return Ok(());
     }
     let res = wizard(cfg, interactive);
     if res.is_err() && interactive {
@@ -185,8 +192,6 @@ fn warn(interactive: bool, text: &str) {
 }
 
 fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
-    cfg.remember_profile()?;
-
     let note = format!(
         "dense is open source — read the code: {}",
         env!("CARGO_PKG_REPOSITORY")

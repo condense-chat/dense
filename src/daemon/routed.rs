@@ -256,6 +256,10 @@ impl Pin {
                 "-c" | "--continue" => picker = true,
                 "--fork-session" => fork = true,
                 "--teleport" | "--from-pr" => unknown = true,
+                // A cluster or attached value (`-cp`, `-r<id>`) may hide a resume.
+                short if !short.starts_with("--") && short.starts_with('-') => {
+                    unknown |= short.contains(['c', 'r']);
+                }
                 _ => {}
             }
         }
@@ -576,6 +580,20 @@ mod tests {
 
     fn v(r: &Routed, b: &mut Bindings, sid: &str, cwd: &str, ts: u64, now: u64) -> &'static str {
         name(r.judge(b, &seen(sid, cwd, None, ts, ts), now))
+    }
+
+    #[test]
+    fn a_resume_hidden_in_a_short_flag_is_never_given_a_session_id() {
+        for flags in [
+            &["-cp", "hi"][..],
+            &["-pc", "hi"],
+            &["-rp", "hi"],
+            &["-pr", "hi"],
+        ] {
+            assert_eq!(Pin::of(&args(flags)), Pin::Unknown, "{flags:?}");
+        }
+        assert_eq!(Pin::of(&args(&[&format!("-r{U}")])), Pin::Unknown);
+        assert_eq!(Pin::of(&args(&[&format!("-r={U}")])), Pin::Unknown);
     }
 
     #[test]

@@ -39,15 +39,15 @@ impl Session {
 
     /// Spawn a background task heartbeating every [`HEARTBEAT_SECS`] until the
     /// returned handle is aborted. The body is rebuilt per beat so cwd/branch
-    /// track a long session.
-    pub fn start_heartbeat(&self, api: &Api) -> tokio::task::JoinHandle<()> {
+    /// track a long session. `repo` adds the git remote and HEAD.
+    pub fn start_heartbeat(&self, api: &Api, repo: bool) -> tokio::task::JoinHandle<()> {
         let api = api.clone();
         let id = self.id.clone();
         tokio::spawn(async move {
             let mut remotes = RemoteCache::default();
             loop {
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let body = body_in(&cwd, &id, &mut remotes).await;
+                let body = body_in(&cwd, &id, &mut remotes, repo).await;
                 api.post_forget("/v1/sessions/heartbeat", &body).await;
                 tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)).await;
             }
@@ -61,13 +61,18 @@ impl Default for Session {
     }
 }
 
-async fn body_in(cwd: &Path, session_id: &str, remotes: &mut RemoteCache) -> serde_json::Value {
+async fn body_in(
+    cwd: &Path,
+    session_id: &str,
+    remotes: &mut RemoteCache,
+    repo: bool,
+) -> serde_json::Value {
     let head = git(cwd, &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"]).await;
     let (branch, head_sha) = match head.as_deref().and_then(|h| h.split_once('\n')) {
         Some((sha, branch)) => (branch.to_string(), Some(sha.to_string())),
         None => (String::new(), None),
     };
-    let head_sha = head_sha.filter(|_| cfg!(feature = "session-repo"));
+    let head_sha = head_sha.filter(|_| repo);
     let key = (cwd.to_path_buf(), branch.clone());
     if remotes.key.as_ref() != Some(&key) {
         let tracked = Some(branch.as_str()).filter(|b| !b.is_empty() && *b != "HEAD");
@@ -214,13 +219,12 @@ mod tests {
         assert_eq!(p("./a:b"), None);
     }
 
-    #[cfg(not(feature = "session-repo"))]
     #[tokio::test]
-    async fn a_build_without_session_repo_sends_no_repo_fields() {
+    async fn only_a_managed_session_names_its_repo() {
         let dir = repo();
         let p = dir.path();
         sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
-        let body = body_in(p, "s", &mut RemoteCache::default()).await;
+        let body = body_in(p, "s", &mut RemoteCache::default(), false).await;
         assert_eq!(body["branch"], "main");
         assert!(body.get("git_remote").is_none() && body.get("head_sha").is_none());
     }
@@ -231,7 +235,7 @@ mod tests {
         let dir = repo();
         let p = dir.path();
         sh(p, &["remote", "add", "zeta", "https://u:t@z.example/z.git"]);
-        let body = body_in(p, "s", &mut RemoteCache::default()).await;
+        let body = body_in(p, "s", &mut RemoteCache::default(), true).await;
         assert_eq!(body["git_remote"], "https://z.example/z.git");
         assert_eq!(body["head_sha"].as_str().unwrap().len(), 40);
         assert_eq!(body["branch"], "main");
@@ -239,13 +243,13 @@ mod tests {
 
         sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
         assert_eq!(
-            body_in(p, "s", &mut RemoteCache::default()).await["git_remote"],
+            body_in(p, "s", &mut RemoteCache::default(), true).await["git_remote"],
             "https://o.example/o.git"
         );
 
         sh(p, &["config", "branch.main.remote", "zeta"]);
         assert_eq!(
-            body_in(p, "s", &mut RemoteCache::default()).await["git_remote"],
+            body_in(p, "s", &mut RemoteCache::default(), true).await["git_remote"],
             "https://z.example/z.git"
         );
     }
@@ -257,18 +261,18 @@ mod tests {
         let p = dir.path();
         sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
         let mut cache = RemoteCache::default();
-        body_in(p, "s", &mut cache).await;
+        body_in(p, "s", &mut cache, true).await;
         sh(
             p,
             &["remote", "set-url", "origin", "https://n.example/n.git"],
         );
         assert_eq!(
-            body_in(p, "s", &mut cache).await["git_remote"],
+            body_in(p, "s", &mut cache, true).await["git_remote"],
             "https://o.example/o.git"
         );
         sh(p, &["checkout", "-q", "-b", "other"]);
         assert_eq!(
-            body_in(p, "s", &mut cache).await["git_remote"],
+            body_in(p, "s", &mut cache, true).await["git_remote"],
             "https://n.example/n.git"
         );
     }
@@ -276,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn outside_a_repo_the_git_fields_are_omitted() {
         let dir = tempfile::tempdir().unwrap();
-        let body = body_in(dir.path(), "s", &mut RemoteCache::default()).await;
+        let body = body_in(dir.path(), "s", &mut RemoteCache::default(), true).await;
         assert!(body.get("git_remote").is_none() && body.get("head_sha").is_none());
         assert_eq!(body["session_id"], "s");
         assert_eq!(body["branch"], "");

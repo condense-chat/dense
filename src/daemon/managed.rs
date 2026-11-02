@@ -17,6 +17,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const INTERVAL_MAX_S: u64 = 3_600;
 const INTERVAL_MIN_S: u64 = 5;
+/// How often a logged-out daemon looks for a login; Desktop's pass already wakes it this often.
+const LOGIN_POLL: Duration = Duration::from_secs(15);
 /// After a switch change, re-heartbeat this soon so the new mode is reported.
 pub const REPORT_DELAY: Duration = Duration::from_secs(1);
 
@@ -459,9 +461,14 @@ async fn tick(
             return backoff.next_delay();
         }
         Err(e) => {
+            state.last_error = Some(error_chain(&e));
+            // Nothing was sent, so there is nothing to back off from.
+            if !auth::load_creds(cfg).is_authenticated() {
+                backoff.reset();
+                return LOGIN_POLL;
+            }
             let delay = backoff.next_delay();
             tracing::warn!("heartbeat failed, retrying in {}s: {e}", delay.as_secs());
-            state.last_error = Some(error_chain(&e));
             return delay;
         }
     };
@@ -966,6 +973,33 @@ pub(crate) mod tests {
         let seen: Vec<_> = seen.try_iter().collect();
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen.iter().all(|r| r.contains("/v1/devices/heartbeat")));
+    }
+
+    #[tokio::test]
+    async fn a_logged_out_daemon_picks_up_a_login_without_backing_off() {
+        let (url, rx) = serve(
+            200,
+            r#"{"managed":false,"enabled":true,"heartbeat_interval_s":60}"#,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), &url);
+        let mut state = State::default();
+        let mut b = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+        let mut id = "d".to_string();
+        for _ in 0..8 {
+            assert_eq!(tick(&cfg, &mut id, &mut state, &mut b).await, LOGIN_POLL);
+        }
+        assert!(state.last_error.as_deref().unwrap().contains("dense login"));
+        assert!(rx.try_recv().is_err());
+
+        std::fs::create_dir_all(cfg.cred_dir()).unwrap();
+        std::fs::write(cfg.user_file(), "u\n").unwrap();
+        assert_eq!(
+            tick(&cfg, &mut id, &mut state, &mut b).await,
+            Duration::from_secs(60)
+        );
+        assert_eq!(state.last_error, None);
+        assert!(rx.recv().unwrap().starts_with("POST /v1/devices/heartbeat"));
     }
 
     #[test]

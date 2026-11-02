@@ -55,7 +55,8 @@ async fn main() -> EyreResult<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    let cfg = Config::resolve(cli.url.clone(), cli.environment.clone())?;
+    let url = Config::cli_url(cli.url.clone(), cli.environment.as_deref());
+    let cfg = Config::resolve(url, cli.environment.clone())?;
     if let Err(e) = migrate::run(&cfg) {
         eprintln!("warning: could not finish moving dense files to their new dirs: {e}");
     }

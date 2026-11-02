@@ -28,6 +28,7 @@ fn version_smoke() {
     assert!(String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_tool_that_is_gone_says_so_before_any_login() {
     let home = tempfile::tempdir().expect("home");

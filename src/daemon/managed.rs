@@ -63,6 +63,11 @@ impl State {
         self.managed == Some(true)
     }
 
+    /// False when the daemon runs for another profile than `cfg`.
+    pub fn owned_by(&self, cfg: &Config) -> bool {
+        self.profile.as_deref().is_none_or(|p| p == cfg.profile())
+    }
+
     pub fn forget_switch(&mut self) {
         self.enabled = None;
         self.managed = None;
@@ -113,12 +118,14 @@ impl Device {
     }
 }
 
-/// Whether the org turned dense off on this device for the logged-in user.
-/// Routing entry points (`dense <tool>`, wrapped Desktop engines) honour it.
+/// Whether the org turned dense off on this device for the daemon's login.
+/// Routing entry points (`dense <tool>`, wrapped Desktop engines) honour it on
+/// every profile: the switch is the device's, and the device has one daemon.
 /// Fails open: an unreadable state file routes until the next heartbeat.
 pub fn switched_off(cfg: &Config) -> bool {
     let state = State::load(cfg);
-    state.enforced() == Some(false) && state.user == user_ref(&auth::load_creds(cfg))
+    let owner = state.profile.as_deref().map(|p| cfg.on_profile(p));
+    state.enforced() == Some(false) && state.user == user_ref(owner.as_ref().unwrap_or(cfg))
 }
 
 /// After `dense login`: if the account's org manages devices, install the
@@ -127,8 +134,8 @@ pub async fn after_login(cfg: &Config) {
     sessions::remember_root(cfg);
     if let Some(user) = auth::load_creds(cfg).user_id {
         match device::bind_user(cfg, &user) {
-            Ok(true) => drop_usage(cfg),
-            Ok(false) => {}
+            Ok(true) if State::load(cfg).owned_by(cfg) => drop_usage(cfg),
+            Ok(_) => {}
             Err(e) => tracing::warn!("could not bind the device id to this user: {e}"),
         }
     }
@@ -168,6 +175,9 @@ pub async fn after_login(cfg: &Config) {
 /// nor this account's unsent usage.
 pub fn forget_switch(cfg: &Config) {
     let mut state = State::load(cfg);
+    if !state.owned_by(cfg) {
+        return;
+    }
     state.forget_switch();
     state.transparent_windows = sessions::Windows::default();
     state.user = None;
@@ -297,7 +307,7 @@ fn now_ms() -> u64 {
 /// Follow the logged-in user. On any change nothing of the previous user's
 /// carries over: not their windows, queued usage, or org switch.
 fn track_user(cfg: &Config, state: &mut State) -> Option<String> {
-    let user = user_ref(&auth::load_creds(cfg));
+    let user = user_ref(cfg);
     if state.user != user {
         if state.user.is_some() {
             state.transparent_windows = sessions::Windows::default();
@@ -337,10 +347,13 @@ fn report_offline_usage(cfg: &Config, state: &mut State) {
     }
 }
 
-fn user_ref(creds: &auth::Creds) -> Option<String> {
+/// One login on one profile: the same id on another profile is a user change.
+fn user_ref(cfg: &Config) -> Option<String> {
     use sha2::{Digest, Sha256};
+    let creds = auth::load_creds(cfg);
     let who = creds.user_id.as_deref().or(creds.token.as_deref())?;
-    Some(hex::encode(&Sha256::digest(who.as_bytes())[..8]))
+    let key = format!("{}\n{who}", cfg.profile());
+    Some(hex::encode(&Sha256::digest(key.as_bytes())[..8]))
 }
 
 /// One heartbeat. `Ok(None)`: the server refused this credential/device for
@@ -876,6 +889,65 @@ mod tests {
         assert_eq!((state.user.as_deref(), state.enforced()), (None, None));
         assert!(!state.transparent_windows.contains(now_ms()));
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn the_daemons_switch_binds_every_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = logged_in(root.path(), "http://127.0.0.1:9");
+        let active = logged_in(root.path(), "http://127.0.0.1:8");
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            profile: Some(daemon.profile().to_string()),
+            ..State::default()
+        };
+        track_user(&daemon, &mut state);
+        state.save(&daemon).unwrap();
+        assert!(switched_off(&active));
+
+        std::fs::remove_file(daemon.user_file()).unwrap();
+        assert!(!switched_off(&active), "a logged-out daemon gates nobody");
+    }
+
+    #[test]
+    fn another_profiles_logout_and_login_leave_the_daemons_state_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = logged_in(root.path(), "http://127.0.0.1:9");
+        let other = logged_in(root.path(), "http://127.0.0.1:8");
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            profile: Some(daemon.profile().to_string()),
+            ..State::default()
+        };
+        track_user(&daemon, &mut state);
+        state.save(&daemon).unwrap();
+        let queue = queue::Queue::open(&daemon);
+        queue.push(&[usage_record("kept")]).unwrap();
+
+        forget_switch(&other);
+        assert_eq!(State::load(&daemon).enforced(), Some(false));
+        assert_eq!(queue.len(), 1);
+
+        forget_switch(&daemon);
+        assert_eq!(State::load(&daemon).enforced(), None);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn a_daemon_moved_to_another_profile_starts_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let before = logged_in(root.path(), "http://127.0.0.1:9");
+        let after = logged_in(root.path(), "http://127.0.0.1:8");
+        let mut state = State {
+            enabled: Some(false),
+            managed: Some(true),
+            ..State::default()
+        };
+        track_user(&before, &mut state);
+        track_user(&after, &mut state);
+        assert_eq!(state.enforced(), None);
     }
 
     #[test]

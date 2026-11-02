@@ -115,6 +115,14 @@ impl Config {
         cred_dir_for(&self.config_dir, &self.profile_name)
     }
 
+    /// This config, for another profile's credentials.
+    pub fn on_profile(&self, name: &str) -> Self {
+        Self {
+            profile_name: name.to_string(),
+            ..self.clone()
+        }
+    }
+
     /// The one daemon's lock, state, usage queue and log, shared by every profile.
     pub fn daemon_dir(&self) -> PathBuf {
         self.data_dir.join("daemon")

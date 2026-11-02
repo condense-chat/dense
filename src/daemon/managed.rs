@@ -444,7 +444,11 @@ async fn tick(
     };
 
     let queue = queue::Queue::open(cfg);
-    match queue::flush_to(&api, device_id, &queue).await {
+    let flushed = queue::flush_to(&api, device_id, &queue).await;
+    let more = flushed
+        .as_ref()
+        .is_ok_and(|f| f.more && f.stalled.is_none());
+    match flushed {
         Ok(f) if f.stalled.is_some() => tracing::warn!(
             sent = f.sent,
             "usage upload refused for this device ({}); kept queued until the next heartbeat",
@@ -465,6 +469,8 @@ async fn tick(
 
     if changed {
         REPORT_DELAY
+    } else if more {
+        BACKOFF_MIN
     } else {
         clamp_interval(reply.heartbeat_interval_s)
     }

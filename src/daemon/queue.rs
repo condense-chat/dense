@@ -17,12 +17,16 @@ use crate::config::Config;
 use crate::error::Context;
 
 pub const BATCH: usize = 500;
+/// Per flush, so a backlog on a slow link never holds the other daemon jobs up.
+pub const MAX_BATCHES: usize = 4;
 pub const MAX_RECORDS: usize = 20_000;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Flushed {
     /// Records in batches the server rejected for good.
     pub dropped: usize,
+    /// Stopped at [`MAX_BATCHES`] with records still queued.
+    pub more: bool,
     pub sent: usize,
     /// The drain stopped on a refusal of the device itself (unknown, or bound
     /// to another user); the batch stays queued for after a heartbeat.
@@ -151,7 +155,7 @@ where
     Fut: Future<Output = Result<Reply<()>>>,
 {
     let mut out = Flushed::default();
-    loop {
+    for _ in 0..MAX_BATCHES {
         let (records, consumed) = queue.peek(BATCH);
         if consumed == 0 {
             return Ok(out);
@@ -177,6 +181,8 @@ where
             }
         }
     }
+    out.more = queue.peek(1).1 > 0;
+    Ok(out)
 }
 
 /// [`flush`] to `POST /v1/devices/usage`.
@@ -252,6 +258,20 @@ mod tests {
         .unwrap();
         assert_eq!(sent.sent, 1_234);
         assert_eq!(sizes, vec![500, 500, 234]);
+        assert_eq!(q.len(), 0);
+        assert!(!sent.more);
+    }
+
+    #[tokio::test]
+    async fn one_flush_stops_after_max_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("q.jsonl"), 5_000);
+        q.push(&records(0..2_100)).unwrap();
+        let send = |_| async { Ok(Reply::Ok(())) };
+        let first = flush(&q, send).await.unwrap();
+        assert_eq!((first.sent, first.more), (BATCH * MAX_BATCHES, true));
+        let second = flush(&q, send).await.unwrap();
+        assert_eq!((second.sent, second.more), (100, false));
         assert_eq!(q.len(), 0);
     }
 
@@ -343,6 +363,7 @@ mod tests {
             out,
             Flushed {
                 dropped: 500,
+                more: false,
                 sent: 200,
                 stalled: None
             }

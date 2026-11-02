@@ -21,13 +21,18 @@ pub fn id(cfg: &Config) -> Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), id));
     write_private(&tmp, &format!("{id}\n"))?;
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
     // Hard-link, not rename: two first runs racing keep one id, never two.
-    let linked = std::fs::hard_link(&tmp, &path);
+    let mut linked = std::fs::hard_link(&tmp, &path);
+    if linked
+        .as_ref()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+        && load(cfg).is_none()
+    {
+        // Garbage, not a racing writer's id: replace it.
+        linked = std::fs::rename(&tmp, &path);
+    }
     let _ = std::fs::remove_file(&tmp);
     match (linked, load(cfg)) {
         (_, Some(stored)) => Ok(stored),
@@ -122,6 +127,28 @@ mod tests {
             std::fs::read_to_string(cfg.device_file()).unwrap().trim(),
             first
         );
+    }
+
+    #[test]
+    fn racing_first_runs_agree_on_one_id() {
+        for _ in 0..20 {
+            let home = tempfile::tempdir().unwrap();
+            let cfg = Config::for_test(home.path(), "http://127.0.0.1:9");
+            let barrier = std::sync::Barrier::new(8);
+            let ids: Vec<String> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            id(&cfg).unwrap()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(ids.iter().all(|i| *i == ids[0]), "{ids:?}");
+            assert_eq!(load(&cfg).as_deref(), Some(ids[0].as_str()));
+        }
     }
 
     #[test]

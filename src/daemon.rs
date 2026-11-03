@@ -22,7 +22,7 @@ use crate::{Result, desktop};
 // ponytail: jobs take turns on one thread, so a slow tick delays the others;
 // give each job its own task if one must run during another's network call.
 enum Job {
-    DesktopEngines,
+    DesktopEngines(desktop::Watcher),
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -32,12 +32,12 @@ pub struct State {
 
 impl Job {
     fn all() -> Vec<Self> {
-        vec![Self::DesktopEngines]
+        vec![Self::DesktopEngines(desktop::Watcher::default())]
     }
 
     async fn tick(&mut self, cfg: &Config) -> Duration {
         match self {
-            Self::DesktopEngines => desktop::watch(cfg).await,
+            Self::DesktopEngines(watcher) => desktop::watch(cfg, watcher).await,
         }
     }
 }

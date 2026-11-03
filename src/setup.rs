@@ -1,6 +1,7 @@
 //! `dense setup` — the first-run wizard the installer hands off to. Signs in
-//! when no creds exist, asks which tools to route through condense and
-//! whether to wire PATH, then tells the user how to start. Run via `curl … | sh`, the installer
+//! when no creds exist, asks which tools and whether Claude Desktop to route
+//! through condense and whether to wire PATH, then tells the user how to
+//! start. Run via `curl … | sh`, the installer
 //! reconnects stdin to the tty so the prompts work; with no tty it explains
 //! and uses defaults.
 
@@ -9,7 +10,7 @@ use std::path::Path;
 
 use crate::api::auth;
 use crate::config::Config;
-use crate::{Result, env_file, persist, tool, ui};
+use crate::{Result, desktop, env_file, persist, tool, ui};
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
@@ -43,6 +44,24 @@ fn ask(interactive: bool, question: &str, explain: &str, default_yes: bool) -> O
         .initial_value(default_yes)
         .interact()
         .ok()
+}
+
+/// Desktop is its own choice: routing it wraps Desktop's engine and keeps a
+/// background service following Desktop, even before it's installed.
+fn ask_desktop(interactive: bool) -> Option<bool> {
+    let explain = if desktop::detected() {
+        "Covers Desktop's Code sessions on this computer, including engines Desktop \
+         downloads later. Undo with `dense claude-desktop uninstall`."
+    } else {
+        "Desktop hasn't run on this computer yet; a background service routes its Code \
+         sessions from the first one. Undo with `dense claude-desktop uninstall`."
+    };
+    ask(
+        interactive,
+        "Route Claude Desktop through condense?",
+        explain,
+        false,
+    )
 }
 
 // A cancelled prompt already closed the frame ("Operation cancelled.").
@@ -149,6 +168,14 @@ fn start_hint(tools: &[String]) -> String {
 }
 
 /// A warning that stays inside the cliclack frame when there is one.
+fn info(interactive: bool, text: &str) {
+    if interactive {
+        let _ = cliclack::log::info(text);
+    } else {
+        println!("{text}");
+    }
+}
+
 fn warn(interactive: bool, text: &str) {
     if interactive {
         let _ = cliclack::log::warning(text);
@@ -184,6 +211,10 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
         return cancelled(interactive);
     };
 
+    let Some(route_desktop) = ask_desktop(interactive) else {
+        return cancelled(interactive);
+    };
+
     let wiring = env_file::ensure_env(cfg, modify_path)?;
     if let env_file::PathWiring::Manual(notes) = &wiring {
         warn(interactive, &notes.join("\n"));
@@ -196,6 +227,17 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
     }
     for warning in path_warnings(cfg, &tools, &wiring) {
         warn(interactive, &warning);
+    }
+    if route_desktop {
+        match desktop::route(cfg, None, true) {
+            Ok(report) => {
+                for warning in &report.warnings {
+                    warn(interactive, warning);
+                }
+                info(interactive, &report.lines.join("\n"));
+            }
+            Err(e) => warn(interactive, &format!("Claude Desktop not routed: {e}")),
+        }
     }
 
     let later = persist_summary(&tools);

@@ -192,8 +192,30 @@ impl Rig {
         exe
     }
 
+    fn once(&self) {
+        let out = run(self.dense().args(["daemon", "run", "--once"]));
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
     fn publish(&self, version: &str) -> PathBuf {
-        let dir = self.engines().join(version).join("abcdef012345");
+        self.publish_in(&self.engines(), version)
+    }
+
+    /// Where Desktop really keeps engines, the folder setup looks in.
+    fn publish_desktop(&self, version: &str) -> PathBuf {
+        let base = if cfg!(target_os = "macos") {
+            "Library/Application Support"
+        } else {
+            ".config"
+        };
+        self.publish_in(
+            &self.home.path().join(base).join("Claude/claude-code"),
+            version,
+        )
+    }
+
+    fn publish_in(&self, root: &Path, version: &str) -> PathBuf {
+        let dir = root.join(version).join("abcdef012345");
         fs::create_dir_all(&dir).expect("mkdir");
         fs::write(dir.join("claude"), ENGINE).expect("write engine");
         fs::write(dir.join(".verified"), "manifest-checksum").expect("write marker");
@@ -657,6 +679,97 @@ fn self_uninstall_warns_and_carries_on() {
     assert!(!rig.entry().exists());
     assert!(!rig.data_dir().exists());
     assert!(!exe.exists());
+}
+
+#[test]
+fn install_before_desktop_and_the_watcher_follows_it_through_an_uninstall() {
+    let rig = Rig::new();
+    rig.fake_service_manager();
+    let out = rig.install();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hasn't run on this computer yet"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let status = run(rig
+        .dense()
+        .args(["claude-desktop", "status", "--data-dir"])
+        .arg(rig.engines()));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("no engine yet"));
+    rig.once();
+
+    let dir = rig.publish("2.1.309");
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+
+    fs::remove_dir_all(rig.engines()).expect("Desktop is uninstalled");
+    rig.once();
+    let dir = rig.publish("2.1.310");
+    rig.once();
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+}
+
+#[test]
+fn install_with_desktop_but_no_engine_routes_the_first_download() {
+    let rig = Rig::new();
+    rig.fake_service_manager();
+    fs::create_dir_all(rig.engines()).expect("mkdir");
+    let out = rig.install();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the next one Desktop downloads"));
+}
+
+#[test]
+fn install_without_the_watcher_says_to_run_it_again() {
+    let rig = Rig::new();
+    let out = run(&mut rig.install_no_watch());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("run this again"));
+    assert!(!rig.routing_file().exists());
+}
+
+#[test]
+fn a_daemon_on_a_new_build_replaces_older_wrappers() {
+    let rig = Rig::new();
+    let dir = rig.publish_wrapped("2.1.309");
+    rig.record_routing(false);
+    rig.once();
+    let current = fs::read(env!("CARGO_BIN_EXE_dense")).expect("dense");
+    assert!(fs::read(dir.join("claude")).expect("wrapper") == current);
+    assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+}
+
+#[test]
+fn setup_offers_desktop_before_it_is_installed_and_defaults_to_no() {
+    let rig = Rig::new();
+    rig.log_in();
+    let out = run(rig.dense().arg("setup"));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        said.contains("Route Claude Desktop through condense?"),
+        "{said}"
+    );
+    assert!(said.contains("hasn't run on this computer yet"), "{said}");
+    assert!(!rig.routing_file().exists());
+}
+
+#[test]
+fn setup_offers_an_installed_desktop_and_leaves_it_alone_by_default() {
+    let rig = Rig::new();
+    rig.log_in();
+    let dir = rig.publish_desktop("2.1.309");
+    let out = run(rig.dense().arg("setup"));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        said.contains("Route Claude Desktop through condense?"),
+        "{said}"
+    );
+    assert!(!said.contains("hasn't run on this computer yet"), "{said}");
+    assert!(!dir.join("claude.real").exists());
+    assert!(!rig.routing_file().exists());
 }
 
 #[test]

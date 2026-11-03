@@ -6,16 +6,17 @@
 mod bundle;
 pub mod engine;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::auth;
 use crate::config::Config;
-use crate::error::{Context, Error};
+use crate::error::Context;
 use crate::{Result, daemon};
 
 use bundle::Bundles;
@@ -37,8 +38,14 @@ const REAL: &str = if cfg!(windows) {
     "claude.real"
 };
 const REAL_BUNDLE: &str = "claude.real.app";
+/// How long an engine left unrouted waits, unchanged, before another full check.
+const RETRY: Duration = Duration::from_secs(300);
 const ROUTING_FILE: &str = "desktop.toml";
 const TMP: &str = "claude.dense-tmp";
+
+/// Size and mtime of an engine's files: a stat, where a full check costs a hash
+/// and a signature.
+type Seen = Vec<Option<(u64, SystemTime)>>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -64,6 +71,22 @@ struct RemoteSpaces {
 #[derive(Deserialize)]
 struct Payload {
     sha256: String,
+}
+
+/// What [`route`] did, for the caller to show.
+#[derive(Debug, Default)]
+pub struct Report {
+    pub lines: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// What the daemon's Desktop job carries from one pass to the next.
+#[derive(Debug, Default)]
+pub struct Watcher {
+    /// Whether a pass already replaced wrappers from an older dense.
+    refreshed: bool,
+    /// Engines a pass left unrouted, as their files were then.
+    unrouted: BTreeMap<PathBuf, (Seen, Instant)>,
 }
 
 /// Turns the daemon's Desktop job on. Wrapped engines can't stand in for this:
@@ -113,6 +136,18 @@ impl Install {
             return Ok(false);
         };
         Ok(file_sha256(&self.bin)? == payload.sha256)
+    }
+
+    fn seen(&self) -> Seen {
+        let markers = [self.dir.join(".payload"), self.dir.join(".verified")];
+        [&self.bin, &self.real]
+            .into_iter()
+            .chain(&markers)
+            .map(|path| {
+                let meta = std::fs::metadata(path).ok()?;
+                Some((meta.len(), meta.modified().ok()?))
+            })
+            .collect()
     }
 
     fn unwrap_engine(&self) -> Result<bool> {
@@ -177,6 +212,16 @@ impl Routing {
     }
 }
 
+impl Watcher {
+    /// An engine left unrouted is checked again once Desktop changes its files,
+    /// or after [`RETRY`]. Until then a pass only stats it.
+    fn due(&self, dir: &Path, seen: &Seen, now: Instant) -> bool {
+        self.unrouted
+            .get(dir)
+            .is_none_or(|(was, at)| was != seen || now.duration_since(*at) >= RETRY)
+    }
+}
+
 /// Published engines still running outside condense, each with its fix.
 pub fn unwrapped_versions(cfg: &Config) -> Vec<String> {
     installs(&roots_or_default(recorded_or(cfg, None)))
@@ -192,75 +237,26 @@ pub fn has_wrapped_engines(cfg: &Config) -> bool {
         .any(Install::is_wrapped)
 }
 
+/// Whether Desktop has run on this computer, even with no engine downloaded yet.
+pub fn detected() -> bool {
+    candidate_roots()
+        .iter()
+        .any(|root| root.parent().is_some_and(Path::is_dir))
+}
+
 /// Routing outlives the wrapped engines, which Desktop can replace all at once.
 pub fn in_use(cfg: &Config) -> bool {
     Routing::load(cfg).is_some() || has_wrapped_engines(cfg)
 }
 
 pub fn install(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<()> {
-    let _lock = lock(cfg)?;
-    let data_dir = recorded_or(cfg, data_dir);
-    let roots = roots_or_default(data_dir.clone());
-    if roots.is_empty() {
-        return Err(Error::msg(
-            "no Claude Desktop engine folder found — open Desktop and start a Code session first",
-        ));
+    let report = route(cfg, data_dir, watch)?;
+    for line in &report.lines {
+        println!("{line}");
     }
-    let exe = std::env::current_exe().ctx("locating the dense binary")?;
-    let mut routed = 0;
-    for found in installs(&roots) {
-        match found.wrap(&exe, true, bundle::CODESIGNED)? {
-            Outcome::Wrapped => {
-                routed += 1;
-                println!("wrapped {}", found.label());
-            }
-            Outcome::Current => {
-                routed += 1;
-                println!("already wrapped {}", found.label());
-            }
-            Outcome::Skipped(why) => println!("skipped {}: {why}", found.label()),
-        }
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
     }
-    if watch {
-        let added_daemon = daemon::autostart::installed(cfg).is_none()
-            || Routing::load(cfg).is_some_and(|routing| routing.added_daemon);
-        Routing {
-            added_daemon,
-            data_dir,
-        }
-        .save(cfg)?;
-        match daemon::install(cfg) {
-            Ok(()) => println!("watcher enabled: new engine versions are wrapped automatically"),
-            // Not fatal: wrapped engines keep working without the daemon.
-            Err(e) => eprintln!("warning: {e}"),
-        }
-    }
-    if routed == 0 {
-        println!("No engine is routed yet.");
-        return Ok(());
-    }
-    // Desktop passes no flags, so the engine only ever sees the default profile.
-    let engine = Config::resolve(None, None)?;
-    if engine.api_host != cfg.api_host {
-        eprintln!(
-            "warning: this command targeted {}, but Desktop's engine uses your default \
-             profile, {}. `dense profile` changes it.",
-            cfg.api_host, engine.api_host
-        );
-    }
-    if auth::load_creds(&engine).is_authenticated() {
-        println!(
-            "Desktop's Code sessions on this computer now route through {}.",
-            engine.api_host
-        );
-    } else {
-        println!("Desktop's engine is wrapped, but sessions run directly until `dense login`.");
-    }
-    println!(
-        "Cowork routes only when Desktop runs it on this computer's engine.\n\
-         Cowork in Anthropic's cloud or in Desktop's VM, and Desktop's Chat, are not routed.\n\
-         Undo with `dense claude-desktop uninstall`."
-    );
     Ok(())
 }
 
@@ -281,14 +277,22 @@ pub fn keep_daemon(cfg: &Config) -> Result<()> {
 pub fn status(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
     let roots = roots_or_default(recorded_or(cfg, data_dir));
     if roots.is_empty() {
-        println!("Claude Desktop: no engine folder found");
-        return Ok(());
+        let state = if detected() {
+            "no engine downloaded yet"
+        } else {
+            "not on this computer yet"
+        };
+        println!("Claude Desktop: {state}");
     }
     for root in &roots {
         println!("engines: {}", root.display());
     }
     let logged_in = auth::load_creds(&Config::resolve(None, None)?).is_authenticated();
-    for found in installs(&roots) {
+    let found = installs(&roots);
+    if found.is_empty() && !roots.is_empty() {
+        println!("  no engine yet");
+    }
+    for found in found {
         let state = match (found.is_wrapped(), logged_in) {
             (false, _) => "NOT routed",
             (true, false) => "wrapped, sessions run directly until `dense login`",
@@ -302,10 +306,12 @@ pub fn status(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
         (true, true) => "running",
     };
     println!("watcher: {watcher}");
-    println!(
-        "{}",
-        cowork_status(roots.iter().map(|r| cloud_sessions(r)).sum())
-    );
+    if !roots.is_empty() {
+        println!(
+            "{}",
+            cowork_status(roots.iter().map(|r| cloud_sessions(r)).sum())
+        );
+    }
     Ok(())
 }
 
@@ -327,17 +333,25 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
     result
 }
 
-/// The daemon's Desktop job: wrap engines that appeared since the last pass,
-/// since Desktop installs them while running.
-pub async fn watch(cfg: &Config) -> Duration {
-    if let Ok(exe) = std::env::current_exe() {
-        let cfg = cfg.clone();
-        // Off the daemon's thread: the lock can wait on an `install`, and hashing
-        // and `codesign` take seconds.
-        let pass = tokio::task::spawn_blocking(move || wrap_new(&cfg, &exe));
-        if let Err(e) = pass.await {
-            tracing::warn!("Desktop engine pass failed: {e}");
-        }
+/// The daemon's Desktop job: follow Desktop through installs, engine downloads
+/// and updates, and uninstalls, wrapping each engine it publishes. The first
+/// pass after a start also replaces wrappers from an older dense, since the
+/// daemon restarts whenever its binary changes.
+pub async fn watch(cfg: &Config, watcher: &mut Watcher) -> Duration {
+    let Ok(exe) = std::env::current_exe() else {
+        return POLL;
+    };
+    let cfg = cfg.clone();
+    let mut state = std::mem::take(watcher);
+    // Off the daemon's thread: the lock can wait on an `install`, and hashing
+    // and `codesign` take seconds.
+    let pass = tokio::task::spawn_blocking(move || {
+        wrap_new(&cfg, &exe, &mut state);
+        state
+    });
+    match pass.await {
+        Ok(state) => *watcher = state,
+        Err(e) => tracing::warn!("Desktop engine pass failed: {e}"),
     }
     POLL
 }
@@ -368,7 +382,8 @@ fn cowork_status(cloud: usize) -> String {
     }
 }
 
-fn default_roots() -> Vec<PathBuf> {
+/// Where Desktop keeps engines, whether or not it has made the folder yet.
+fn candidate_roots() -> Vec<PathBuf> {
     let Some(base) = directories::BaseDirs::new() else {
         return Vec::new();
     };
@@ -376,6 +391,11 @@ fn default_roots() -> Vec<PathBuf> {
     if cfg!(windows) {
         roots.extend(packaged_roots(base.data_local_dir()));
     }
+    roots
+}
+
+fn default_roots() -> Vec<PathBuf> {
+    let mut roots = candidate_roots();
     roots.retain(|r| r.is_dir());
     roots
 }
@@ -469,6 +489,21 @@ fn lock(cfg: &Config) -> Result<File> {
     Ok(file)
 }
 
+fn nothing_routed(found: &[Install], watch: bool, data_dir: Option<&Path>) -> &'static str {
+    let present = data_dir.map_or_else(detected, Path::is_dir);
+    match (found.is_empty(), watch, present) {
+        (false, _, _) => "No engine is routed yet.",
+        (true, true, true) => "No Desktop engine yet: the next one Desktop downloads is routed.",
+        (true, true, false) => {
+            "Claude Desktop hasn't run on this computer yet: its engine is routed \
+             from its first Code session."
+        }
+        (true, false, _) => {
+            "No Desktop engine yet: run this again once Desktop has downloaded one."
+        }
+    }
+}
+
 fn place(exe: &Path, bin: &Path) -> Result<()> {
     let tmp = stage(exe, bin)?;
     replace(&tmp, bin).inspect_err(|_| {
@@ -504,6 +539,101 @@ fn roots_or_default(data_dir: Option<PathBuf>) -> Vec<PathBuf> {
         Some(dir) => vec![dir],
         None => default_roots(),
     }
+}
+
+/// [`install`] without printing, for callers with their own output.
+pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Report> {
+    let _lock = lock(cfg)?;
+    let data_dir = recorded_or(cfg, data_dir);
+    let exe = std::env::current_exe().ctx("locating the dense binary")?;
+    let found = installs(&roots_or_default(data_dir.clone()));
+    let mut report = Report::default();
+    let mut failed = None;
+    let mut routed = 0;
+    for found in &found {
+        match found.wrap(&exe, true, bundle::CODESIGNED) {
+            Ok(Outcome::Wrapped) => {
+                routed += 1;
+                report.lines.push(format!("wrapped {}", found.label()));
+            }
+            Ok(Outcome::Current) => {
+                routed += 1;
+                report
+                    .lines
+                    .push(format!("already wrapped {}", found.label()));
+            }
+            Ok(Outcome::Skipped(why)) => {
+                report
+                    .lines
+                    .push(format!("skipped {}: {why}", found.label()));
+            }
+            // With the watcher on, a later pass tries again.
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("could not wrap {}: {e}", found.label()));
+                failed = Some(e);
+            }
+        }
+    }
+    if let Some(e) = failed.filter(|_| !watch) {
+        return Err(e);
+    }
+    if watch {
+        let added_daemon = daemon::autostart::installed(cfg).is_none()
+            || Routing::load(cfg).is_some_and(|routing| routing.added_daemon);
+        Routing {
+            added_daemon,
+            data_dir: data_dir.clone(),
+        }
+        .save(cfg)?;
+        match daemon::autostart::install(cfg) {
+            Ok(autostart) => {
+                report.lines.push(format!(
+                    "daemon autostart installed -> {}",
+                    autostart.path.display()
+                ));
+                report.warnings.extend(autostart.notes);
+                report
+                    .lines
+                    .push("watcher enabled: new engine versions are wrapped automatically".into());
+            }
+            // Not fatal: wrapped engines keep working without the daemon.
+            Err(e) => report.warnings.push(e.to_string()),
+        }
+    }
+    if routed == 0 {
+        report
+            .lines
+            .push(nothing_routed(&found, watch, data_dir.as_deref()).into());
+        return Ok(report);
+    }
+    // Desktop passes no flags, so the engine only ever sees the default profile.
+    let engine = Config::resolve(None, None)?;
+    if engine.api_host != cfg.api_host {
+        report.warnings.push(format!(
+            "this command targeted {}, but Desktop's engine uses your default profile, {}. \
+             `dense profile` changes it.",
+            cfg.api_host, engine.api_host
+        ));
+    }
+    report
+        .lines
+        .push(if auth::load_creds(&engine).is_authenticated() {
+            format!(
+                "Desktop's Code sessions on this computer now route through {}.",
+                engine.api_host
+            )
+        } else {
+            "Desktop's engine is wrapped, but sessions run directly until `dense login`.".into()
+        });
+    report.lines.push(
+        "Cowork routes only when Desktop runs it on this computer's engine.\n\
+         Cowork in Anthropic's cloud or in Desktop's VM, and Desktop's Chat, are not routed.\n\
+         Undo with `dense claude-desktop uninstall`."
+            .into(),
+    );
+    Ok(report)
 }
 
 fn routing_file(cfg: &Config) -> PathBuf {
@@ -568,18 +698,37 @@ fn sweep_displaced(bin: &Path) {
     }
 }
 
-fn wrap_new(cfg: &Config, exe: &Path) {
+fn wrap_new(cfg: &Config, exe: &Path, watcher: &mut Watcher) {
     let Ok(_lock) = lock(cfg).inspect_err(|e| tracing::warn!("no Desktop engine pass: {e}")) else {
         return;
     };
     let Some(routing) = Routing::load(cfg) else {
         return;
     };
-    for found in installs(&roots_or_default(routing.data_dir)) {
-        if let Err(e) = found.wrap(exe, false, bundle::CODESIGNED) {
-            tracing::warn!("could not wrap {}: {e}", found.label());
+    let refresh = !watcher.refreshed;
+    let found = installs(&roots_or_default(routing.data_dir));
+    // Gone with Desktop, or replaced by a newer version.
+    watcher
+        .unrouted
+        .retain(|dir, _| found.iter().any(|f| &f.dir == dir));
+    for found in &found {
+        if !watcher.due(&found.dir, &found.seen(), Instant::now()) {
+            continue;
         }
+        let why = match found.wrap(exe, refresh, bundle::CODESIGNED) {
+            Ok(Outcome::Current | Outcome::Wrapped) => {
+                watcher.unrouted.remove(&found.dir);
+                continue;
+            }
+            Ok(Outcome::Skipped(why)) => why,
+            Err(e) => e.to_string(),
+        };
+        tracing::warn!("{} not routed: {why}", found.label());
+        watcher
+            .unrouted
+            .insert(found.dir.clone(), (found.seen(), Instant::now()));
     }
+    watcher.refreshed = true;
 }
 
 #[cfg(test)]
@@ -824,7 +973,7 @@ mod tests {
         let root = tmp.path().join("engines");
         let found = published(&root, ENGINE);
         // The job wraps with this test binary, so the payload check is the real one.
-        assert_eq!(watch(&cfg).await, POLL);
+        assert_eq!(watch(&cfg, &mut Watcher::default()).await, POLL);
         assert!(!found.is_wrapped());
 
         Routing {
@@ -833,7 +982,7 @@ mod tests {
         }
         .save(&cfg)
         .unwrap();
-        watch(&cfg).await;
+        watch(&cfg, &mut Watcher::default()).await;
         assert!(found.is_wrapped());
         assert_eq!(std::fs::read(&found.real).unwrap(), ENGINE);
     }
@@ -858,7 +1007,8 @@ mod tests {
             Routing::take(&cfg);
             drop(held);
         };
-        tokio::join!(watch(&cfg), release);
+        let mut watcher = Watcher::default();
+        tokio::join!(watch(&cfg, &mut watcher), release);
         assert!(!found.is_wrapped());
     }
 
@@ -900,6 +1050,92 @@ mod tests {
 
         assert!(in_use(&cfg));
         assert!(has_wrapped_engines(&cfg));
+    }
+
+    fn routed_at(cfg: &Config, root: &Path) {
+        Routing {
+            added_daemon: false,
+            data_dir: Some(root.to_path_buf()),
+        }
+        .save(cfg)
+        .unwrap();
+    }
+
+    #[test]
+    fn an_engine_left_unrouted_is_checked_again_once_desktop_changes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let root = tmp.path().join("engines");
+        // Desktop has written the engine but not yet its download record.
+        let found = published(&root, b"not finished");
+        routed_at(&cfg, &root);
+        let exe = exe(tmp.path());
+        let mut watcher = Watcher::default();
+
+        wrap_new(&cfg, &exe, &mut watcher);
+        assert!(!found.is_wrapped());
+        assert!(!watcher.due(&found.dir, &found.seen(), Instant::now()));
+
+        let sha = hex::encode(Sha256::digest(ENGINE));
+        std::fs::write(
+            found.dir.join(".payload"),
+            format!(r#"{{"sha256":"{sha}"}}"#),
+        )
+        .unwrap();
+        assert!(watcher.due(&found.dir, &found.seen(), Instant::now()));
+        wrap_new(&cfg, &exe, &mut watcher);
+        assert!(found.is_wrapped());
+        assert!(watcher.unrouted.is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_unrouted_engine_waits_out_the_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let found = published(tmp.path(), b"something else");
+        let start = Instant::now();
+        let mut watcher = Watcher::default();
+        watcher
+            .unrouted
+            .insert(found.dir.clone(), (found.seen(), start));
+        assert!(!watcher.due(&found.dir, &found.seen(), start + RETRY / 2));
+        assert!(watcher.due(&found.dir, &found.seen(), start + RETRY));
+    }
+
+    #[test]
+    fn the_watcher_forgets_engines_desktop_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let root = tmp.path().join("engines");
+        let found = published(&root, b"something else");
+        routed_at(&cfg, &root);
+        let mut watcher = Watcher::default();
+        wrap_new(&cfg, &exe(tmp.path()), &mut watcher);
+        assert_eq!(watcher.unrouted.len(), 1);
+
+        std::fs::remove_dir_all(&found.dir).unwrap();
+        wrap_new(&cfg, &exe(tmp.path()), &mut watcher);
+        assert!(watcher.unrouted.is_empty());
+    }
+
+    #[test]
+    fn only_the_first_pass_replaces_older_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let root = tmp.path().join("engines");
+        let found = published(&root, ENGINE);
+        routed_at(&cfg, &root);
+        let exe = exe(tmp.path());
+        found.wrap(&exe, false, default_bundles()).unwrap();
+        std::fs::write(&exe, b"newer dense").unwrap();
+
+        let mut watcher = Watcher::default();
+        wrap_new(&cfg, &exe, &mut watcher);
+        assert_eq!(std::fs::read(&found.bin).unwrap(), b"newer dense");
+
+        std::fs::write(&exe, b"newest dense").unwrap();
+        wrap_new(&cfg, &exe, &mut watcher);
+        assert_eq!(std::fs::read(&found.bin).unwrap(), b"newer dense");
+        assert_eq!(std::fs::read(&found.real).unwrap(), ENGINE);
     }
 
     #[test]

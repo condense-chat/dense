@@ -64,8 +64,8 @@ pub fn wrap(dir: &Path, exe: &Path, refresh: bool, bundles: Bundles) -> Result<O
         return Ok(Outcome::Current);
     }
     let genuine = app.exists() && !ours;
-    // ponytail: the watcher repeats this ~300MB hash every poll while a
-    // bundle fails it; remember the failure if one ever lingers.
+    // ponytail: a ~300MB hash; the watcher repeats it only when Desktop
+    // changes the bundle or the retry interval passes.
     if genuine && !(bundles.is_anthropic)(&app) {
         return Ok(Outcome::Skipped(
             "claude.app isn't signed by Anthropic".to_string(),

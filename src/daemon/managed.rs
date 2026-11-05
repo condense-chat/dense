@@ -151,6 +151,17 @@ pub fn note_forced(cfg: &Config) {
     }
 }
 
+/// Refuse a command that would take routing away while the org manages it.
+pub fn refuse_if_managed(cfg: &Config, command: &str) -> Result<()> {
+    if cfg!(feature = "managed-setup") && switch_for_login(cfg).is_some() {
+        return Err(Error::msg(format!(
+            "dense is managed remotely by your organization on this device, so `{command}` \
+             is turned off; ask your admin to change what routes"
+        )));
+    }
+    Ok(())
+}
+
 /// A login from before device management never went through [`after_login`],
 /// so an already logged-in device checks once, at its first launch.
 pub async fn enroll_once(cfg: &Config) {

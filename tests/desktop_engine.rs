@@ -884,7 +884,7 @@ fn self_uninstall_warns_and_carries_on() {
 
 #[cfg(feature = "managed-setup")]
 #[test]
-fn a_managed_on_routes_desktop_and_a_manual_uninstall_comes_back() {
+fn a_managed_on_routes_desktop_and_refuses_to_take_it_back() {
     let rig = Rig::new();
     rig.log_in();
     rig.reply_to_heartbeats(MANAGED_ON);
@@ -897,13 +897,36 @@ fn a_managed_on_routes_desktop_and_a_manual_uninstall_comes_back() {
     let status = run(rig.dense().args(["claude-desktop", "status"]));
     assert!(!stream(&status).contains("watcher: disabled"));
 
-    let out = run(rig.dense().args(["claude-desktop", "uninstall"]));
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("managed by your organization"));
-    assert_eq!(fs::read(dir.join("claude")).expect("engine"), ENGINE);
-
-    rig.once();
+    for args in [&["claude-desktop", "uninstall"][..], &["unpersist"][..]] {
+        let out = run(rig.dense().args(args));
+        assert!(!out.status.success(), "{args:?} ran on a managed device");
+        assert!(stderr(&out).contains("managed remotely by your organization"));
+    }
     assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
+}
+
+#[cfg(feature = "managed-setup")]
+#[test]
+fn a_managed_off_still_refuses_manual_changes() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(MANAGED_OFF);
+    rig.once();
+    let out = run(rig.dense().args(["unpersist"]));
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("`dense unpersist` is turned off"));
+}
+
+#[test]
+fn a_device_the_org_does_not_manage_can_still_undo_routing() {
+    let rig = Rig::new();
+    rig.log_in();
+    rig.reply_to_heartbeats(REGULAR);
+    rig.once();
+    for args in [&["claude-desktop", "uninstall"][..], &["unpersist"][..]] {
+        let out = run(rig.dense().args(args));
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
 }
 
 #[cfg(feature = "managed-setup")]

@@ -91,7 +91,8 @@ async fn main() -> EyreResult<()> {
         } => persist::persist(&cfg, &targets, !no_modify_path)
             .inspect(|()| daemon::managed::note_forced(&cfg)),
         Command::Unpersist { targets } => {
-            persist::unpersist(&cfg, &targets).inspect(|()| daemon::managed::note_forced(&cfg))
+            daemon::managed::refuse_if_managed(&cfg, "dense unpersist")
+                .and_then(|()| persist::unpersist(&cfg, &targets))
         }
         Command::Usage {
             attributed_only,
@@ -105,7 +106,8 @@ async fn main() -> EyreResult<()> {
             }
             DesktopCommand::Status { data_dir } => desktop::status(&cfg, data_dir),
             DesktopCommand::Uninstall { data_dir } => {
-                desktop::uninstall(&cfg, data_dir).inspect(|()| daemon::managed::note_forced(&cfg))
+                daemon::managed::refuse_if_managed(&cfg, "dense claude-desktop uninstall")
+                    .and_then(|()| desktop::uninstall(&cfg, data_dir))
             }
         },
         Command::Doctor => doctor::run(&cfg).await,

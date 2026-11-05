@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.12.0] - 2026-11-05
+
+### Documentation
+- Say when the watcher re-hashes a bundle
+
+### Features
+- Follow Claude Desktop in any state and offer it in setup
+
 ## [0.11.0] - 2026-11-02
 
 ### Features

@@ -34,8 +34,9 @@ const TOOLS: &[ToolSpec] = &[
 #[derive(Default, Serialize, Deserialize)]
 pub struct Record {
     /// The user refused PATH wiring, which the daemon has to respect too.
-    #[serde(default)]
-    pub no_modify_path: bool,
+    /// `None` on a record from before dense remembered the choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_modify_path: Option<bool>,
     pub tools: BTreeMap<String, String>,
 }
 
@@ -92,7 +93,13 @@ pub fn install_shims(cfg: &Config, targets: &[String]) -> Result<ShimReport> {
 
 /// Whether the user allows dense to wire PATH.
 pub fn may_modify_path(cfg: &Config) -> bool {
-    !load_record(cfg).no_modify_path
+    let rec = load_record(cfg);
+    match rec.no_modify_path {
+        Some(refused) => !refused,
+        // An older install that shimmed tools but left every profile alone
+        // was set up with `--no-modify-path`.
+        None => rec.tools.is_empty() || env_file::is_wired(cfg),
+    }
 }
 
 pub fn load_record(cfg: &Config) -> Record {
@@ -126,7 +133,7 @@ pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()
 
 pub fn remember_path_choice(cfg: &Config, modify_path: bool) -> Result<()> {
     let mut rec = load_record(cfg);
-    rec.no_modify_path = !modify_path;
+    rec.no_modify_path = Some(!modify_path);
     save_record(cfg, &rec)
 }
 
@@ -194,9 +201,7 @@ fn save_record(cfg: &Config, rec: &Record) -> Result<()> {
     std::fs::create_dir_all(cfg.data_dir()).ctx("creating dense data dir")?;
     let body = toml::to_string_pretty(rec).ctx("serializing persist record")?;
     let path = cfg.persist_file();
-    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, body).ctx("writing persist record")?;
-    std::fs::rename(&tmp, &path).ctx("replacing persist record")
+    crate::atomic::replace(&path, body.as_bytes()).ctx("replacing persist record")
 }
 
 fn select(targets: &[String]) -> Result<Vec<&'static ToolSpec>> {

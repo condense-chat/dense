@@ -1,6 +1,3 @@
-//! Device management: the daemon's heartbeat (which carries the admin's
-//! on/off switch back), offline usage upload, and uninstall.
-
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

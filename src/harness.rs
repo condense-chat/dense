@@ -83,11 +83,12 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     }
 
     let mut cmd = routed_command(cfg, &tool, &creds, &session, &bin);
-    let routed = routed_span(cfg, tool.kind(), Pin::of(args), &mut cmd);
     cmd.args(args);
 
     let repo = crate::daemon::managed::sends_repo(cfg);
-    spawn_and_wait(&api, &session, repo, &bin, cmd, routed).await
+    let (kind, pin) = (tool.kind(), Pin::of(args));
+    let span = |child| routed_span(cfg, kind, pin, child);
+    spawn_and_wait(&api, &session, repo, &bin, cmd, span).await
 }
 
 /// Replace this process with `real` (Unix) or run it and exit with its status.
@@ -126,15 +127,11 @@ pub async fn launch_engine<T: Tool>(
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    // Desktop's argv is its own; a session it did not name is bound by cwd.
-    let pin = match Pin::of(&lossy) {
-        Pin::Inject(_) => Pin::Unknown,
-        pin => pin,
-    };
-    let routed = routed_span(cfg, tool.kind(), pin, &mut cmd);
+    let pin = Pin::of(&lossy);
 
     let stops = stop_signals();
     let mut child = cmd.spawn().ctx(format!("launching {}", bin.display()))?;
+    let routed = routed_span(cfg, tool.kind(), pin, child.id());
     crate::desktop::engine::log(
         cfg,
         &format!("routed launch: session {} via {}", session.id, cfg.api_host),
@@ -182,25 +179,18 @@ fn routed_command<T: Tool>(
 
 /// The proxy reports a routed Claude Code child's usage; record its span so the
 /// daemon's disk reader skips it.
-fn routed_span(
-    cfg: &Config,
-    kind: &str,
-    pin: Pin,
-    cmd: &mut tokio::process::Command,
-) -> Option<Guard> {
-    if kind != "claude_code" || !crate::daemon::managed::collects_usage(cfg) {
+/// Opened whether or not the device is managed yet: management can start
+/// mid-session, and a session without a span would then be counted twice.
+fn routed_span(cfg: &Config, kind: &str, pin: Pin, child: Option<u32>) -> Option<Guard> {
+    if kind != "claude_code" || !cfg!(feature = "offline-usage") {
         return None;
     }
     crate::daemon::sessions::remember_root(cfg);
     let session_id = match pin {
-        Pin::Inject(id) => {
-            cmd.args(["--session-id", &id]);
-            Some(id)
-        }
         Pin::Known(id) => Some(id),
         Pin::Unknown => None,
     };
-    Guard::open(cfg, session_id)
+    Guard::open(cfg, session_id, child)
 }
 
 /// Run an already-configured child to completion under a condense session.
@@ -210,7 +200,7 @@ async fn spawn_and_wait(
     repo: bool,
     bin: &Path,
     mut cmd: tokio::process::Command,
-    routed: Option<Guard>,
+    span: impl FnOnce(Option<u32>) -> Option<Guard>,
 ) -> Result<()> {
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -218,7 +208,13 @@ async fn spawn_and_wait(
 
     let heartbeat = session.start_heartbeat(api, repo);
     let interrupts = swallow_interrupts();
-    let status = cmd.status().await;
+    let (status, routed) = match cmd.spawn() {
+        Ok(mut child) => {
+            let routed = span(child.id());
+            (child.wait().await, routed)
+        }
+        Err(e) => (Err(e), None),
+    };
     interrupts.abort();
     heartbeat.abort();
     if let Some(g) = routed {

@@ -37,7 +37,9 @@ pub async fn uninstall(cfg: &Config) -> Result<()> {
     for name in persist::load_record(cfg).tools.keys() {
         let _ = std::fs::remove_file(persist::shim_path(cfg, name));
     }
-    env_file::unwire(cfg)?;
+    if let Err(e) = env_file::unwire(cfg) {
+        eprintln!("warning: {e}; remove the `# >>> dense >>>` block from it by hand");
+    }
     crate::harness::commands::cleanup(cfg);
     let _ = std::fs::remove_dir_all(cfg.data_dir());
     if let Ok(exe) = std::env::current_exe() {

@@ -575,15 +575,35 @@ fn dense_claude_runs_the_tool_directly_while_switched_off() {
     assert!(!rig.data().join("routed").exists());
 }
 
+#[cfg(not(feature = "offline-usage"))]
 #[test]
-fn a_device_that_is_not_managed_records_no_span() {
+fn a_build_without_offline_usage_records_no_span() {
+    let rig = Rig::new();
+    rig.log_in();
+    let out = run(rig.command().args(["--output-format", "stream-json"]));
+
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!rig.data().join("routed").exists());
+}
+
+/// Management can start mid-session, and a routed session with no span would
+/// then be read from its session file and counted a second time.
+#[cfg(feature = "offline-usage")]
+#[test]
+fn a_device_not_yet_managed_still_records_a_closed_span() {
     let rig = Rig::new();
     rig.log_in();
     let out = run(rig.command().args(["--output-format", "stream-json"]));
 
     assert_eq!(out.status.code(), Some(3));
     assert!(rig.reported().contains("device=1"));
-    assert!(!rig.data().join("routed").exists());
+    let spans: Vec<_> = std::fs::read_dir(rig.data().join("routed"))
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(spans.len(), 1);
+    assert!(spans[0].contains("\"end_ms\":"), "{}", spans[0]);
+    assert!(!spans[0].contains("\"end_ms\":null"), "{}", spans[0]);
 }
 
 #[test]
@@ -897,7 +917,12 @@ fn a_managed_on_routes_desktop_and_refuses_to_take_it_back() {
     let status = run(rig.dense().args(["claude-desktop", "status"]));
     assert!(!stream(&status).contains("watcher: disabled"));
 
-    for args in [&["claude-desktop", "uninstall"][..], &["unpersist"][..]] {
+    let undo: [&[&str]; 3] = [
+        &["claude-desktop", "uninstall"],
+        &["unpersist"],
+        &["daemon", "uninstall"],
+    ];
+    for args in undo {
         let out = run(rig.dense().args(args));
         assert!(!out.status.success(), "{args:?} ran on a managed device");
         assert!(stderr(&out).contains("managed remotely by your organization"));
@@ -923,7 +948,12 @@ fn a_device_the_org_does_not_manage_can_still_undo_routing() {
     rig.log_in();
     rig.reply_to_heartbeats(REGULAR);
     rig.once();
-    for args in [&["claude-desktop", "uninstall"][..], &["unpersist"][..]] {
+    let undo: [&[&str]; 3] = [
+        &["claude-desktop", "uninstall"],
+        &["unpersist"],
+        &["daemon", "uninstall"],
+    ];
+    for args in undo {
         let out = run(rig.dense().args(args));
         assert!(out.status.success(), "{args:?}: {}", stderr(&out));
     }

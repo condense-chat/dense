@@ -1,8 +1,3 @@
-//! Offline usage: while no Condense routing is applied nothing reaches the proxy, so the
-//! daemon reads token counts from Claude Code's local session files
-//! (`<claude home>/projects/**/*.jsonl`) and queues them for upload. Lines
-//! deserialize into [`Line`], which has no field that can hold message content.
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -68,7 +63,6 @@ struct Ctx<'a> {
     bindings: &'a mut Bindings,
     filter: &'a Filter<'a>,
     now_ms: u64,
-    project: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -86,6 +80,7 @@ struct Cursor {
     size: u64,
 }
 
+/// Has no field that can hold message content, so none is ever read.
 #[derive(Deserialize)]
 struct Line {
     cwd: Option<PathBuf>,
@@ -143,9 +138,7 @@ impl Cursors {
             std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
         }
         let body = serde_json::to_vec(self).ctx("serializing session cursors")?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).ctx(format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).ctx(format!("replacing {}", path.display()))
+        crate::atomic::replace(path, &body).ctx(format!("replacing {}", path.display()))
     }
 }
 
@@ -282,10 +275,7 @@ fn remember_dir(cfg: &Config, dir: PathBuf) {
         .map(|p| format!("{p}\n"))
         .collect();
     let path = roots_file(cfg);
-    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = crate::atomic::replace(&path, body.as_bytes()) {
         tracing::debug!("could not remember CLAUDE_CONFIG_DIR: {e}");
     }
 }
@@ -304,15 +294,6 @@ pub fn scan(
     }
     files.sort();
     files.dedup();
-    let project_of = |path: &Path| {
-        roots.iter().find_map(|r| {
-            let rel = path.strip_prefix(r).ok()?;
-            let mut parts = rel.components();
-            let dir = parts.next()?.as_os_str().to_str()?.to_string();
-            parts.next()?;
-            parts.next().is_none().then_some(dir)
-        })
-    };
     let mut out = Vec::new();
     let mut dirty = false;
     let mut live = BTreeSet::new();
@@ -324,7 +305,6 @@ pub fn scan(
             bindings: &mut cursors.bindings,
             filter,
             now_ms,
-            project: project_of(&path),
         };
         let bound = ctx.bindings.len();
         match read_file(&path, cursor, &mut ctx, &mut out) {
@@ -392,12 +372,9 @@ fn handle_line(
     {
         return true;
     }
-    let file_first_ms = *cursor.first_ms.get_or_insert(ts);
     if !cursor.pending.contains_key(&id) {
         let seen = Seen {
             cwd: parsed.cwd.as_deref(),
-            file_first_ms,
-            project: ctx.project.as_deref(),
             session: Some(session.as_str()).filter(|s| !s.is_empty()),
             ts_ms: ts,
         };
@@ -775,6 +752,7 @@ pub(crate) mod tests {
             pid: 1,
             seen_ms: T0 + 100,
             session_id: sid.map(str::to_string),
+            sessions: Vec::new(),
             start_ms: T0 + 10,
         };
         let routed = Routed {
@@ -826,7 +804,7 @@ pub(crate) mod tests {
         let mut got = ids(&got);
         got.sort_unstable();
         assert_eq!(got, ["pin_after", "pin_before", "plain_other", "plain_sub"]);
-        assert_eq!(c.bindings.len(), 2);
+        assert_eq!(c.bindings.len(), 1);
 
         let routed = Routed {
             loaded_ms: T0 + 1_000_000,
@@ -841,7 +819,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn clear_inside_a_pinned_session_is_not_reported() {
+    fn clear_inside_a_routed_session_is_not_reported_but_its_neighbour_is() {
         let fx = Fx::new();
         let mut c = Cursors::default();
         let w = open_from(T0);
@@ -855,6 +833,7 @@ pub(crate) mod tests {
                 pid: 1,
                 seen_ms: T0 + 500,
                 session_id: Some("X".into()),
+                sessions: vec!["Y".into()],
                 start_ms: T0 + 10,
             }],
         };
@@ -877,12 +856,18 @@ pub(crate) mod tests {
             "-w-elsewhere/Z.jsonl",
             &line("plain", T0 + 30, "Z", "/w/elsewhere"),
         );
+        fx.append(
+            "-w-routed/W.jsonl",
+            &line("plain_beside", T0 + 40, "W", "/w/routed"),
+        );
         let f = Filter {
             routed: &routed,
             windows: &w,
         };
         let (got, _) = scan(std::slice::from_ref(&fx.root), &mut c, &f, T0 + 600);
-        assert_eq!(ids(&got), ["plain"]);
+        let mut got = ids(&got);
+        got.sort_unstable();
+        assert_eq!(got, ["plain", "plain_beside"]);
     }
 
     #[test]

@@ -163,8 +163,15 @@ impl Api {
     fn build(base: &str, headers: HeaderMap) -> Result<Self> {
         let base = base.trim_end_matches('/');
         reqwest::Url::parse(base).ctx("invalid api url")?;
+        // reqwest only strips its own auth headers on a redirect, never ours.
+        let redirects = if headers.is_empty() {
+            reqwest::redirect::Policy::default()
+        } else {
+            reqwest::redirect::Policy::none()
+        };
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .redirect(redirects)
             .timeout(DEFAULT_TIMEOUT)
             .user_agent(concat!("dense/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -203,7 +210,50 @@ fn creds_headers(creds: &Creds) -> Result<HeaderMap> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+
     use super::*;
+
+    /// One reply of 302 to `to`, for a client to follow or not.
+    fn redirecting_to(to: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 302 Found\r\nlocation: {to}/stolen\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 4096]).unwrap();
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_client_with_credentials_stops_at_a_redirect() {
+        let (other, rx) = crate::daemon::managed::tests::serve(200, "{}");
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), &redirecting_to(&other));
+        let creds = Creds {
+            token: Some("secret".into()),
+            user_id: None,
+        };
+        let api = Api::authed(&cfg, &creds).unwrap();
+        assert_eq!(api.status_of("/v1/me", Duration::from_secs(5)).await, 302);
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_client_still_follows_one() {
+        let (other, rx) = crate::daemon::managed::tests::serve(200, "{}");
+        let api = Api::anonymous(&redirecting_to(&other)).unwrap();
+        assert_eq!(api.status_of("/release", Duration::from_secs(5)).await, 200);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .contains("/stolen")
+        );
+    }
 
     #[test]
     fn url_keeps_base_path() {

@@ -1,7 +1,3 @@
-//! Apply the admin's on/off switch: on is `dense persist`, off is `dense
-//! unpersist`, both through the persist module's own functions. Idempotent —
-//! a tick that finds the machine already in the wanted state writes nothing.
-
 use serde::{Deserialize, Serialize};
 
 use crate::Result;

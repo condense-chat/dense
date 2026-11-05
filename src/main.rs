@@ -2,6 +2,7 @@
 //! the work, and renders any error via color-eyre.
 
 mod api;
+mod atomic;
 mod cli;
 mod config;
 mod daemon;
@@ -73,7 +74,7 @@ async fn main() -> EyreResult<()> {
             daemon::install(&cfg).and_then(|()| desktop::keep_daemon(&cfg))
         }
         Command::Daemon(DaemonCommand::Run { once }) => daemon::run(&cfg, once).await,
-        Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg).await,
+        Command::Daemon(DaemonCommand::Uninstall) => daemon::uninstall(&cfg),
         Command::Codex { args } => harness::codex::run(&cfg, &args).await,
         Command::Login => match auth::login(&cfg).await {
             Ok(()) => {

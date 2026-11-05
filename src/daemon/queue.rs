@@ -1,9 +1,3 @@
-//! The offline usage queue: an append-only JSONL file under the daemon dir,
-//! capped at [`MAX_RECORDS`] (oldest dropped first), drained to
-//! `POST /v1/devices/usage` in batches of [`BATCH`]. The server dedupes on
-//! `(device_id, message_id)`, so a batch resent after a crash is harmless; a
-//! batch it rejects outright (non-retryable 4xx) is dropped, not retried.
-
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -12,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::api::Api;
-use crate::api::devices::{self, DEVICE_OWNED_ELSEWHERE, DEVICE_UNKNOWN, Rejection, Reply};
+use crate::api::devices::{self, Rejection, Reply};
 use crate::config::Config;
 use crate::error::Context;
 
@@ -23,13 +17,13 @@ pub const MAX_RECORDS: usize = 20_000;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Flushed {
-    /// Records in batches the server rejected for good.
+    /// Records in batches the server could not take as sent (400, 413, 422).
     pub dropped: usize,
     /// Stopped at [`MAX_BATCHES`] with records still queued.
     pub more: bool,
     pub sent: usize,
-    /// The drain stopped on a refusal of the device itself (unknown, or bound
-    /// to another user); the batch stays queued for after a heartbeat.
+    /// The drain stopped on any other refusal (the device, the login, a
+    /// proxy); the batch stays queued for a later tick.
     pub stalled: Option<Rejection>,
 }
 
@@ -107,11 +101,6 @@ impl Queue {
         Ok(())
     }
 
-    fn drop_front(&self, n: usize) -> Result<()> {
-        let lines = self.lines();
-        self.rewrite(&lines[n.min(lines.len())..])
-    }
-
     fn lines(&self) -> Vec<String> {
         std::fs::read_to_string(&self.path)
             .map(|s| {
@@ -123,65 +112,68 @@ impl Queue {
             .unwrap_or_default()
     }
 
-    /// The next up-to-`n` queued lines: the records that parse, and how many
-    /// lines were consumed (a corrupt line is skipped, then dropped with them).
-    fn peek(&self, n: usize) -> (Vec<UsageRecord>, usize) {
-        let lines = self.lines();
-        let take = n.min(lines.len());
-        let records = lines[..take]
-            .iter()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        (records, take)
-    }
-
     fn rewrite(&self, lines: &[String]) -> Result<()> {
-        let tmp = self.path.with_extension("jsonl.tmp");
         let mut body = lines.join("\n");
         if !body.is_empty() {
             body.push('\n');
         }
-        std::fs::write(&tmp, body).ctx(format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).ctx(format!("replacing {}", self.path.display()))
+        crate::atomic::replace(&self.path, body.as_bytes())
+            .ctx(format!("replacing {}", self.path.display()))
     }
 }
 
-/// Drain the queue through `send`, one [`BATCH`] at a time. A batch leaves
-/// the queue once `send` returns `Ok` — accepted, or rejected for good — and
-/// stays (stopping the drain) on `Err` or a device-level refusal.
+/// Drain the queue through `send`, one [`BATCH`] at a time, reading the file
+/// once and rewriting it once. The server dedupes on `(device_id,
+/// message_id)`, so a batch resent after a crash is harmless. A batch leaves
+/// the queue once accepted or refused as malformed; any other refusal or an
+/// `Err` stops the drain with it still queued.
 pub async fn flush<F, Fut>(queue: &Queue, mut send: F) -> Result<Flushed>
 where
     F: FnMut(Vec<UsageRecord>) -> Fut,
     Fut: Future<Output = Result<Reply<()>>>,
 {
+    let lines = queue.lines();
     let mut out = Flushed::default();
-    for _ in 0..MAX_BATCHES {
-        let (records, consumed) = queue.peek(BATCH);
-        if consumed == 0 {
-            return Ok(out);
-        }
+    let mut done = 0;
+    let mut failed = None;
+    for chunk in lines.chunks(BATCH).take(MAX_BATCHES) {
+        // A corrupt line is skipped, then dropped with its batch.
+        let records: Vec<UsageRecord> = chunk
+            .iter()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
         let count = records.len();
         let reply = if count > 0 {
-            send(records).await?
+            match send(records).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
         } else {
             Reply::Ok(())
         };
-        if let Reply::Rejected(r) = &reply
-            && (r.is(DEVICE_UNKNOWN) || r.is(DEVICE_OWNED_ELSEWHERE))
-        {
-            out.stalled = Some(r.clone());
-            return Ok(out);
-        }
-        queue.drop_front(consumed)?;
         match reply {
             Reply::Ok(()) => out.sent += count,
-            Reply::Rejected(r) => {
+            Reply::Rejected(r) if malformed(&r) => {
                 tracing::warn!("server rejected {count} usage records ({r}); dropped them");
                 out.dropped += count;
             }
+            Reply::Rejected(r) => {
+                out.stalled = Some(r);
+                break;
+            }
         }
+        done += chunk.len();
     }
-    out.more = queue.peek(1).1 > 0;
+    if done > 0 {
+        queue.rewrite(&lines[done..])?;
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    out.more = out.stalled.is_none() && lines.len() > done;
     Ok(out)
 }
 
@@ -211,10 +203,20 @@ fn ends_with_newline(file: &mut std::fs::File) -> bool {
     }
 }
 
+/// A batch the server can't take as sent; resending it unchanged never helps.
+fn malformed(r: &Rejection) -> bool {
+    matches!(r.status, 400 | 413 | 422)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::devices::{DEVICE_OWNED_ELSEWHERE, DEVICE_UNKNOWN};
     use crate::error::Error;
+
+    fn head(q: &Queue) -> UsageRecord {
+        serde_json::from_str(&q.lines()[0]).unwrap()
+    }
 
     fn record(i: usize) -> UsageRecord {
         UsageRecord {
@@ -240,8 +242,7 @@ mod tests {
         q.push(&records(0..8)).unwrap();
         q.push(&records(8..15)).unwrap();
         assert_eq!(q.len(), 10);
-        let (head, _) = q.peek(1);
-        assert_eq!(head[0].message_id, "msg_5");
+        assert_eq!(head(&q).message_id, "msg_5");
     }
 
     #[tokio::test]
@@ -295,8 +296,7 @@ mod tests {
         .await;
         assert!(res.is_err());
         assert_eq!(q.len(), 200);
-        let (head, _) = q.peek(1);
-        assert_eq!(head[0].message_id, "msg_500");
+        assert_eq!(head(&q).message_id, "msg_500");
     }
 
     #[tokio::test]
@@ -368,6 +368,41 @@ mod tests {
                 stalled: None
             }
         );
+        assert_eq!(q.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_or_a_proxy_404_keeps_the_batch_queued() {
+        for status in [401, 403, 404] {
+            let dir = tempfile::tempdir().unwrap();
+            let q = Queue::at(dir.path().join("q.jsonl"), 5_000);
+            q.push(&records(0..700)).unwrap();
+            let out = flush(&q, |_| async move {
+                Ok(Reply::Rejected(Rejection::new(status, None)))
+            })
+            .await
+            .unwrap();
+            assert_eq!((out.sent, out.dropped), (0, 0), "{status}");
+            assert!(out.stalled.is_some() && !out.more);
+            assert_eq!(q.len(), 700);
+        }
+    }
+
+    #[tokio::test]
+    async fn one_flush_reads_and_rewrites_the_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let q = Queue::at(path.clone(), 5_000);
+        q.push(&records(0..1_234)).unwrap();
+        let mut seen = Vec::new();
+        flush(&q, |_| {
+            // Unchanged until the drain ends: nothing rewrote it between batches.
+            seen.push(std::fs::read_to_string(&path).unwrap().lines().count());
+            async move { Ok(Reply::Ok(())) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, vec![1_234, 1_234, 1_234]);
         assert_eq!(q.len(), 0);
     }
 

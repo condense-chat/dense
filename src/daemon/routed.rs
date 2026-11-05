@@ -1,13 +1,7 @@
-//! Spans in which `dense claude` routed a Claude Code process through the
-//! proxy. The proxy already reports that usage, so the session reader skips
-//! those sessions' lines inside the span. One file per launch under
-//! `<data dir>/routed/`, shared by every profile since one daemon serves the
-//! machine. The launcher refreshes `seen_ms` while alive, so a crashed
-//! launcher's span ends at its last refresh plus [`LEASE_MS`].
-
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,10 +10,11 @@ use crate::config::Config;
 /// A line dated further ahead than this is judged now instead of deferred.
 pub const FUTURE_MS: u64 = 10 * 60 * 1_000;
 pub const LEASE_MS: u64 = 2 * 60 * 1_000;
+/// How often a span re-reads which session its Claude Code process is on.
+const ID_POLL: Duration = Duration::from_secs(2);
 const MAX_BINDINGS: usize = 1_024;
-const MAX_PROJECTS: usize = 8;
-/// Claude Code's project-dir slug keeps this many characters before hashing.
-const SLUG_MAX: usize = 200;
+const MAX_ID_LEN: usize = 256;
+const MAX_SESSIONS: usize = 64;
 const MAX_SPANS: usize = 1_024;
 const REFRESH: Duration = Duration::from_secs(30);
 const RETENTION_MS: u64 = 35 * 24 * 3_600 * 1_000;
@@ -49,14 +44,12 @@ const SUBCOMMANDS: &[&str] = &[
     "upgrade",
 ];
 
-/// Which Claude Code session a `dense claude` launch runs.
+/// Which Claude Code session a `dense claude` launch runs, when its argv says.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pin {
-    /// None named: pass `--session-id <uuid>` so the reader can match on it.
-    Inject(String),
     /// The user named it (`--session-id`, `--resume <uuid>`).
     Known(String),
-    /// `--continue`, the resume picker, teleport: bound by the launch cwd instead.
+    /// New, `--continue`, the resume picker, teleport: learned from the process.
     Unknown,
 }
 
@@ -67,13 +60,10 @@ pub enum Verdict {
     Skip,
 }
 
-/// Sessions bound to a span they were not pinned to (an unpinned launch's
-/// session, or a new session a `/clear` started inside a span), and the
-/// project dirs each span's sessions were seen in. Persisted with the cursors.
+/// Sessions bound by launch folder to a span that never learned its session
+/// ids (a Claude Code too old to publish them). Persisted with the cursors.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Bindings {
-    #[serde(default)]
-    projects: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     sessions: BTreeMap<String, Bound>,
 }
@@ -89,7 +79,8 @@ struct Bound {
 pub struct Guard {
     path: PathBuf,
     refresh: tokio::task::JoinHandle<()>,
-    span: Span,
+    session_file: Option<PathBuf>,
+    span: Arc<Mutex<Span>>,
 }
 
 #[derive(Debug)]
@@ -105,10 +96,6 @@ pub struct Routed {
 /// One assistant line as the span judge sees it.
 pub struct Seen<'a> {
     pub cwd: Option<&'a Path>,
-    /// Timestamp of the first assistant line of the file this line is in.
-    pub file_first_ms: u64,
-    /// `projects/<dir>` of a top-level session file (not a subagent's).
-    pub project: Option<&'a str>,
     pub session: Option<&'a str>,
     pub ts_ms: u64,
 }
@@ -123,16 +110,22 @@ pub struct Span {
     pub seen_ms: u64,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Session ids the launched process was seen on (`/clear` starts another).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
     pub start_ms: u64,
 }
 
-impl Bindings {
-    fn has_project(&self, span: &str, project: &str) -> bool {
-        self.projects.get(span).is_some_and(|s| s.contains(project))
-    }
+/// Claude Code's `<claude home>/sessions/<pid>.json`, as far as a span reads it.
+#[derive(Deserialize)]
+struct LiveSession {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
 
+impl Bindings {
     pub fn len(&self) -> usize {
-        self.sessions.len() + self.projects.values().map(BTreeSet::len).sum::<usize>()
+        self.sessions.len()
     }
 
     /// Drop bindings to spans that were pruned. Returns whether any went.
@@ -143,7 +136,6 @@ impl Bindings {
         let before = self.len();
         let known = |id: &String| routed.spans.iter().any(|s| &s.id == id);
         self.sessions.retain(|_, b| known(&b.span));
-        self.projects.retain(|id, _| known(id));
         self.len() != before
     }
 
@@ -167,17 +159,12 @@ impl Bindings {
             self.sessions.remove(&oldest);
         }
     }
-
-    fn note_project(&mut self, span: &str, project: &str) {
-        let set = self.projects.entry(span.to_string()).or_default();
-        if set.len() < MAX_PROJECTS {
-            set.insert(project.to_string());
-        }
-    }
 }
 
 impl Guard {
-    pub fn open(cfg: &Config, session_id: Option<String>) -> Option<Self> {
+    /// Open a span for `child`, the Claude Code process just launched, after
+    /// the spawn so its pid can be followed.
+    pub fn open(cfg: &Config, session_id: Option<String>, child: Option<u32>) -> Option<Self> {
         let cwd = std::env::current_dir().ok()?;
         let now = now_ms();
         let id = uuid::Uuid::new_v4().to_string();
@@ -190,36 +177,60 @@ impl Guard {
             pid: std::process::id(),
             seen_ms: now,
             session_id,
+            sessions: Vec::new(),
             start_ms: now,
         };
         if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| write(&path, &span)) {
             tracing::debug!("could not record routed span: {e}");
             return None;
         }
+        let session_file = child.map(|pid| {
+            crate::harness::commands::claude_home(cfg.home(), |k| std::env::var(k).ok())
+                .join("sessions")
+                .join(format!("{pid}.json"))
+        });
+        let span = Arc::new(Mutex::new(span));
         let refresh = {
-            let (path, mut span) = (path.clone(), span.clone());
+            let (path, span, file) = (path.clone(), Arc::clone(&span), session_file.clone());
             tokio::spawn(async move {
+                let mut written = Instant::now();
                 loop {
-                    tokio::time::sleep(REFRESH).await;
-                    span.seen_ms = now_ms();
-                    let _ = write(&path, &span);
+                    tokio::time::sleep(ID_POLL).await;
+                    let mut span = lock(&span);
+                    let learned = file.as_deref().is_some_and(|f| learn(&mut span, f));
+                    if learned || written.elapsed() >= REFRESH {
+                        span.seen_ms = now_ms();
+                        let _ = write(&path, &span);
+                        written = Instant::now();
+                    }
                 }
             })
         };
         Some(Self {
             path,
             refresh,
+            session_file,
             span,
         })
     }
 
-    pub async fn close(mut self) {
-        self.refresh.abort();
-        let _ = (&mut self.refresh).await;
+    pub async fn close(self) {
+        let Self {
+            path,
+            refresh,
+            session_file,
+            span,
+        } = self;
+        refresh.abort();
+        let _ = refresh.await;
+        let mut span = lock(&span);
+        if let Some(f) = &session_file {
+            learn(&mut span, f);
+        }
         let now = now_ms();
-        self.span.seen_ms = now;
-        self.span.end_ms = Some(now);
-        let _ = write(&self.path, &self.span);
+        span.seen_ms = now;
+        span.end_ms = Some(now);
+        let _ = write(&path, &span);
     }
 }
 
@@ -263,12 +274,10 @@ impl Pin {
                 _ => {}
             }
         }
-        // Claude accepts `--session-id` with `--resume`/`--continue` only for a fork.
+        // A fork runs under a new id, learned from the process like any other.
         match resume {
-            _ if unknown || (picker && !fork) => Self::Unknown,
-            Some(_) if fork => Self::Inject(uuid::Uuid::new_v4().to_string()),
-            Some(v) => Self::Known(v),
-            None => Self::Inject(uuid::Uuid::new_v4().to_string()),
+            Some(v) if !(unknown || picker || fork) => Self::Known(v),
+            _ => Self::Unknown,
         }
     }
 }
@@ -367,16 +376,11 @@ impl Routed {
         let owners: Vec<&Span> = self
             .spans
             .iter()
-            .filter(|s| s.session_id.as_deref() == Some(session) || bound.as_ref() == Some(&s.id))
+            .filter(|s| s.names(session) || bound.as_ref() == Some(&s.id))
             .collect();
         for s in &owners {
             match s.judge(ts_ms, now_ms) {
-                Verdict::Skip => {
-                    if let Some(p) = line.project {
-                        bindings.note_project(&s.id, p);
-                    }
-                    return Verdict::Skip;
-                }
+                Verdict::Skip => return Verdict::Skip,
                 Verdict::Defer => verdict = Verdict::Defer,
                 Verdict::Report => {}
             }
@@ -384,36 +388,18 @@ impl Routed {
         if bound.is_some() || !owners.is_empty() || !matches!(verdict, Verdict::Report) {
             return verdict;
         }
-        // A session born inside a span in that span's project dir: `/clear`
-        // (or plan mode's clear) gave the routed process a new session id.
-        if let Some(project) = line.project {
-            for s in &self.spans {
-                let has_session =
-                    s.session_id.is_some() || bindings.sessions.values().any(|b| b.span == s.id);
-                if !has_session
-                    || line.file_first_ms < s.start_ms
-                    || !(s.project_matches(project) || bindings.has_project(&s.id, project))
-                {
-                    continue;
-                }
-                match s.judge(line.file_first_ms, now_ms) {
-                    Verdict::Skip => {
-                        bindings.bind(session, &s.id, ts_ms);
-                        return s.judge(ts_ms, now_ms);
-                    }
-                    Verdict::Defer => verdict = Verdict::Defer,
-                    Verdict::Report => {}
-                }
-            }
+        if self.spans.iter().any(|s| s.may_name(ts_ms, now_ms)) {
+            return Verdict::Defer;
         }
+        // A Claude Code that publishes no session ids: bound by launch folder.
         let Some(cwd) = line.cwd else {
             return verdict;
         };
-        let unpinned = self
+        let blind = self
             .spans
             .iter()
-            .filter(|s| s.session_id.is_none() && same_path(&s.cwd, cwd));
-        for s in unpinned {
+            .filter(|s| s.knows_no_session() && same_path(&s.cwd, cwd));
+        for s in blind {
             match s.judge(ts_ms, now_ms) {
                 Verdict::Skip => {
                     bindings.bind(session, &s.id, ts_ms);
@@ -433,22 +419,21 @@ impl Span {
             .unwrap_or_else(|| self.seen_ms.saturating_add(LEASE_MS))
     }
 
-    /// Whether `project` is Claude Code's `projects/<dir>` for the launch cwd.
-    fn project_matches(&self, project: &str) -> bool {
-        let slug = slug(&self.cwd.to_string_lossy());
-        let fold = |s: &str| {
-            if cfg!(any(windows, target_os = "macos")) {
-                s.to_lowercase()
-            } else {
-                s.to_string()
-            }
-        };
-        let (slug, project) = (fold(&slug), fold(project));
-        if slug.len() <= SLUG_MAX {
-            slug == project
-        } else {
-            project.starts_with(&format!("{}-", &slug[..SLUG_MAX]))
-        }
+    /// Open, and its last refresh is older than the line: the process may
+    /// yet report it was on that line's session.
+    fn may_name(&self, ts_ms: u64, now_ms: u64) -> bool {
+        self.end_ms.is_none()
+            && self.start_ms <= ts_ms
+            && self.seen_ms <= ts_ms
+            && now_ms < self.seen_ms.saturating_add(LEASE_MS)
+    }
+
+    fn knows_no_session(&self) -> bool {
+        self.session_id.is_none() && self.sessions.is_empty()
+    }
+
+    fn names(&self, session: &str) -> bool {
+        self.session_id.as_deref() == Some(session) || self.sessions.iter().any(|s| s == session)
     }
 
     /// Open spans past their lease wait until a refresh could have landed
@@ -468,8 +453,30 @@ impl Span {
     }
 }
 
+/// Machine-wide, not per profile: one daemon reads every profile's spans.
 fn dir(cfg: &Config) -> PathBuf {
     cfg.data_dir().join("routed")
+}
+
+/// Note the session `file` names now. Returns whether it is a new one.
+fn learn(span: &mut Span, file: &Path) -> bool {
+    let id = std::fs::read(file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<LiveSession>(&b).ok())
+        .map(|l| l.session_id);
+    match id {
+        Some(id)
+            if id.len() <= MAX_ID_LEN && !span.names(&id) && span.sessions.len() < MAX_SESSIONS =>
+        {
+            span.sessions.push(id);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn lock(span: &Mutex<Span>) -> MutexGuard<'_, Span> {
+    span.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn now_ms() -> u64 {
@@ -489,19 +496,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Claude Code's project-dir name for a cwd: every UTF-16 unit that is not
 /// ASCII alphanumeric becomes `-` (longer names are cut and hashed).
-fn slug(cwd: &str) -> String {
-    cwd.chars()
-        .flat_map(|c| {
-            let n = if c.is_ascii_alphanumeric() {
-                0
-            } else {
-                c.len_utf16()
-            };
-            std::iter::repeat_n('-', n).chain((n == 0).then_some(c))
-        })
-        .collect()
-}
-
 fn sweep_stale_tmp(path: &Path) {
     let old = std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -514,14 +508,10 @@ fn sweep_stale_tmp(path: &Path) {
 }
 
 fn write(path: &Path, span: &Span) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(span).map_err(std::io::Error::other)?,
-    )?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::atomic::replace(
+        path,
+        &serde_json::to_vec(span).map_err(std::io::Error::other)?,
+    )
 }
 
 #[cfg(test)]
@@ -538,7 +528,15 @@ mod tests {
             pid: 1,
             seen_ms: seen,
             session_id: sid.map(str::to_string),
+            sessions: Vec::new(),
             start_ms: start,
+        }
+    }
+
+    fn learned(id: &str, sessions: &[&str], start: u64, seen: u64, end: Option<u64>) -> Span {
+        Span {
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+            ..span(id, None, start, seen, end)
         }
     }
 
@@ -550,17 +548,9 @@ mod tests {
         }
     }
 
-    fn seen<'a>(
-        sid: &'a str,
-        cwd: &'a str,
-        project: Option<&'a str>,
-        first: u64,
-        ts: u64,
-    ) -> Seen<'a> {
+    fn seen<'a>(sid: &'a str, cwd: &'a str, ts: u64) -> Seen<'a> {
         Seen {
             cwd: Some(Path::new(cwd)),
-            file_first_ms: first,
-            project,
             session: Some(sid),
             ts_ms: ts,
         }
@@ -579,11 +569,11 @@ mod tests {
     }
 
     fn v(r: &Routed, b: &mut Bindings, sid: &str, cwd: &str, ts: u64, now: u64) -> &'static str {
-        name(r.judge(b, &seen(sid, cwd, None, ts, ts), now))
+        name(r.judge(b, &seen(sid, cwd, ts), now))
     }
 
     #[test]
-    fn a_resume_hidden_in_a_short_flag_is_never_given_a_session_id() {
+    fn a_resume_hidden_in_a_short_flag_is_not_taken_as_a_session_id() {
         for flags in [
             &["-cp", "hi"][..],
             &["-pc", "hi"],
@@ -598,8 +588,8 @@ mod tests {
 
     #[test]
     fn pin_reads_session_flags() {
-        assert!(matches!(Pin::of(&args(&[])), Pin::Inject(_)));
-        assert!(matches!(Pin::of(&args(&["-p", "hi"])), Pin::Inject(_)));
+        assert_eq!(Pin::of(&args(&[])), Pin::Unknown);
+        assert_eq!(Pin::of(&args(&["-p", "hi"])), Pin::Unknown);
         assert_eq!(Pin::of(&args(&["--session-id", U])), Pin::Known(U.into()));
         assert_eq!(
             Pin::of(&args(&[&format!("--session-id={U}")])),
@@ -609,20 +599,9 @@ mod tests {
         assert_eq!(Pin::of(&args(&["--resume"])), Pin::Unknown);
         assert_eq!(Pin::of(&args(&["--resume", "search"])), Pin::Unknown);
         assert_eq!(Pin::of(&args(&["-c"])), Pin::Unknown);
-        assert!(matches!(
-            Pin::of(&args(&["-r", U, "--fork-session"])),
-            Pin::Inject(_)
-        ));
-        assert!(matches!(
-            Pin::of(&args(&["--continue", "--fork-session"])),
-            Pin::Inject(_)
-        ));
-        assert!(matches!(
-            Pin::of(&args(&["--resume", "--fork-session"])),
-            Pin::Inject(_)
-        ));
+        assert_eq!(Pin::of(&args(&["-r", U, "--fork-session"])), Pin::Unknown);
         assert_eq!(Pin::of(&args(&["mcp", "list"])), Pin::Unknown);
-        assert!(matches!(Pin::of(&args(&["--", "-c"])), Pin::Inject(_)));
+        assert_eq!(Pin::of(&args(&["--", "-c"])), Pin::Unknown);
     }
 
     #[test]
@@ -639,7 +618,37 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_span_binds_its_session_by_exact_cwd() {
+    fn a_clear_is_skipped_by_the_session_id_the_process_reported() {
+        let r = routed(vec![learned("a", &["S", "Y"], 100, 500, Some(1_000))]);
+        let mut b = Bindings::default();
+        assert_eq!(
+            v(&r, &mut b, "Y", "/somewhere/after/cd", 300, 2_000),
+            "skip"
+        );
+        assert_eq!(v(&r, &mut b, "Y", "/w/proj", 1_200, 2_000), "report");
+    }
+
+    #[test]
+    fn plain_claude_in_the_same_folder_during_a_span_is_reported() {
+        let r = routed(vec![learned("a", &["S"], 100, 500, Some(1_000))]);
+        let mut b = Bindings::default();
+        assert_eq!(v(&r, &mut b, "P", "/w/proj", 300, 2_000), "report");
+        assert_eq!(b.len(), 0);
+        let pinned = routed(vec![span("a", Some("S"), 100, 500, Some(1_000))]);
+        assert_eq!(v(&pinned, &mut b, "P", "/w/proj", 300, 2_000), "report");
+    }
+
+    #[test]
+    fn an_unknown_session_waits_until_an_open_span_has_reported_past_it() {
+        let r = routed(vec![learned("a", &["S"], 100, 500, None)]);
+        let mut b = Bindings::default();
+        assert_eq!(v(&r, &mut b, "P", "/w/proj", 600, 700), "defer");
+        assert_eq!(v(&r, &mut b, "P", "/w/proj", 400, 700), "report");
+        assert_eq!(v(&r, &mut b, "P", "/w/proj", 600, 500 + LEASE_MS), "report");
+    }
+
+    #[test]
+    fn a_span_that_never_learned_a_session_binds_by_exact_cwd() {
         let r = routed(vec![span("a", None, 100, 150, Some(200))]);
         let mut b = Bindings::default();
         assert_eq!(v(&r, &mut b, "P", "/w/proj/sub", 120, 1_000), "report");
@@ -664,65 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_inside_a_pinned_span_binds_the_new_session_by_project() {
-        let r = routed(vec![span("a", Some("S"), 100, 500, Some(1_000))]);
-        let mut b = Bindings::default();
-        let proj = Some("-w-proj");
-        let at = |sid, project, first, ts| seen(sid, "/w/proj", project, first, ts);
-        assert_eq!(
-            name(r.judge(&mut b, &at("Y", proj, 300, 300), 2_000)),
-            "skip"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &at("Y", proj, 300, 900), 2_000)),
-            "skip"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &at("Y", proj, 300, 1_200), 2_000)),
-            "report"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &at("Z", Some("-w-other"), 300, 300), 2_000)),
-            "report"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &at("Q", proj, 50, 300), 2_000)),
-            "report"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &at("Q", None, 300, 300), 2_000)),
-            "report"
-        );
-    }
-
-    #[test]
-    fn clear_after_a_cd_binds_by_a_project_the_span_was_seen_in() {
-        let r = routed(vec![span("a", Some("S"), 100, 500, Some(1_000))]);
-        let mut b = Bindings::default();
-        let elsewhere = |sid, first, ts| seen(sid, "/x", Some("-x"), first, ts);
-        assert_eq!(
-            name(r.judge(&mut b, &elsewhere("Y", 300, 300), 2_000)),
-            "report"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &elsewhere("S", 150, 150), 2_000)),
-            "skip"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &elsewhere("Y2", 400, 400), 2_000)),
-            "skip"
-        );
-    }
-
-    #[test]
-    fn plain_claude_started_in_the_project_before_the_span_is_reported() {
-        let r = routed(vec![span("a", Some("S"), 100, 500, Some(1_000))]);
-        let mut b = Bindings::default();
-        let line = seen("P", "/w/proj", Some("-w-proj"), 90, 300);
-        assert_eq!(name(r.judge(&mut b, &line, 2_000)), "report");
-    }
-
-    #[test]
     fn far_future_lines_are_judged_now() {
         let r = Routed {
             complete: true,
@@ -731,18 +681,9 @@ mod tests {
         };
         let mut b = Bindings::default();
         let far = 1_000 + FUTURE_MS + 1;
-        assert_eq!(
-            name(r.judge(&mut b, &seen("P", "/w", None, far, far), 1_000)),
-            "report"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &seen("S", "/w", None, far, far), 1_000)),
-            "report"
-        );
-        assert_eq!(
-            name(r.judge(&mut b, &seen("P", "/w", None, 1_500, 1_500), 1_000)),
-            "defer"
-        );
+        assert_eq!(v(&r, &mut b, "P", "/w", far, 1_000), "report");
+        assert_eq!(v(&r, &mut b, "S", "/w", far, 1_000), "report");
+        assert_eq!(v(&r, &mut b, "P", "/w", 1_500, 1_000), "defer");
     }
 
     #[test]
@@ -761,21 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn slug_matches_claude_project_dirs() {
-        assert_eq!(slug("/home/u/src/my.repo"), "-home-u-src-my-repo");
-        assert_eq!(slug("C:\\Users\\u"), "C--Users-u");
-        assert_eq!(slug("/tmp/é"), "-tmp--");
-        let long = format!("/{}", "a".repeat(300));
-        let s = span("a", Some("S"), 0, 0, None);
-        let s = Span {
-            cwd: long.clone().into(),
-            ..s
-        };
-        assert!(s.project_matches(&format!("-{}-1abc", "a".repeat(SLUG_MAX - 1))));
-        assert!(!s.project_matches("-aaa"));
-    }
-
-    #[test]
     fn lines_newer_than_the_snapshot_defer() {
         let r = Routed {
             complete: true,
@@ -789,6 +715,28 @@ mod tests {
             v(&r, &mut b, "S", "/w", 5_000_000 + LEASE_MS, 5_000_000),
             "defer"
         );
+    }
+
+    #[test]
+    fn learn_records_each_new_session_once_and_ignores_junk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("42.json");
+        let mut s = span("a", Some("S"), 0, 0, None);
+        assert!(!learn(&mut s, &f));
+        std::fs::write(&f, r#"{"pid":42,"sessionId":"S"}"#).unwrap();
+        assert!(!learn(&mut s, &f));
+        std::fs::write(&f, r#"{"pid":42,"sessionId":"Y","peerToken":"x"}"#).unwrap();
+        assert!(learn(&mut s, &f));
+        assert!(!learn(&mut s, &f));
+        std::fs::write(
+            &f,
+            format!(r#"{{"sessionId":"{}"}}"#, "x".repeat(MAX_ID_LEN + 1)),
+        )
+        .unwrap();
+        assert!(!learn(&mut s, &f));
+        std::fs::write(&f, b"{").unwrap();
+        assert!(!learn(&mut s, &f));
+        assert_eq!(s.sessions, ["Y"]);
     }
 
     #[test]
@@ -820,33 +768,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn span_from_any_profile_reaches_the_machine_daemon() {
+    async fn a_span_follows_its_process_through_a_clear() {
         let tmp = tempfile::tempdir().unwrap();
         let daemon = Config::for_test(tmp.path(), "http://127.0.0.1:9");
         let other = Config::for_test(tmp.path(), "http://127.0.0.2:9");
         assert_ne!(daemon.profile(), other.profile());
-        let guard = Guard::open(&other, Some("S".into())).unwrap();
-        let now = now_ms();
-        let mut r = Routed::load_and_prune(&daemon, now);
-        r.loaded_ms = u64::MAX;
-        let mut b = Bindings::default();
-        assert!(matches!(
-            r.judge(
-                &mut b,
-                &Seen {
-                    cwd: None,
-                    file_first_ms: now,
-                    project: None,
-                    session: Some("S"),
-                    ts_ms: now,
-                },
-                now
-            ),
-            Verdict::Skip
-        ));
+        let sessions = tmp.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let live = sessions.join("4242.json");
+        std::fs::write(&live, r#"{"pid":4242,"sessionId":"S"}"#).unwrap();
+        let guard = Guard::open(&other, None, Some(4242)).unwrap();
+        tokio::time::sleep(ID_POLL + Duration::from_millis(500)).await;
+        std::fs::write(&live, r#"{"pid":4242,"sessionId":"Y"}"#).unwrap();
         guard.close().await;
         let r = Routed::load_and_prune(&daemon, now_ms());
         assert_eq!(r.spans.len(), 1);
         assert!(r.spans[0].end_ms.is_some());
+        assert_eq!(r.spans[0].sessions, ["S", "Y"]);
+        let at = r.spans[0].start_ms;
+        let mut b = Bindings::default();
+        assert_eq!(v(&r, &mut b, "Y", "/x", at, at + LEASE_MS * 2), "skip");
+        assert_eq!(v(&r, &mut b, "P", "/x", at, at + LEASE_MS * 2), "report");
     }
 }

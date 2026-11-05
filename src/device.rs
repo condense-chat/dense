@@ -1,6 +1,3 @@
-//! This machine's condense device identity: a UUIDv4 generated once and kept
-//! at `<cred_dir>/device`, sent as `x-condense-device-id` on every request.
-
 use crate::Result;
 use crate::config::Config;
 use crate::error::Context;
@@ -21,7 +18,7 @@ pub fn id(cfg: &Config) -> Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), id));
+    let tmp = crate::atomic::temp_beside(&path);
     write_private(&tmp, &format!("{id}\n"))?;
     // Hard-link, not rename: two first runs racing keep one id, never two.
     let mut linked = std::fs::hard_link(&tmp, &path);
@@ -51,9 +48,13 @@ pub fn regenerate(cfg: &Config) -> Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ctx(format!("creating {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    write_private(&tmp, &format!("{id}\n"))?;
-    std::fs::rename(&tmp, &path).ctx(format!("replacing {}", path.display()))?;
+    let tmp = crate::atomic::temp_beside(&path);
+    let written = write_private(&tmp, &format!("{id}\n"))
+        .and_then(|()| std::fs::rename(&tmp, &path).ctx(format!("replacing {}", path.display())));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
     tracing::info!(device = %id, "generated a new device id");
     Ok(id)
 }

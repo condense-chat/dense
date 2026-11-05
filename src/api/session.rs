@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -14,10 +14,15 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 const HEARTBEAT_SECS: u64 = 30;
 
-/// The remote for the last (cwd, branch) seen; looked up again only when either changes.
+/// A repo whose remote lookup found nothing (or timed out) is asked again after this.
+const REMOTE_RETRY: Duration = Duration::from_secs(300);
+
+/// The remote for the last (cwd, branch) seen; looked up again when either
+/// changes, or after [`REMOTE_RETRY`] while it is still missing.
 #[derive(Default)]
 struct RemoteCache {
     key: Option<(PathBuf, String)>,
+    looked_at: Option<Instant>,
     remote: Option<String>,
 }
 
@@ -74,13 +79,19 @@ async fn body_in(
     };
     let head_sha = head_sha.filter(|_| repo);
     let key = (cwd.to_path_buf(), branch.clone());
-    if remotes.key.as_ref() != Some(&key) {
+    let missing = head_sha.is_some()
+        && remotes.remote.is_none()
+        && remotes
+            .looked_at
+            .is_none_or(|at| at.elapsed() >= REMOTE_RETRY);
+    if remotes.key.as_ref() != Some(&key) || missing {
         let tracked = Some(branch.as_str()).filter(|b| !b.is_empty() && *b != "HEAD");
         remotes.remote = match head_sha {
             Some(_) => git_remote(cwd, tracked).await,
             None => None,
         };
         remotes.key = Some(key);
+        remotes.looked_at = Some(Instant::now());
     }
     let mut body = json!({
         "session_id": session_id,
@@ -274,6 +285,32 @@ mod tests {
         assert_eq!(
             body_in(p, "s", &mut cache, true).await["git_remote"],
             "https://n.example/n.git"
+        );
+    }
+
+    #[cfg(feature = "session-repo")]
+    #[tokio::test]
+    async fn a_remote_missing_at_first_is_looked_up_again_later() {
+        let dir = repo();
+        let p = dir.path();
+        let mut cache = RemoteCache::default();
+        assert!(
+            body_in(p, "s", &mut cache, true)
+                .await
+                .get("git_remote")
+                .is_none()
+        );
+        sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);
+        assert!(
+            body_in(p, "s", &mut cache, true)
+                .await
+                .get("git_remote")
+                .is_none()
+        );
+        cache.looked_at = Instant::now().checked_sub(REMOTE_RETRY);
+        assert_eq!(
+            body_in(p, "s", &mut cache, true).await["git_remote"],
+            "https://o.example/o.git"
         );
     }
 

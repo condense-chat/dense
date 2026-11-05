@@ -1,6 +1,3 @@
-//! Device management, the daemon's [`Device`](super::Job::Device) job: heartbeat,
-//! the org's on/off switch, and offline usage upload.
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{State, autostart, queue, save, sessions, switch};
@@ -11,18 +8,20 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::{Result, desktop, device, persist};
 
-const DEVICE_LIMIT_MSG: &str =
-    "device limit reached: remove old devices in the dashboard (this device stays unmanaged)";
+/// After a switch change, re-heartbeat this soon so the new mode is reported.
+pub const REPORT_DELAY: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
-/// The most a first launch waits on the once-only enrolment check.
+const DEVICE_LIMIT_MSG: &str =
+    "device limit reached: remove old devices in the dashboard (this device stays unmanaged)";
+/// A launch tries the enrolment check again only this long after the last try.
+const ENROLL_RETRY_S: u64 = 3_600;
+/// The most a launch waits on the enrolment check.
 const ENROLL_WAIT: Duration = Duration::from_secs(3);
 const INTERVAL_MAX_S: u64 = 3_600;
 const INTERVAL_MIN_S: u64 = 5;
 /// How often a logged-out daemon looks for a login; Desktop's pass already wakes it this often.
 const LOGIN_POLL: Duration = Duration::from_secs(15);
-/// After a switch change, re-heartbeat this soon so the new mode is reported.
-pub const REPORT_DELAY: Duration = Duration::from_secs(1);
 
 /// The job's own state; what survives a restart lives in [`State`].
 pub struct Device {
@@ -88,7 +87,8 @@ impl State {
     fn observed(&mut self, mode: switch::Mode) {
         self.mode = Some(mode);
         if self.collects_usage() {
-            self.transparent_windows.note(mode, now_ms());
+            self.transparent_windows
+                .note(switch::Mode::Transparent, now_ms());
         }
     }
 
@@ -105,16 +105,12 @@ impl State {
 }
 
 impl Device {
-    /// Before the first heartbeat: close a transparent window the daemon was
-    /// not alive to close, and re-apply the last known switch.
+    /// Before the first heartbeat: re-apply the last known switch.
     pub fn start(cfg: &Config, state: &mut State) -> Result<Self> {
         let device_id = device::id(cfg)?;
         sessions::remember_root(cfg);
         tracing::info!(device = %device_id, "device management job started");
         track_user(cfg, state);
-        if switch::observe(cfg) == switch::Mode::Condensing {
-            state.transparent_windows.close(last_seen_ms(state));
-        }
         if let Some(enabled) = state.enforced() {
             tracing::info!(enabled, "applying the last known switch");
             apply(cfg, state, enabled);
@@ -165,9 +161,17 @@ pub fn refuse_if_managed(cfg: &Config, command: &str) -> Result<()> {
 /// A login from before device management never went through [`after_login`],
 /// so an already logged-in device checks once, at its first launch.
 pub async fn enroll_once(cfg: &Config) {
-    if State::load(cfg).last_ok_at.is_none() {
-        let _ = tokio::time::timeout(ENROLL_WAIT, after_login(cfg)).await;
+    let mut state = State::load(cfg);
+    let tried_lately = state
+        .last_attempt_at
+        .is_some_and(|at| now() < at.saturating_add(ENROLL_RETRY_S));
+    if state.last_ok_at.is_some() || tried_lately || !state.owned_by(cfg) {
+        return;
     }
+    // Recorded first: a check cut off by the wait still counts as a try.
+    state.last_attempt_at = Some(now());
+    save(cfg, &state);
+    let _ = tokio::time::timeout(ENROLL_WAIT, after_login(cfg)).await;
 }
 
 /// Whether a server told this device it isn't managed. Unknown (`None`, as after
@@ -178,12 +182,7 @@ pub fn no_longer_managed(cfg: &Config) -> bool {
 
 /// Session heartbeats name the repo on managed devices only.
 pub fn sends_repo(cfg: &Config) -> bool {
-    cfg!(feature = "session-repo") && State::load(cfg).is_managed()
-}
-
-/// Whether routed Claude Code runs need a span for the session-file reader.
-pub fn collects_usage(cfg: &Config) -> bool {
-    State::load(cfg).collects_usage()
+    cfg!(feature = "session-repo") && managed_for(cfg)
 }
 
 /// After `dense login`: if the account's org manages devices, install the
@@ -357,11 +356,6 @@ pub fn jitter(d: Duration) -> Duration {
     d + d.mul_f64(f64::from(nanos % 1_000) / 5_000.0)
 }
 
-/// When the daemon last ran a tick (ms) — the latest a mode change it missed can be dated.
-fn last_seen_ms(state: &State) -> u64 {
-    state.last_attempt_at.map_or_else(now_ms, |s| s * 1_000)
-}
-
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -394,10 +388,10 @@ fn track_user(cfg: &Config, state: &mut State) -> Option<String> {
     user
 }
 
-/// Queue session-file usage for the transparent windows. Runs before the
+/// Queue session-file usage from while the device is managed. Runs before the
 /// heartbeat so it works offline; the queue carries it to the next upload.
-/// The window follows the shims actually on disk (`dense claude` runs are
-/// excluded by their routed spans instead).
+/// Routed runs are excluded by their spans, so shims on disk don't close the
+/// window: a session that bypasses them still counts.
 fn report_offline_usage(cfg: &Config, state: &mut State) {
     let now = now_ms();
     if track_user(cfg, state).is_none() {
@@ -407,12 +401,9 @@ fn report_offline_usage(cfg: &Config, state: &mut State) {
     if !state.collects_usage() {
         return;
     }
-    match switch::observe(cfg) {
-        switch::Mode::Condensing => state.transparent_windows.close(last_seen_ms(state)),
-        switch::Mode::Transparent => state
-            .transparent_windows
-            .note(switch::Mode::Transparent, now),
-    }
+    state
+        .transparent_windows
+        .note(switch::Mode::Transparent, now);
     state.transparent_windows.prune(now);
     match sessions::report(cfg, &state.transparent_windows, now) {
         Ok(0) => {}
@@ -421,7 +412,12 @@ fn report_offline_usage(cfg: &Config, state: &mut State) {
     }
 }
 
-/// One login on one profile: the same id on another profile is a user change.
+/// Whether the org manages this device for `cfg`'s own login, not another profile's.
+fn managed_for(cfg: &Config) -> bool {
+    let state = State::load(cfg);
+    state.is_managed() && state.owned_by(cfg) && state.user == user_ref(cfg)
+}
+
 /// The switch, while it belongs to the login that started the daemon.
 fn switch_for_login(cfg: &Config) -> Option<bool> {
     let state = State::load(cfg);
@@ -431,6 +427,7 @@ fn switch_for_login(cfg: &Config) -> Option<bool> {
         .filter(|_| state.user == user_ref(owner.as_ref().unwrap_or(cfg)))
 }
 
+/// One login on one profile: the same id on another profile is a user change.
 fn user_ref(cfg: &Config) -> Option<String> {
     use sha2::{Digest, Sha256};
     let creds = auth::load_creds(cfg);

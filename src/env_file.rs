@@ -80,12 +80,18 @@ pub fn ensure_env(cfg: &Config, modify_path: bool) -> Result<PathWiring> {
 
 /// Whether any shell profile currently sources the dense env file (the
 /// signal that the user accepted PATH wiring, vs `--no-modify-path`).
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 pub fn is_wired(cfg: &Config) -> bool {
     PROFILES
         .iter()
         .any(|n| std::fs::read_to_string(cfg.home().join(n)).is_ok_and(|s| s.contains(BEGIN)))
         || fish_conf_path(cfg).is_some_and(|p| p.is_file())
+}
+
+/// Whether dense's bin dir is on PATH, which only its own wiring puts there.
+#[cfg(windows)]
+pub fn is_wired(cfg: &Config) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == cfg.bin_dir()))
 }
 
 /// One-line description of the PATH change `ensure_env` would make, for the
@@ -129,20 +135,32 @@ pub fn reload_hint(cfg: &Config) -> String {
 /// Remove the source block from every profile (used by `self uninstall`).
 #[cfg(not(windows))]
 pub fn unwire(cfg: &Config) -> Result<()> {
+    let mut failed = Vec::new();
     for name in PROFILES {
         let path = cfg.home().join(name);
-        if path.exists() {
-            strip_block(&path)?;
+        if path.exists()
+            && let Err(e) = strip_block(&path)
+        {
+            let why =
+                std::error::Error::source(&e).map_or_else(|| e.to_string(), ToString::to_string);
+            failed.push(format!("{}: {why}", path.display()));
         }
     }
     if let Some(fish) = fish_conf_path(cfg) {
         match std::fs::remove_file(&fish) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).ctx(format!("removing {}", fish.display())),
+            Err(e) => failed.push(format!("{}: {e}", fish.display())),
         }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::error::Error::msg(format!(
+            "could not remove dense from {}",
+            failed.join("; ")
+        )))
+    }
 }
 
 #[cfg(windows)]
@@ -298,19 +316,19 @@ fn strip_block(path: &std::path::Path) -> Result<()> {
     swap_profile(path, &out).ctx(format!("updating {}", path.display()))
 }
 
-/// Replace a profile in one step, on the file a dotfile manager's symlink points at.
+/// Replace a profile in one step, on the file a dotfile manager's symlink
+/// points at; in place when its folder can't take a temp file.
 #[cfg(not(windows))]
 fn swap_profile(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let real = std::fs::canonicalize(path)?;
-    let mut tmp = real.clone().into_os_string();
-    tmp.push(format!(".dense-{}.tmp", std::process::id()));
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
-    let swapped = std::fs::metadata(&real)
+    let tmp = crate::atomic::temp_beside(&real);
+    let swapped = std::fs::write(&tmp, bytes)
+        .and_then(|()| std::fs::metadata(&real))
         .and_then(|m| std::fs::set_permissions(&tmp, m.permissions()))
         .and_then(|()| std::fs::rename(&tmp, &real));
     if swapped.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return std::fs::write(&real, bytes);
     }
     swapped
 }

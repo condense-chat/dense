@@ -101,9 +101,7 @@ impl State {
         std::fs::create_dir_all(cfg.daemon_dir()).ctx("creating dense daemon dir")?;
         let body = toml::to_string_pretty(self).ctx("serializing daemon state")?;
         let path = state_file(cfg);
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, body).ctx(format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).ctx(format!("replacing {}", path.display()))
+        crate::atomic::replace(&path, body.as_bytes()).ctx(format!("replacing {}", path.display()))
     }
 }
 
@@ -215,10 +213,10 @@ pub fn status_lines(cfg: &Config) -> Vec<(&'static str, String)> {
 
 /// Remove the one autostart entry and tell condense this device is gone.
 /// Routing (shims, wrapped Desktop engines) stays as it is.
-pub async fn uninstall(cfg: &Config) -> Result<()> {
-    remove_autostart(cfg)?;
-    managed::report_uninstall(cfg).await;
-    Ok(())
+/// Stops the daemon only: dense stays installed, so the device stays listed.
+pub fn uninstall(cfg: &Config) -> Result<()> {
+    managed::refuse_if_managed(cfg, "dense daemon uninstall")?;
+    remove_autostart(cfg)
 }
 
 pub fn remove_autostart(cfg: &Config) -> Result<()> {

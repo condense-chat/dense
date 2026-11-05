@@ -149,20 +149,29 @@ async fn remote_url(cwd: &Path, name: &str) -> Option<String> {
     public_remote(&git(cwd, &["remote", "get-url", name]).await?)
 }
 
-/// A network remote with credentials, query and fragment removed. Local paths
-/// and `file://` remotes are dropped: they name directories, not repos.
+/// A network remote with credentials, query and fragment removed. Anything else
+/// is dropped: local paths and `file://` name directories, and helpers such as
+/// `ext::` carry whole commands.
 fn public_remote(url: &str) -> Option<String> {
-    let url = url.split(['?', '#']).next().unwrap_or_default();
-    if let Some((scheme, rest)) = url.split_once("://") {
-        if scheme.eq_ignore_ascii_case("file") {
+    if url.contains("://") {
+        let mut url = reqwest::Url::parse(url).ok()?;
+        if !matches!(url.scheme(), "http" | "https" | "ssh" | "git") || url.host_str().is_none() {
             return None;
         }
-        let host_end = rest.find('/').unwrap_or(rest.len());
-        let host = rest[..host_end].rsplit('@').next().unwrap_or_default();
-        return (!host.is_empty()).then(|| format!("{scheme}://{host}{}", &rest[host_end..]));
+        url.set_username("").ok()?;
+        url.set_password(None).ok()?;
+        url.set_query(None);
+        url.set_fragment(None);
+        return Some(url.into());
     }
-    let (host, _) = url.split_once(':')?;
-    let scp = !host.is_empty() && !host.contains(['/', '\\']) && host.len() > 1;
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let (user, rest) = url.split_once('@').unwrap_or(("", url));
+    let (host, path) = rest.split_once(':')?;
+    let scp = !user.contains([':', '/', '\\'])
+        && host.len() > 1
+        && !host.contains(['/', '\\'])
+        && !path.is_empty()
+        && !path.starts_with(':');
     scp.then(|| url.to_string())
 }
 
@@ -202,6 +211,39 @@ mod tests {
             ],
         );
         dir
+    }
+
+    #[test]
+    fn helpers_and_lookalikes_never_go_out() {
+        for remote in [
+            "ext::sh -c ssh\\ git@host\\ %S\\ /home/me/secret",
+            "ext::sh -c \"curl https://host/x\"",
+            "gcrypt::/home/me/private.git",
+            "gcrypt::rsync://host/backup",
+            "fd::3",
+            "rsync://host/repo",
+            "ftp://host/repo",
+            "user:token@host:o/r.git",
+            "/home/a@b:c",
+            "host:",
+            "h:o/r",
+        ] {
+            assert_eq!(public_remote(remote), None, "{remote}");
+        }
+    }
+
+    #[test]
+    fn a_password_is_never_mistaken_for_the_host() {
+        assert_eq!(
+            public_remote("https://user:tok@en@git.example/o/r.git").as_deref(),
+            Some("https://git.example/o/r.git")
+        );
+        assert_eq!(
+            public_remote("https://user:p/ss@host/o")
+                .as_deref()
+                .filter(|u| u.contains("ss@")),
+            None
+        );
     }
 
     #[test]

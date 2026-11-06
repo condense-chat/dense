@@ -61,6 +61,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
         }
     }
 
+    if persist::watching(cfg) && !daemon::running(cfg) {
+        warn(
+            "dense daemon not running",
+            "editors' Claude Code settings won't be re-applied — run `dense persist claude`",
+        );
+    }
+
     for name in persist::load_record(cfg).tools.keys() {
         let path = persist::shim_path(cfg, name);
         line(

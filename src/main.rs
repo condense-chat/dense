@@ -49,8 +49,8 @@ fn init_tracing(verbose: u8) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> EyreResult<()> {
-    if let Some(real) = desktop::engine::sibling_engine() {
-        return desktop::engine::run(&real).await.map_err(Into::into);
+    if let Some((real, args)) = desktop::engine::launch_target() {
+        return desktop::engine::run(&real, &args).await.map_err(Into::into);
     }
     color_eyre::config::HookBuilder::default()
         .display_env_section(false)

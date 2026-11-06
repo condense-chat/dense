@@ -227,6 +227,21 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
     }
     if !tools.is_empty() {
         let report = persist::install_shims(cfg, &tools)?;
+        for settings in &report.editors {
+            info(
+                interactive,
+                &format!(
+                    "Claude Code in {} now runs through dense",
+                    settings.display()
+                ),
+            );
+        }
+        if let Some(entry) = &report.daemon {
+            info(
+                interactive,
+                &format!("dense daemon keeps it that way ({})", entry.display()),
+            );
+        }
         for warning in &report.warnings {
             warn(interactive, warning);
         }

@@ -20,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{Result, desktop, device};
+use crate::{Result, desktop, device, persist};
 
 const LOCK_ATTEMPTS: u32 = 10;
 const LOCK_RETRY: Duration = Duration::from_millis(20);
@@ -33,6 +33,8 @@ enum Job {
     DesktopEngines(desktop::Watcher),
     /// Heartbeat, the org's on/off switch, and offline usage upload.
     Device(managed::Device),
+    /// Holds the last pass's warnings, so a stuck file is logged once.
+    EditorWrappers(Vec<String>),
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -79,6 +81,7 @@ impl Job {
             Err(e) => tracing::warn!("device management off: no device id ({e})"),
         }
         jobs.push(Self::DesktopEngines(desktop::Watcher::default()));
+        jobs.push(Self::EditorWrappers(Vec::new()));
         jobs
     }
 
@@ -86,6 +89,7 @@ impl Job {
         match self {
             Self::DesktopEngines(watcher) => desktop::watch(cfg, watcher, &mut state.rewraps).await,
             Self::Device(job) => job.tick(cfg, state).await,
+            Self::EditorWrappers(warned) => persist::watch(cfg, warned),
         }
     }
 }
@@ -109,9 +113,12 @@ impl State {
     }
 }
 
+/// `dense daemon install`: the daemon is the user's own now, so [`release`]
+/// leaves it running.
 pub fn install(cfg: &Config) -> Result<()> {
     sessions::remember_root(cfg);
     let device_id = device::id(cfg)?;
+    mark_added(cfg, false)?;
     let report = autostart::install(cfg)?;
     println!("daemon autostart installed -> {}", report.path.display());
     println!("device {device_id}");
@@ -119,6 +126,18 @@ pub fn install(cfg: &Config) -> Result<()> {
         eprintln!("warning: {note}");
     }
     Ok(())
+}
+
+/// Remove the autostart a feature's [`want`] added, once no job has work. A
+/// managed device keeps it: the daemon carries the org's switch.
+pub fn release(cfg: &Config) -> Result<()> {
+    if !added_file(cfg).exists() || wanted(cfg) || State::load(cfg).is_managed() {
+        return Ok(());
+    }
+    if autostart::installed(cfg).is_some() {
+        remove_autostart(cfg)?;
+    }
+    mark_added(cfg, false)
 }
 
 /// The daemon loop. `once` runs every job a single time (a job that changed
@@ -220,7 +239,8 @@ pub fn status_lines(cfg: &Config) -> Vec<(&'static str, String)> {
 /// Stops the daemon only: dense stays installed, so the device stays listed.
 pub fn uninstall(cfg: &Config) -> Result<()> {
     managed::refuse_if_managed(cfg, "dense daemon uninstall")?;
-    remove_autostart(cfg)
+    remove_autostart(cfg)?;
+    mark_added(cfg, false)
 }
 
 pub fn remove_autostart(cfg: &Config) -> Result<()> {
@@ -234,6 +254,20 @@ pub fn remove_autostart(cfg: &Config) -> Result<()> {
         None => println!("daemon autostart was not installed"),
     }
     Ok(())
+}
+
+/// Install and start the daemon for a job that needs it, recording that dense
+/// added it unless the user already had one. Prints nothing.
+pub fn want(cfg: &Config) -> Result<autostart::Report> {
+    if autostart::installed(cfg).is_none() {
+        mark_added(cfg, true)?;
+    }
+    autostart::install(cfg)
+}
+
+/// Whether any job has work, i.e. the daemon is worth running.
+pub fn wanted(cfg: &Config) -> bool {
+    desktop::watching(cfg) || persist::watching(cfg)
 }
 
 /// The machine-wide single-instance lock, held for the daemon's lifetime;
@@ -268,8 +302,27 @@ fn live_pid(cfg: &Config) -> Option<u32> {
     running(cfg).then(|| State::load(cfg).pid).flatten()
 }
 
+fn added_file(cfg: &Config) -> PathBuf {
+    cfg.daemon_dir().join("added")
+}
+
 fn lock_file(cfg: &Config) -> PathBuf {
     cfg.daemon_dir().join("daemon.lock")
+}
+
+/// Kept beside, not in, the state file, which a running daemon rewrites.
+pub fn mark_added(cfg: &Config, added: bool) -> Result<()> {
+    let path = added_file(cfg);
+    if added {
+        std::fs::create_dir_all(cfg.daemon_dir()).ctx("creating dense daemon dir")?;
+        return std::fs::write(&path, "").ctx(format!("writing {}", path.display()));
+    }
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).ctx(format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// How the daemon notices a self-update: the old image keeps running until the
@@ -335,6 +388,25 @@ mod tests {
         .save(&cfg)
         .unwrap();
         assert_eq!(State::load(&cfg).pid, Some(7));
+    }
+
+    #[test]
+    fn a_persisted_claude_wants_the_daemon_and_other_tools_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
+        assert!(!wanted(&cfg));
+        std::fs::create_dir_all(cfg.data_dir()).unwrap();
+        std::fs::write(cfg.persist_file(), "[tools]\ncodex = \"\"\n").unwrap();
+        assert!(!wanted(&cfg));
+        std::fs::write(cfg.persist_file(), "[tools]\nclaude = \"\"\n").unwrap();
+        assert!(wanted(&cfg));
+
+        mark_added(&cfg, true).unwrap();
+        release(&cfg).unwrap();
+        assert!(
+            added_file(&cfg).exists(),
+            "released while a job still wants it"
+        );
     }
 
     #[test]

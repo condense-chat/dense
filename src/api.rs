@@ -162,12 +162,24 @@ impl Api {
 
     fn build(base: &str, headers: HeaderMap) -> Result<Self> {
         let base = base.trim_end_matches('/');
-        reqwest::Url::parse(base).ctx("invalid api url")?;
-        // reqwest only strips its own auth headers on a redirect, never ours.
+        let home = reqwest::Url::parse(base).ctx("invalid api url")?;
+        // reqwest only strips its own auth headers on a redirect, never ours, so
+        // credentials follow one only within the api's origin (or its https).
         let redirects = if headers.is_empty() {
             reqwest::redirect::Policy::default()
         } else {
-            reqwest::redirect::Policy::none()
+            reqwest::redirect::Policy::custom(move |attempt| {
+                let to = attempt.url();
+                let upgrade = home.scheme() == "http"
+                    && to.scheme() == "https"
+                    && to.host_str() == home.host_str();
+                // 10 is reqwest's own limit.
+                if attempt.previous().len() < 10 && (to.origin() == home.origin() || upgrade) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            })
         };
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -227,6 +239,38 @@ mod tests {
             let _ = stream.write_all(reply.as_bytes());
         });
         url
+    }
+
+    /// One 302 to its own `/next`, then 200 there.
+    fn redirecting_to_itself() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let replies = [
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: {url}/next\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_string(),
+        ];
+        std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.read(&mut [0; 4096]).unwrap();
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_client_with_credentials_follows_a_redirect_within_its_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(root.path(), &redirecting_to_itself());
+        let creds = Creds {
+            token: Some("secret".into()),
+            user_id: None,
+        };
+        let api = Api::authed(&cfg, &creds).unwrap();
+        assert_eq!(api.status_of("/v1/me", Duration::from_secs(5)).await, 200);
     }
 
     #[tokio::test]

@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.13.1] - 2026-11-06
+
+### Bug Fixes
+- Send the repo on heartbeats for every user
+
 ## [0.13.0] - 2026-11-06
 
 ### Bug Fixes

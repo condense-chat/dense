@@ -182,11 +182,6 @@ pub fn no_longer_managed(cfg: &Config) -> bool {
     State::load(cfg).managed == Some(false)
 }
 
-/// Session heartbeats name the repo on managed devices only.
-pub fn sends_repo(cfg: &Config) -> bool {
-    cfg!(feature = "session-repo") && managed_for(cfg)
-}
-
 /// After `dense login`: if the account's org manages devices, install the
 /// daemon so the switch applies without anyone running `dense daemon install`.
 /// True when the device is managed, so there is nothing left to set up.
@@ -412,12 +407,6 @@ fn report_offline_usage(cfg: &Config, state: &mut State) {
         Ok(n) => tracing::info!("queued {n} offline usage records from session files"),
         Err(e) => tracing::warn!("could not read session usage: {e}"),
     }
-}
-
-/// Whether the org manages this device for `cfg`'s own login, not another profile's.
-fn managed_for(cfg: &Config) -> bool {
-    let state = State::load(cfg);
-    state.is_managed() && state.owned_by(cfg) && state.user == user_ref(cfg)
 }
 
 /// The switch, while it belongs to the login that started the daemon.
@@ -1157,24 +1146,6 @@ pub(crate) mod tests {
         state.user = Some("another-login".into());
         state.save(&cfg).unwrap();
         assert!(!forced_on(&cfg));
-    }
-
-    #[test]
-    fn only_a_managed_device_sends_repo_fields() {
-        let root = tempfile::tempdir().unwrap();
-        let cfg = Config::for_test(root.path(), "http://127.0.0.1:9");
-        assert!(!sends_repo(&cfg));
-        let saved = |managed| {
-            let state = State {
-                managed,
-                ..State::default()
-            };
-            state.save(&cfg).unwrap();
-        };
-        saved(Some(false));
-        assert!(!sends_repo(&cfg));
-        saved(Some(true));
-        assert_eq!(sends_repo(&cfg), cfg!(feature = "session-repo"));
     }
 
     #[test]

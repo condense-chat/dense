@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_managed_session_names_its_repo() {
+    async fn without_repo_no_git_fields_go_out() {
         let dir = repo();
         let p = dir.path();
         sh(p, &["remote", "add", "origin", "https://o.example/o.git"]);

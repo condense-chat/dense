@@ -85,7 +85,7 @@ pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<(
     let mut cmd = routed_command(cfg, &tool, &creds, &session, &bin);
     cmd.args(args);
 
-    let repo = crate::daemon::managed::sends_repo(cfg);
+    let repo = cfg!(feature = "session-repo");
     let (kind, pin) = (tool.kind(), Pin::of(args));
     let span = |child| routed_span(cfg, kind, pin, child);
     spawn_and_wait(&api, &session, repo, &bin, cmd, span).await
@@ -136,7 +136,7 @@ pub async fn launch_engine<T: Tool>(
         cfg,
         &format!("routed launch: session {} via {}", session.id, cfg.api_host),
     );
-    let repo = crate::daemon::managed::sends_repo(cfg);
+    let repo = cfg!(feature = "session-repo");
     let heartbeat = session.start_heartbeat(&api, repo);
     let signals = forward_signals(stops, child.id());
     let status = child.wait().await;

@@ -55,6 +55,10 @@ pub struct State {
     /// The profile the daemon runs for. The switch, windows and queue are that
     /// profile's login, whichever profile the process reading them resolved to.
     pub profile: Option<String>,
+    /// The server refused the last heartbeat for good (a 4xx other than the
+    /// device cap or a rate limit), so a launch stops asking until one succeeds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
     /// Engine folders whose wrapper keeps disappearing.
     #[serde(default, skip_serializing_if = "desktop::Rewraps::is_empty")]
     pub rewraps: desktop::Rewraps,

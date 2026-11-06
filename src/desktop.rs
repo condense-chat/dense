@@ -367,14 +367,12 @@ pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
             Err(e) => result = result.and(Err(e)),
         }
     }
-    // A managed device keeps the daemon: it carries the org's switch.
-    if routing.added_daemon
-        && !daemon::State::load(cfg).is_managed()
-        && daemon::autostart::installed(cfg).is_some()
-    {
-        result = result.and(daemon::remove_autostart(cfg));
+    // The daemon may still serve another job; hand it the ownership, and
+    // [`daemon::release`] removes it once none does.
+    if routing.added_daemon {
+        result = result.and(daemon::mark_added(cfg, true));
     }
-    result
+    result.and(daemon::release(cfg))
 }
 
 /// The daemon's Desktop job: follow Desktop through installs, engine downloads
@@ -402,6 +400,11 @@ pub async fn watch(cfg: &Config, watcher: &mut Watcher, rewraps: &mut Rewraps) -
         Err(e) => tracing::warn!("Desktop engine pass failed: {e}"),
     }
     POLL
+}
+
+/// Whether the daemon's Desktop job has work.
+pub fn watching(cfg: &Config) -> bool {
+    Routing::load(cfg).is_some()
 }
 
 /// Cloud sessions that were granted a local folder. They run on Anthropic's side,

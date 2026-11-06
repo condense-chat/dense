@@ -5,7 +5,15 @@ use std::path::{Path, PathBuf};
 /// renamed into place, so a reader never sees a partial file.
 pub fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = temp_beside(path);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    // The old file's mode goes on before the rename, so a 0600 file is never
+    // briefly readable.
+    let written = std::fs::write(&tmp, bytes)
+        .and_then(|()| match std::fs::metadata(path) {
+            Ok(old) => std::fs::set_permissions(&tmp, old.permissions()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -38,5 +46,18 @@ mod tests {
         assert!(body.starts_with('v') && body.ends_with('\n') && body.len() <= 4);
         let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(left.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        replace(&path, b"{ }").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

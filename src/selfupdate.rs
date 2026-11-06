@@ -34,6 +34,7 @@ pub async fn uninstall(cfg: &Config) -> Result<()> {
         eprintln!("warning: could not restore Claude Desktop's engines ({e})");
     }
     daemon::managed::report_uninstall(cfg).await;
+    persist::unwire_editors(cfg);
     for name in persist::load_record(cfg).tools.keys() {
         let _ = std::fs::remove_file(persist::shim_path(cfg, name));
     }

@@ -65,9 +65,13 @@ pub fn apply(
 }
 
 /// The shimmable tools that are installed (found on PATH outside the shim dir).
+/// An editor counts as claude: its extension needs no CLI, and the claude
+/// entry is what keeps the daemon wiring it.
 pub fn installed(cfg: &Config) -> Vec<String> {
     persist::names()
-        .filter(|n| tool::resolve_real(cfg, n).is_ok())
+        .filter(|n| {
+            tool::resolve_real(cfg, n).is_ok() || (*n == "claude" && persist::has_editors(cfg))
+        })
         .map(str::to_string)
         .collect()
 }

@@ -17,7 +17,7 @@ const DEVICE_LIMIT_MSG: &str =
 /// A launch tries the enrolment check again only this long after the last try.
 const ENROLL_RETRY_S: u64 = 3_600;
 /// The most a launch waits on the enrolment check.
-const ENROLL_WAIT: Duration = Duration::from_secs(3);
+const ENROLL_WAIT: Duration = Duration::from_secs(1);
 const INTERVAL_MAX_S: u64 = 3_600;
 const INTERVAL_MIN_S: u64 = 5;
 /// How often a logged-out daemon looks for a login; Desktop's pass already wakes it this often.
@@ -94,6 +94,7 @@ impl State {
 
     fn record(&mut self, reply: &HeartbeatReply) {
         self.limited = false;
+        self.refused = false;
         self.managed = Some(reply.managed);
         self.enabled = Some(reply.enabled);
         self.member_enabled = reply.member_enabled;
@@ -159,13 +160,14 @@ pub fn refuse_if_managed(cfg: &Config, command: &str) -> Result<()> {
 }
 
 /// A login from before device management never went through [`after_login`],
-/// so an already logged-in device checks once, at its first launch.
+/// so an already logged-in device checks once, at its first launch. A server
+/// that refused the device is not asked again from a launch.
 pub async fn enroll_once(cfg: &Config) {
     let mut state = State::load(cfg);
     let tried_lately = state
         .last_attempt_at
         .is_some_and(|at| now() < at.saturating_add(ENROLL_RETRY_S));
-    if state.last_ok_at.is_some() || tried_lately || !state.owned_by(cfg) {
+    if state.last_ok_at.is_some() || state.refused || tried_lately || !state.owned_by(cfg) {
         return;
     }
     // Recorded first: a check cut off by the wait still counts as a try.
@@ -225,7 +227,7 @@ pub async fn after_login(cfg: &Config) -> bool {
     }
     match autostart::install(cfg) {
         Ok(_) => {
-            println!("this device is managed by your organization; the dense daemon is installed")
+            eprintln!("this device is managed by your organization; the dense daemon is installed")
         }
         Err(e) => eprintln!(
             "warning: this device is managed by your organization, but installing the dense daemon failed ({}); run `dense daemon install`",
@@ -475,6 +477,7 @@ async fn heartbeat(
     }
     state.forget_switch();
     state.limited = rejection.is(devices::DEVICE_LIMIT);
+    state.refused = !state.limited && !matches!(rejection.status, 408 | 429);
     state.last_error = Some(if state.limited {
         DEVICE_LIMIT_MSG.to_string()
     } else if matches!(rejection.status, 401 | 403) {
@@ -1116,6 +1119,22 @@ pub(crate) mod tests {
         after_login(&cfg).await;
         let state = State::load(&cfg);
         assert_eq!((state.managed, state.enabled), (Some(true), Some(false)));
+    }
+
+    #[cfg(feature = "login-autostart")]
+    #[tokio::test]
+    async fn a_launch_stops_asking_a_server_that_refused_the_device() {
+        let (url, rx) = serve(404, "{}");
+        let root = tempfile::tempdir().unwrap();
+        let cfg = logged_in(root.path(), &url);
+        enroll_once(&cfg).await;
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        let mut state = State::load(&cfg);
+        assert!(state.refused);
+        state.last_attempt_at = Some(0);
+        state.save(&cfg).unwrap();
+        enroll_once(&cfg).await;
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     #[cfg(feature = "managed-setup")]

@@ -184,6 +184,8 @@ impl Guard {
             tracing::debug!("could not record routed span: {e}");
             return None;
         }
+        // Pruned here too: without a managed daemon nothing else reads them.
+        Routed::load_and_prune(cfg, now);
         let session_file = child.map(|pid| {
             crate::harness::commands::claude_home(cfg.home(), |k| std::env::var(k).ok())
                 .join("sessions")
@@ -765,6 +767,18 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["live.json"]);
+    }
+
+    #[tokio::test]
+    async fn opening_a_span_prunes_expired_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(tmp.path(), "http://127.0.0.1:9");
+        let d = dir(&cfg);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d.join("old.json"), &span("", None, 1, 1, Some(2))).unwrap();
+        let guard = Guard::open(&cfg, None, None).unwrap();
+        assert!(!d.join("old.json").exists());
+        guard.close().await;
     }
 
     #[tokio::test]

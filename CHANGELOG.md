@@ -3,6 +3,17 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.13.0] - 2026-11-06
+
+### Bug Fixes
+- Forget the org switch whenever the logged-in user changes- Keep one device id when first runs race- Run dense <tool> directly while the org switch is off- Send only network remotes and look them up once per branch- Cap usage batches per flush so other jobs keep their turn- Tie the machine-wide state to the profile the daemon runs for- Let -e beat CONDENSE_URL and accept a bare zone- Stop a status check turning a starting daemon away- Say an expired code means logging in again- Pick up a login without waiting out the backoff- Report a missing tool before asking for a login- Never lose a shell profile, and respect --no-modify-path- Never add a session id behind a short-flag resume- Put Desktop back when a device leaves its org- Address the device management review- Keep credentials and remote helpers from leaving the machine- Keep launches on unmanaged devices quiet and bounded- Follow redirects within the api's own origin
+
+### Features
+- Run device management and offline usage as a daemon job- Follow the org switch and mark routed Desktop sessions- Send git remote, HEAD and dense version on heartbeats- Collect usage on managed devices only, behind cargo features- Route a managed device without any setup- Refuse to undo routing on a device the org manages
+
+### Testing
+- Stop two tests racing parallel forks and a reused port- Run the missing-tool test on Unix only- Gate the managed PATH tests on remote-control
+
 ## [0.12.0] - 2026-11-05
 
 ### Documentation

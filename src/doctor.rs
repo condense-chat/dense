@@ -59,6 +59,11 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 "new Claude Desktop engines won't route — run `dense claude-desktop install`",
             );
         }
+    } else if persist::watching(cfg) && !daemon::running(cfg) {
+        warn(
+            "dense daemon not running",
+            "editors' Claude Code settings won't be re-applied — run `dense persist claude`",
+        );
     }
 
     for name in persist::load_record(cfg).tools.keys() {

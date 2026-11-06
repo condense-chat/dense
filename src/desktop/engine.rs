@@ -1,7 +1,8 @@
 //! Engine mode: this binary was installed as Desktop's `claude`, with the real
-//! engine beside it. It never logs in, prints nothing on stdout (Desktop's
-//! stream), and runs the engine unproxied on any failure, so a condense
-//! problem can't stop a Desktop session.
+//! engine beside it, or is an editor extension's process wrapper, handed the
+//! real engine as its first arg. It never logs in, prints nothing on stdout
+//! (the caller's stream), and runs the engine unproxied on any failure, so a
+//! condense problem can't stop a session.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -19,6 +20,14 @@ use crate::harness::{claude, run_direct};
 use super::{BIN, BUNDLE, REAL, REAL_BUNDLE, bundle};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+/// Helper calls the VS Code extension makes (`ws(` and `subcommand:` in its
+/// extension.js), plus its `edit-*` settings editors; none reach the model api.
+const DIRECT_COMMANDS: &[&str] = &[
+    "--claude-in-chrome-mcp",
+    "auth",
+    "design-login",
+    "drop-worktree-registrations",
+];
 const INFO_FLAGS: &[&str] = &["--version", "-v", "--help", "-h"];
 const LOG_FILE: &str = "desktop-engine.log";
 const LOG_MAX_BYTES: u64 = 1 << 20;
@@ -32,25 +41,32 @@ const OTHER_PROVIDERS: &[&str] = &[
 const PROBE_STAMP: &str = ".desktop-probe";
 const PROBE_TTL: Duration = Duration::from_secs(300);
 
-/// The real engine, when this process is running as Desktop's `claude`.
-pub fn sibling_engine() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    engine_beside(&exe)
+/// The real engine and its args, when this process is Desktop's `claude` or
+/// an editor's `claudeCode.claudeProcessWrapper` (`dense <engine> <args…>`).
+pub fn launch_target() -> Option<(PathBuf, Vec<OsString>)> {
+    let mut args = std::env::args_os().skip(1);
+    if let Some(real) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| engine_beside(&exe))
+    {
+        return Some((real, args.collect()));
+    }
+    let real = PathBuf::from(args.next()?);
+    is_wrapped_engine(&real).then(|| (real, args.collect()))
 }
 
 /// Never returns on success: both paths exit with the engine's status.
-pub async fn run(real: &Path) -> Result<()> {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if is_info_call(&args) {
-        return run_direct(real, &args);
+pub async fn run(real: &Path, args: &[OsString]) -> Result<()> {
+    if runs_direct(args) {
+        return run_direct(real, args);
     }
     let Ok(cfg) = Config::resolve(None, None) else {
-        return run_direct(real, &args);
+        return run_direct(real, args);
     };
-    if let Err(why) = route(&cfg, real, &args).await {
+    if let Err(why) = route(&cfg, real, args).await {
         log(&cfg, &format!("direct launch: {why}"));
     }
-    run_direct(real, &args)
+    run_direct(real, args)
 }
 
 pub(crate) fn log(cfg: &Config, line: &str) {
@@ -106,11 +122,9 @@ fn env_is_routable(get: impl Fn(&str) -> Option<String>) -> bool {
     }
 }
 
-fn is_info_call(args: &[OsString]) -> bool {
-    match args {
-        [only] => only.to_str().is_some_and(|a| INFO_FLAGS.contains(&a)),
-        _ => false,
-    }
+/// No dense subcommand is an absolute path, so this can't shadow the CLI.
+fn is_wrapped_engine(path: &Path) -> bool {
+    path.is_absolute() && path.file_name() == Some(OsStr::new(BIN)) && path.is_file()
 }
 
 /// Warm respawns are frequent, so a recent success skips the round trip.
@@ -156,7 +170,7 @@ async fn reachable(api_url: &str) -> bool {
 /// an error: a routed engine's exit ends this process.
 async fn route(cfg: &Config, real: &Path, args: &[OsString]) -> Result<()> {
     if !env_is_routable(|key| std::env::var(key).ok()) {
-        return Err(Error::msg("Desktop is set up for another provider"));
+        return Err(Error::msg("the env points at another provider"));
     }
     if cfg!(feature = "desktop-switch") && crate::daemon::managed::switched_off(cfg) {
         return Err(Error::msg("dense is turned off by your organization"));
@@ -172,6 +186,17 @@ async fn route(cfg: &Config, real: &Path, args: &[OsString]) -> Result<()> {
         probe(cfg, token).await?;
     }
     claude::run_engine(cfg, &creds, real, args).await
+}
+
+fn runs_direct(args: &[OsString]) -> bool {
+    let is = |arg: &OsString, set: &[&str]| arg.to_str().is_some_and(|a| set.contains(&a));
+    match args {
+        [only] if is(only, INFO_FLAGS) => true,
+        [first, ..] => {
+            is(first, DIRECT_COMMANDS) || first.to_str().is_some_and(|a| a.starts_with("edit-"))
+        }
+        [] => false,
+    }
 }
 
 fn stamp_is_fresh(stamp: &Path, key: &str) -> bool {
@@ -222,10 +247,33 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_info_flag_skips_routing() {
-        assert!(is_info_call(&["--version".into()]));
-        assert!(!is_info_call(&[]));
-        assert!(!is_info_call(&["--print".into(), "--version".into()]));
+    fn info_flags_and_helper_commands_skip_routing() {
+        assert!(runs_direct(&["--version".into()]));
+        assert!(runs_direct(&[
+            "auth".into(),
+            "status".into(),
+            "--json".into()
+        ]));
+        assert!(runs_direct(&["--claude-in-chrome-mcp".into()]));
+        assert!(!runs_direct(&[]));
+        assert!(!runs_direct(&["--print".into(), "--version".into()]));
+        assert!(!runs_direct(&[
+            "--output-format".into(),
+            "stream-json".into()
+        ]));
+    }
+
+    #[test]
+    fn wrapper_mode_needs_an_absolute_existing_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join(BIN);
+        assert!(!is_wrapped_engine(&bin));
+        std::fs::write(&bin, "").unwrap();
+        assert!(is_wrapped_engine(&bin));
+        assert!(!is_wrapped_engine(Path::new(BIN)));
+        let other = tmp.path().join("dense");
+        std::fs::write(&other, "").unwrap();
+        assert!(!is_wrapped_engine(&other));
     }
 
     #[test]

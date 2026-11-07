@@ -1,89 +1,103 @@
-# dense
+![dense, the Condense CLI](https://raw.githubusercontent.com/condense-chat/.github/main/profile/dense-banner.png)
 
-**Save up to 50% on agentic coding usage.** [condense](https://condense.chat)
-strips up to 70% of the tokens — prompts, context, and tool output — out of
-every request before it reaches the AI provider. Same model, same results, a
-fraction of the input tokens.
+**Use fewer tokens in Claude Code, Codex, and OpenCode.** A long debugging session can send the same file reads, diffs, and test logs to the model dozens of times. The open-source `dense` CLI launches your coding agent and routes its model requests through Condense’s hosted compression proxy.
 
-`dense` is the local CLI that makes it one command: an intercept that routes
-your coding agent (Claude Code today) through the condense proxy, plus the auth
-that keeps it signed in. Install once, log in once — no key swap, no per-run
-`curl`.
+**63.8% lower estimated model cost** across 64 recorded coding sessions. Replaying all 11,712 turns at Claude Opus 4.8 rates put the baseline at $861.28 and condense at $312.20. [See the benchmark replay](#reproduce-the-benchmark).
+
+[Install](#install) · [Try one session](#try-one-session) · [Privacy](#privacy) · [CLI docs](https://condense.chat/docs/cli/) · [Plans](https://condense.chat/pricing/)
 
 ## Install
 
+Start with Claude Code, Codex, or OpenCode installed and working on your machine.
+
+### macOS and Linux
+
 ```sh
-curl -fsSL https://cli.condense.chat/unix | sh        # macOS / Linux
-irm https://cli.condense.chat/nt | iex                # Windows (PowerShell)
+curl -fsSL https://cli.condense.chat/unix | sh
 ```
 
-The installer drops the `dense` binary on your PATH and hands off to
-`dense setup`, which asks which of the supported tools (`claude`, `opencode`,
-`codex`) to route through dense — so you keep typing `claude` and it just goes
-through condense. Change the choice later with `dense persist <tool>` /
-`dense unpersist <tool>`.
+### Windows PowerShell
 
-Both install scripts are vendored in [`install/`](install/) — real, runnable
-scripts pointing at prod, byte-identical to what `https://cli.condense.chat`
-serves. (Internal environments get the same script with the endpoints
-rewritten to their own zone.)
-
-## Commands
-
-```
-dense login                  authenticate this machine
-dense claude <args>          run Claude Code through the proxy (args pass through)
-dense codex <args>           run Codex through the proxy
-dense opencode <args>        run OpenCode through the proxy
-dense persist [tools...]     shim the named tools (no args: all) so the bare
-                             `claude` routes through dense; non-destructive
-dense unpersist [tools...]   remove the shims
-dense info [--bar|--matrix|--json] [SESSION]
-                             account + lifetime savings; with a session id
-                             (or inside a dense-launched tool) also that
-                             session's context sizes and spend.
-                             --matrix is the coloured glyph grid (terminal
-                             default), --bar the emoji bars (piped default)
-dense usage [claude] [--json] [--attributed-only]
-                             Claude limits + estimated gain; fits terminal width.
-                             --json includes costs and request counts.
-                             --attributed-only excludes untagged requests.
-dense status                 current login + endpoint
-dense doctor                 verify the install is wired correctly
-dense setup                  first-run wizard (the installer hands off to this)
-dense self update            update the binary in place
-dense self uninstall         remove dense, its shims, and PATH wiring
+```powershell
+irm https://cli.condense.chat/nt | iex
 ```
 
-Inside a `dense`-launched tool, `/dense:info` runs `dense info` for the
-current session and renders the result in place. It is scoped to that
-process: Claude Code loads it from a plugin dir under dense's data dir,
-OpenCode gets it inline in its config, and Codex gets a plugin dense stages
-in its cache and enables for that one run. Codex releases old enough to still
-read `$CODEX_HOME/prompts/` also get `/prompts:dense` from a file dense
-writes there only when nothing else owns it. Everything dense wrote outside
-its own data dir goes on `dense self uninstall`; your own commands, skills,
-and plugins are never touched.
+The installer opens setup and signs you in to Condense through your browser. Setup preselects the agents it finds. **For a one-session trial, press Space to uncheck each selected agent, then Enter.** [View the install scripts](https://github.com/condense-chat/dense/tree/main/install).
 
-## Zero data retention
+## Try one session
 
-The proxy is transparent and **ZDR (zero data retention)**: your conversations
-are never stored. The database keeps only SHA-256 hashes — never prompt or
-completion content — and compressed context lives in a cache that expires after
-7 days. condense sees enough to compress a request in flight, and nothing
-persists beyond that window.
+From your project directory, launch the agent you already use. Pass it the same flags and arguments as usual.
 
-## Build & verify
+| Claude Code | Codex | OpenCode |
+| --- | --- | --- |
+| `dense claude` | `dense codex` | `dense opencode` |
+
+Try a task you can verify. For example, open a project with a failing test and ask the agent to find the cause, fix it, and rerun the test. Once it finishes, type `/dense:info` inside the agent to see the input tokens and model cost before and after compression.
+
+Run `dense info` from a separate terminal for lifetime totals. On a Claude subscription, `dense usage` also shows how much of your plan Anthropic says you’ve used and estimates what the same work would have used without compression. [How the estimate works](https://condense.chat/blog/dense-usage/).
+
+## Use your usual launch command
+
+If you selected Claude Code during setup, just type `claude`. You can change that choice later for any supported agent.
+
+```sh
+dense persist claude     # route future claude sessions through Condense
+dense unpersist claude   # return to launching with dense claude on demand
+```
+
+## Reproduce the benchmark
+
+This accelerated [benchmark replay](https://github.com/condense-chat/minmax-bench/tree/main/runs/run-5c61ab52-8eea-4fee-97a4-5c64ee5344af) compares the same coding sessions with and without condense. It runs offline, simulates prompt-cache reads and writes, and prices the resulting token counts at Claude Opus 4.8 rates. The right side shows cumulative estimated cost and tokens.
+
+![Offline benchmark replay across 11,712 turns: baseline $861.28, condense $312.20 in estimated model cost.](https://raw.githubusercontent.com/condense-chat/.github/main/profile/benchmark-replay.gif)
+
+Across all 11,712 turns, condense removed 72.7% of input tokens and reduced estimated model cost by $549.08. Estimated cost fell 9.2% on turns under 16k input tokens and 73.1% in the 400k–800k range. These figures exclude Condense fees.
+
+With [uv](https://docs.astral.sh/uv/) installed, reproduce the report from the saved measurements. No model calls or API key are needed.
+
+```sh
+git clone https://github.com/condense-chat/minmax-bench
+cd minmax-bench
+uv run minmax-bench report 5c61ab52-8eea-4fee-97a4-5c64ee5344af
+```
+
+This replay measures the cost of the recorded workload. To see how compression affects the agent’s work, read [how we compare the agent’s next action and full task runs](https://github.com/condense-chat/minmax-bench/blob/main/docs/quality.md).
+
+<details><summary>My agent starts, but I don’t see savings</summary>
+
+Run `dense status` to check your login and `dense doctor` to check the installation. If the session shows `pricing pending`, wait a few minutes and check again. To start a fresh session, launch the agent explicitly, for example with `dense claude`, send a request, and check `/dense:info` in that session. [Agent setup guide](https://condense.chat/docs/coding-agents/).
+
+</details>
+
+<details><summary>More CLI commands</summary>
+
+| Command | What it does |
+| --- | --- |
+| `dense login / dense logout` | Sign this machine in or out. |
+| `dense setup` | Change which agents use Condense. |
+| `dense info [SESSION]` | See account totals or inspect a session. Use --bar, --matrix, or --json for the output format. |
+| `dense usage claude` | Check Claude limits and estimated gain. Use --json for usage data or --attributed-only to exclude untagged requests. |
+| `dense status` | Check the active login and endpoint. |
+| `dense doctor` | Check the CLI installation. |
+| `dense self update` | Update the CLI. |
+| `dense self uninstall` | Remove the CLI and its shell integration. |
+
+</details>
+
+<details><summary>Build from source</summary>
 
 ```sh
 cargo build --release
-# static, dependency-free linux binary:
-cargo build --release --target x86_64-unknown-linux-musl
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-The crate forbids `unsafe` and denies `unwrap`/`expect`/`panic` via the
-`[lints]` table; `cargo clippy -- -D warnings` enforces it. Because releases
-are built from this repo's tagged source on GitHub Actions, you can read
-exactly what a published binary contains and reproduce it from a tag.
+For a static Linux binary, build with `--target x86_64-unknown-linux-musl`.
 
-Contributing and the release flow: see [CONTRIBUTING.md](CONTRIBUTING.md).
+</details>
+
+## Privacy
+
+Your agent’s requests pass through the Condense proxy. By default, conversation content is deleted after seven days of inactivity. Zero data retention is available on request. [Read the retention policy](https://condense.chat/security/).
+
+[Releases](https://github.com/condense-chat/dense/releases) · [Contributing](https://github.com/condense-chat/dense/blob/main/CONTRIBUTING.md) · [MIT license](https://github.com/condense-chat/dense/blob/main/LICENSE) · [Report an issue](https://github.com/condense-chat/dense/issues)

@@ -1,0 +1,58 @@
+[
+  {
+    "title": "A 938-turn coding session",
+    "url": "https://condense.chat/blog/anatomy-of-savings/",
+    "classification": "Published session replay",
+    "result": "One coding trace that exceeded 800k tokens of context was replayed for 938 turns. At Sonnet rates the estimated model cost went from $154 to $43, a reported 72.3% reduction.",
+    "caveat": "One unusually long trace. Helene 1 and Adeline 1 ran live; model costs were priced from cache-tier usage at Anthropic list rates. The Sonnet and Opus rows are the same session."
+  },
+  {
+    "title": "Where long sessions spend their tokens",
+    "url": "https://condense.chat/blog/anatomy-of-savings/",
+    "classification": "Usage analysis",
+    "result": "Across 12 coding sessions and 18,333 assistant turns, cache reads accounted for 67.7% of the baseline model cost.",
+    "caveat": "A breakdown of the sampled workload, not a savings percentage or a separate compression trial."
+  },
+  {
+    "title": "RTK on Terminal-Bench",
+    "url": "https://condense.chat/blog/case-001-rtk/",
+    "classification": "Exploratory third-party tool comparison",
+    "result": "In one Terminal-Bench comparison, cost per suite pass rose from $25.46 without RTK to $29.33 with RTK (+15.2%).",
+    "caveat": "No Condense arm. One run per setting; task outcomes vary across repeats. This measures suite cost rather than shell-output compression."
+  },
+  {
+    "title": "Helene 1.1 on Lost in Compression",
+    "url": "https://condense.chat/blog/helene-1-1/",
+    "classification": "Standalone compressor · multilingual QA",
+    "result": "At the roughly 50%-text-retained band, Helene 1.1 scored 7.09 accuracy points above bear-2 on the multilingual QA comparison.",
+    "caveat": "3,000 paired items across ten languages. Retained-text rates were approximately matched: Helene kept 1.02 percentage points more text than bear-2 at this band. This measures answer accuracy, not coding-agent solve rate."
+  },
+  {
+    "title": "Helene 1 on CoQA",
+    "url": "https://condense.chat/blog/helene-1/",
+    "classification": "Standalone compressor · conversational QA",
+    "result": "Across 150 CoQA turns, auto mode removed 30.6% of input tokens and scored 92.0% judged accuracy, versus 90.0% on uncompressed text.",
+    "caveat": "GPT-5.4 answered and judged the same 150 turns. The observed two-point difference represents three answers; no statistical significance is established."
+  },
+  {
+    "title": "Helene 1 on LongBench v2",
+    "url": "https://condense.chat/blog/helene-1/",
+    "classification": "Standalone compressor · long-document QA",
+    "result": "On 150 LongBench v2 items, Helene 1 auto removed 38.8% of 15.7M input tokens. Measured accuracy was 49.3%, versus 48.7% on uncompressed text.",
+    "caveat": "One sample, one answerer/judge pairing. The accuracy difference is approximately one item. The separate 50-item code/structured-data figure is a subset of this test."
+  },
+  {
+    "title": "Adeline 1 on CoderForge SWE traces",
+    "url": "https://condense.chat/blog/2026-05-23-adeline-v1/",
+    "classification": "Standalone compressor · fact retention",
+    "result": "On held-out CoderForge coding traces, Adeline 1 retained 94.2% of atomic facts while removing 90.2% of Claude-token input.",
+    "caveat": "Inputs were 30k–100k tokens. Fact recall measures information retained in compacted traces, not task completion or a reduction in model cost."
+  },
+  {
+    "title": "Axiometa Studio",
+    "url": "https://condense.chat/blog/axiometa/",
+    "classification": "Production customer case study",
+    "result": "Median cost per Studio turn, including failed turns, went from $0.45 to $0.16. Axiometa reports a 65% reduction.",
+    "caveat": "Before/after customer deployment combining compression, managed caching and changes to the agent workflow. The 65% cannot be attributed to compression alone."
+  }
+]

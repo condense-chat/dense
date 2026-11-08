@@ -1,0 +1,22 @@
+<div class="wrap"><section class="hero">
+<div><p class="eyebrow">Condense / dense CLI</p><h1>Context compression for <em>coding agents.</em></h1>
+<p class="lede">Keep using Claude Code, Codex or OpenCode. The open-source <code>dense</code> CLI routes your session through Condense to shrink the context your agent sends back to the model.</p>
+<div class="actions"><a class="btn" href="#install">Install dense <span aria-hidden="true">↓</span></a><a class="textlink" href="{{root}}benchmarks/">Explore the benchmarks →</a></div></div>
+<figure class="herofigure"><div class="file">Claude Opus 4.8 / cost replay</div><strong class="large">63.8%</strong><div class="unit">lower estimated model cost</div><div class="bars" aria-hidden="true"><div class="barrow"><span>Baseline</span><span class="track"><i class="bar"></i></span><b>$861.28</b></div><div class="barrow"><span>Condense</span><span class="track"><i class="bar after"></i></span><b>$312.20</b></div></div><figcaption>64 coding sessions · 11,712 turns<br>$861.28 → $312.20 with simulated prompt caching. <a href="{{root}}benchmarks/opus-rewrite/">Inspect the replay ↗</a></figcaption></figure>
+</section>
+<section class="section" id="benchmarks"><p class="eyebrow">Cost / matched turns</p><h2>Condense vs. Headroom</h2>
+<p>On the same 1,571 coding-agent turns, Condense saved <strong>27.5%</strong> of model cost. Headroom cache mode saved <strong>13.8%</strong> and Headroom Kompress saved <strong>1.8%</strong>. All three started from the same $17.63 baseline.</p>{{common_table}}
+<p class="micro">Company-published replay · Claude Haiku 4.5 · six SWE-chat sessions · July 2, 2026. Savings exclude service fees.</p>
+<a class="textlink" href="{{root}}compare/headroom/">Compare strategies and reproduce the result →</a></section>
+<section class="section" id="quality"><p class="eyebrow">Quality / task completion</p><h2>Does the agent still finish the task?</h2>
+<p>A cost replay holds the conversation fixed. To test quality, let the agent choose its next step or run the entire task against its verifier.</p>
+{{verifier}}
+<div class="tagrow"><div class="panel"><h3>What the verifier measured</h3><p>Claude Opus 4.8 attempted 14 long Terminal-Bench tasks. Condense passed 11 of 14 trials and Headroom passed 10 of 14. The sample is too small to establish a winner.</p></div><div class="panel"><h3>What the next-step scores measure</h3><p>On 192 shared steps, Condense chose the recorded action 24% of the time versus 46% for the control. A judge rated 63% and 58% of steps useful, respectively. Multiple actions can advance the same task.</p></div></div><a class="textlink" href="{{root}}benchmarks/quality/">Inspect the quality results and uncertainty →</a></section></div>
+<section id="install" class="install"><div class="wrap"><p class="eyebrow">Get started / dense CLI</p><h2>Try it on your next session.</h2>
+<p>Install <code>dense</code> on a machine where you already use a supported coding agent.</p>
+<h3>macOS or Linux</h3><div class="cmd"><pre><code>curl -fsSL https://cli.condense.chat/unix | sh</code></pre></div>
+<details><summary>Windows PowerShell</summary><div class="cmd"><pre><code>irm https://cli.condense.chat/nt | iex</code></pre></div></details>
+<p class="launch">Sign in during setup. For a one-session trial, uncheck preselected agents with Space, then press Enter. If setup asks about Claude Desktop, leave it on No. Launch the agent you use:</p>
+<pre><code>dense claude
+dense codex
+dense opencode</code></pre><p>Run <code>/dense:info</code> inside the agent to see session usage. <a href="https://condense.chat/docs/cli/">CLI guide</a> · <a href="https://condense.chat/pricing/">Condense pricing</a></p></div></section>

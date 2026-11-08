@@ -1,0 +1,18 @@
+{{head}}
+<h2>Which strategy reduced model cost the most?</h2>
+<p>Condense saved <strong>27.5%</strong> on the 1,571 turns every strategy completed. Headroom cache mode saved <strong>13.8%</strong> and Kompress saved <strong>1.8%</strong>. That puts Condense 13.7 percentage points ahead of cache mode on this replay.</p>
+{{common_table}}
+<div class="fine">Claude Haiku 4.5 · SWE-chat · six sessions · 190k-token context cap · July 2, 2026</div>
+<h2>Why match turns across all three strategies?</h2>
+<p>Some strategies completed more of the replay. The harness pairs each successful turn with its uncompressed baseline. Its published summary uses all available pairs for each strategy. For the comparison above, we took the intersection of session ID and turn index across all three strategies. Each row therefore prices exactly the same history.</p>
+<h3>Published results by strategy</h3>{{capped_table}}
+<p>Input tokens and dollars measure different things. Providers price cache reads, cache writes, fresh input and output differently. Rewriting a cached prefix can erase some of the savings from a shorter prompt. These figures cover the model bill before Condense fees.</p>
+<p><a href="{{root}}benchmarks/haiku-capped/">Read the full capped replay</a> · <a href="{{root}}data/common-turns.py" download>Download the common-turn calculation</a></p>
+<h2>Does the result carry over to Opus?</h2>
+<p>In a separate 64-session Claude Opus 4.8 rewrite replay, Condense reduced estimated model cost by <strong>63.8%</strong>. Headroom cache mode increased it by <strong>2.0%</strong>. Both used simulated cache pricing across 11,712 turns. The uncapped Haiku run tested only Condense, so its 37.3% savings measure a different question.</p>
+<p><a href="{{root}}benchmarks/opus-rewrite/">Opus replay and cache assumptions</a> · <a href="{{root}}benchmarks/haiku-long/">Uncapped Haiku replay</a></p>
+<h2>Which agent finished more tasks?</h2>{{verifier}}
+<p>On 14 long Terminal-Bench tasks, the verifier counted 11 of 14 successful Condense trials and 10 of 14 successful Headroom trials. Vanilla Claude Code had 34 trials. The reported intervals leave the ordering unresolved. The Headroom quality arm uses token mode with retrieval. The cost replay measured cache mode and Kompress separately.</p><p><a href="{{root}}benchmarks/quality/">See the quality study, including the higher-cost full-task result</a></p>
+<h2>What ran, and when?</h2>
+<p>Condense published these coding-agent benchmarks in its open evaluation harness. Here, Headroom means the <code>headroom-ai</code> context-compression proxy. The July runs identify the tested modes but the installer was unpinned and the manifests omit the exact Headroom release. Treat these results as a dated comparison of configurations.</p>
+<p><a href="https://github.com/condense-chat/minmax-bench/blob/2d3143f9f641ce93bfb72148126a59dc18789d2f/minmax_bench/config.py#L55">Historical harness configuration</a> · <a href="https://github.com/condense-chat/minmax-bench">Benchmark repository</a> · <a href="{{root}}#install">Try dense on your own agent</a></p>

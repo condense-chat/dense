@@ -4,7 +4,7 @@
 
 **63.8% lower estimated model cost** across 64 recorded coding sessions. Replaying all 11,712 turns at Claude Opus 4.8 rates put the baseline at $861.28 and condense at $312.20. [See the benchmark replay](#reproduce-the-benchmark).
 
-[Install](#install) · [Try one session](#try-one-session) · [Privacy](#privacy) · [CLI docs](https://condense.chat/docs/cli/) · [Plans](https://condense.chat/pricing/)
+[Benchmarks](https://condense-chat.github.io/dense/benchmarks/) · [Condense vs. Headroom](https://condense-chat.github.io/dense/compare/headroom/) · [Install](#install) · [Try one session](#try-one-session) · [Privacy](#privacy) · [CLI docs](https://condense.chat/docs/cli/) · [Plans](https://condense.chat/pricing/)
 
 ## Install
 

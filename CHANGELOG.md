@@ -3,6 +3,17 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.14.0] - 2026-11-08
+
+### Bug Fixes
+- Send the repo on heartbeats for every user
+
+### Documentation
+- Guide first sessions and show reproducible savings- Publish coding-agent cost and quality benchmarks
+
+### Features
+- Route the Claude Code VS Code extension through dense
+
 ## [0.13.0] - 2026-11-06
 
 ### Bug Fixes

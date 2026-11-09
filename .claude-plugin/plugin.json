@@ -1,0 +1,16 @@
+{
+  "name": "dense",
+  "description": "Show Condense token savings and Claude subscription usage in Claude Code. Requires the dense CLI on your PATH and a Condense login.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Condense"
+  },
+  "homepage": "https://condense.chat/docs/cli/",
+  "repository": "https://github.com/condense-chat/dense",
+  "license": "MIT",
+  "commands": [
+    "./assets/claude/info.md",
+    "./assets/claude/usage.md"
+  ],
+  "icon": "./.claude-plugin/icon.png"
+}

@@ -113,7 +113,10 @@ pub enum Command {
     Status,
     /// Claude Code status line for the launch footer (hidden).
     #[command(hide = true)]
-    Statusline,
+    Statusline {
+        #[arg(allow_hyphen_values = true)]
+        line: String,
+    },
     /// Remove shims for the named tools (no args: all).
     Unpersist {
         #[arg(value_name = "TOOL")]

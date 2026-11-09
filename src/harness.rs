@@ -54,14 +54,6 @@ pub trait Tool {
     fn label(&self) -> &str;
 }
 
-/// Last 7 days from the same endpoint helm reads.
-enum Savings {
-    /// Money off API traffic.
-    Api { saved_usd: f64 },
-    /// How much further the tool's own subscription went.
-    Plan { stretch: f64 },
-}
-
 /// One resolved dialect a tool wires itself to: its route, the condense base
 /// URL, and the shared `x-condense-*` headers.
 pub struct Target {
@@ -71,6 +63,14 @@ pub struct Target {
     /// `$CONDENSE_UPSTREAM_URL` — set when the proxy forwards to a
     /// non-default upstream (also sent as `x-condense-upstream-url`).
     pub upstream: Option<String>,
+}
+
+/// Last 7 days from the same endpoint helm reads.
+enum Savings {
+    /// Money off API traffic.
+    Api { saved_usd: f64 },
+    /// How much further the tool's own subscription went.
+    Plan { stretch: f64 },
 }
 
 impl Savings {

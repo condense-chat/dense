@@ -14,8 +14,6 @@ use crate::config::Config;
 use crate::harness::commands;
 use crate::harness::{self, Target, Tool};
 
-const FOOTER_ENV: &str = "CONDENSE_FOOTER";
-
 pub struct Claude {
     /// Plugin dir carrying `/dense`; `None` when staging failed and the
     /// launch should proceed without the command.
@@ -87,14 +85,8 @@ impl Tool for Claude {
         if has_status_line(cfg.home()) {
             return false;
         }
-        let command = format!(
-            "'{}' statusline",
-            exe.to_string_lossy().replace('\'', r"'\''")
-        );
-        let settings = serde_json::json!({"statusLine": {"type": "command", "command": command}});
-        cmd.env(FOOTER_ENV, line)
-            .arg("--settings")
-            .arg(settings.to_string());
+        let settings = serde_json::json!({"statusLine": {"type": "command", "command": statusline_command(&exe.to_string_lossy(), line)}});
+        cmd.arg("--settings").arg(settings.to_string());
         true
     }
 
@@ -123,11 +115,11 @@ pub async fn run_engine(cfg: &Config, creds: &Creds, real: &Path, args: &[OsStri
 
 /// `dense statusline`: prints the launch footer until the session's first API
 /// call lands, then nothing, so the row goes away.
-pub fn statusline() {
+pub fn statusline(line: &str) {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let status = serde_json::from_str(&input).unwrap_or(Value::Null);
-    if let Some(line) = footer_line(&status, std::env::var(FOOTER_ENV).ok()) {
+    if let Some(line) = footer_line(&status, line) {
         println!("{line}");
     }
 }
@@ -160,11 +152,11 @@ fn custom_headers(headers: &[(String, String)]) -> String {
     merge_headers(existing.as_deref(), headers)
 }
 
-fn footer_line(status: &Value, footer: Option<String>) -> Option<String> {
+fn footer_line<'a>(status: &Value, line: &'a str) -> Option<&'a str> {
     let api_ms = status["cost"]["total_api_duration_ms"]
         .as_f64()
         .unwrap_or(0.0);
-    footer.filter(|_| api_ms <= 0.0)
+    (api_ms <= 0.0 && !line.is_empty()).then_some(line)
 }
 
 fn has_status_line(home: &Path) -> bool {
@@ -203,6 +195,12 @@ fn merge_headers(existing: Option<&str>, headers: &[(String, String)]) -> String
         lines.push(format!("{name}: {value}"));
     }
     lines.join("\n")
+}
+
+/// `'<exe>' statusline '<line>'`, single-quoted for the shell Claude Code runs it in.
+fn statusline_command(exe: &str, line: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    format!("{} statusline {}", quote(exe), quote(line))
 }
 
 /// Claude Code's stored login: `.credentials.json`, else (macOS) its keychain item.
@@ -336,13 +334,21 @@ mod plugin_tests {
 
     #[test]
     fn footer_shows_until_the_first_api_call() {
-        let line = Some("condense gave you 58% more usage this week".to_string());
+        let line = "condense gave you 58% more usage this week";
         let fresh = serde_json::json!({"cost": {"total_api_duration_ms": 0}});
         let used = serde_json::json!({"cost": {"total_api_duration_ms": 1840}});
-        assert_eq!(footer_line(&fresh, line.clone()), line);
-        assert_eq!(footer_line(&Value::Null, line.clone()), line);
+        assert_eq!(footer_line(&fresh, line), Some(line));
+        assert_eq!(footer_line(&Value::Null, line), Some(line));
         assert_eq!(footer_line(&used, line), None);
-        assert_eq!(footer_line(&fresh, None), None);
+        assert_eq!(footer_line(&fresh, ""), None);
+    }
+
+    #[test]
+    fn statusline_command_quotes_the_exe_and_the_line() {
+        assert_eq!(
+            statusline_command("/Users/o'neil/dense", "condense saved you $412 this week"),
+            r"'/Users/o'\''neil/dense' statusline 'condense saved you $412 this week'"
+        );
     }
 
     #[test]

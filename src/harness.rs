@@ -26,7 +26,7 @@ use crate::error::{Context, Error};
 use crate::{Result, hosts, info, selfupdate, tool, ui};
 
 pub const SESSION_ENV: &str = "CONDENSE_SESSION_ID";
-const BANNER_TIMEOUT: Duration = Duration::from_millis(2500);
+const BANNER_TIMEOUT: Duration = Duration::from_millis(1500);
 const SESSION_END_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An agent CLI routed through condense. A tool declares which dialects it

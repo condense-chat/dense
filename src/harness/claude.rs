@@ -1,16 +1,20 @@
 //! Claude Code through condense (Anthropic dialect).
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::Path;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::Result;
 use crate::api::auth::Creds;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
 use crate::harness::commands;
-use crate::harness::{self, Target, Tool};
+use crate::harness::{self, Savings, Target, Tool};
+
+const FOOTER_ENV: &str = "CONDENSE_FOOTER";
 
 pub struct Claude {
     /// Plugin dir carrying `/dense`; `None` when staging failed and the
@@ -74,6 +78,26 @@ impl Tool for Claude {
         "claude"
     }
 
+    /// Session-scoped `statusLine` running `dense statusline`; a status line
+    /// the user set up themselves keeps its row.
+    fn footer(&self, cfg: &Config, cmd: &mut tokio::process::Command, savings: &Savings) -> bool {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        if has_status_line(cfg.home()) {
+            return false;
+        }
+        let command = format!(
+            "'{}' statusline",
+            exe.to_string_lossy().replace('\'', r"'\''")
+        );
+        let settings = serde_json::json!({"statusLine": {"type": "command", "command": command}});
+        cmd.env(FOOTER_ENV, savings.footer("Dense Claude"))
+            .arg("--settings")
+            .arg(settings.to_string());
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "claude_code"
     }
@@ -95,6 +119,17 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
 /// Desktop's engine through the Anthropic proxy; see [`harness::launch_engine`].
 pub async fn run_engine(cfg: &Config, creds: &Creds, real: &Path, args: &[OsString]) -> Result<()> {
     harness::launch_engine(cfg, Claude { plugin_dir: None }, creds, real, args).await
+}
+
+/// `dense statusline`: prints the launch footer until the session's first API
+/// call lands, then nothing, so the row goes away.
+pub fn statusline() {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let status = serde_json::from_str(&input).unwrap_or(Value::Null);
+    if let Some(line) = footer_line(&status, std::env::var(FOOTER_ENV).ok()) {
+        println!("{line}");
+    }
 }
 
 /// An Anthropic-only knob: `on` when we forward to Anthropic itself, `off`
@@ -123,6 +158,27 @@ fn anthropic_only(
 fn custom_headers(headers: &[(String, String)]) -> String {
     let existing = std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
     merge_headers(existing.as_deref(), headers)
+}
+
+fn footer_line(status: &Value, footer: Option<String>) -> Option<String> {
+    let api_ms = status["cost"]["total_api_duration_ms"]
+        .as_f64()
+        .unwrap_or(0.0);
+    footer.filter(|_| api_ms <= 0.0)
+}
+
+fn has_status_line(home: &Path) -> bool {
+    let user = commands::claude_home(home, |k| std::env::var(k).ok());
+    let project = Path::new(".claude");
+    [
+        user.join("settings.json"),
+        project.join("settings.json"),
+        project.join("settings.local.json"),
+    ]
+    .iter()
+    .filter_map(|p| std::fs::read_to_string(p).ok())
+    .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
+    .any(|v| !v["statusLine"].is_null())
 }
 
 /// Newline-joined `Name: Value` for ANTHROPIC_CUSTOM_HEADERS. Preserves a
@@ -277,6 +333,17 @@ mod tests {
 #[cfg(test)]
 mod plugin_tests {
     use super::*;
+
+    #[test]
+    fn footer_shows_until_the_first_api_call() {
+        let line = Some("condense ███".to_string());
+        let fresh = serde_json::json!({"cost": {"total_api_duration_ms": 0}});
+        let used = serde_json::json!({"cost": {"total_api_duration_ms": 1840}});
+        assert_eq!(footer_line(&fresh, line.clone()), line);
+        assert_eq!(footer_line(&Value::Null, line.clone()), line);
+        assert_eq!(footer_line(&used, line), None);
+        assert_eq!(footer_line(&fresh, None), None);
+    }
 
     #[test]
     fn plugin_dir_rides_the_argv_ahead_of_user_args() {

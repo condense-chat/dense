@@ -57,6 +57,10 @@ async fn main() -> EyreResult<()> {
         .display_location_section(false)
         .install()?;
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Statusline) {
+        harness::claude::statusline();
+        return Ok(());
+    }
     init_tracing(cli.verbose);
 
     let url = Config::cli_url(cli.url.clone(), cli.environment.as_deref());
@@ -70,6 +74,7 @@ async fn main() -> EyreResult<()> {
             status(&cfg);
             Ok(())
         }
+        Command::Statusline => Ok(()),
         Command::Daemon(DaemonCommand::Install) => {
             daemon::install(&cfg).and_then(|()| desktop::keep_daemon(&cfg))
         }

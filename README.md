@@ -1,5 +1,7 @@
 ![dense, the Condense CLI](https://raw.githubusercontent.com/condense-chat/.github/main/profile/dense-banner.png)
 
+[condense.chat](https://condense.chat) · [condense.chat/docs](https://condense.chat/docs/) · [helm.condense.chat](https://helm.condense.chat)
+
 **Use fewer tokens in Claude Code, Codex, and OpenCode.** A long debugging session can send the same file reads, diffs, and test logs to the model dozens of times. The open-source `dense` CLI launches your coding agent and routes its model requests through Condense’s hosted compression proxy.
 
 **63.8% lower estimated model cost** across 64 recorded coding sessions. Replaying all 11,712 turns at Claude Opus 4.8 rates put the baseline at $861.28 and condense at $312.20. [See the benchmark replay](#reproduce-the-benchmark).

@@ -12,7 +12,7 @@ pub mod opencode;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -27,7 +27,6 @@ use crate::{Result, hosts, info, selfupdate, tool, ui};
 
 pub const SESSION_ENV: &str = "CONDENSE_SESSION_ID";
 const BANNER_TIMEOUT: Duration = Duration::from_millis(2500);
-const FOOTER_BAR: usize = 12;
 const SESSION_END_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An agent CLI routed through condense. A tool declares which dialects it
@@ -43,13 +42,9 @@ pub trait Tool {
     /// The dialects this tool speaks; `apply` gets one [`Target`] per entry.
     fn dialects(&self) -> &'static [Dialect];
 
-    /// Hand `savings` to the tool's own UI; `false` leaves it to the banner.
-    fn footer(
-        &self,
-        _cfg: &Config,
-        _cmd: &mut tokio::process::Command,
-        _savings: &Savings,
-    ) -> bool {
+    /// Hand the savings `line` to the tool's own UI; `false` leaves it to the
+    /// banner.
+    fn footer(&self, _cfg: &Config, _cmd: &mut tokio::process::Command, _line: &str) -> bool {
         false
     }
 
@@ -59,10 +54,10 @@ pub trait Tool {
     fn label(&self) -> &str;
 }
 
-/// Last 30 days from the same endpoint helm reads.
-pub enum Savings {
-    /// Money off API traffic; `share` is the fraction of the bill saved.
-    Api { saved_usd: f64, share: f64 },
+/// Last 7 days from the same endpoint helm reads.
+enum Savings {
+    /// Money off API traffic.
+    Api { saved_usd: f64 },
     /// How much further the tool's own subscription went.
     Plan { stretch: f64 },
 }
@@ -79,25 +74,18 @@ pub struct Target {
 }
 
 impl Savings {
-    /// Footer row: a bar filled to the share condense took off, then the text.
-    pub fn footer(&self, name: &str) -> String {
-        let share = match self {
-            Self::Api { share, .. } => *share,
-            Self::Plan { stretch } => 1.0 - 1.0 / stretch,
-        };
-        let filled = ((share.clamp(0.0, 1.0) * FOOTER_BAR as f64).round() as usize).min(FOOTER_BAR);
-        format!(
-            "{} {}{} {}",
-            ui::bold(&ui::green(name)),
-            ui::green(&"█".repeat(filled)),
-            ui::dim(&"░".repeat(FOOTER_BAR - filled)),
-            ui::green(&format!("{} in last 30 days", self.text())),
-        )
-    }
-
-    /// Banner line for when the footer is taken: names condense in the text.
-    pub fn line(&self) -> String {
-        format!("{} with condense in last 30 days", self.text())
+    fn line(&self) -> String {
+        match self {
+            Self::Api { saved_usd } => {
+                format!("condense saved you {} this week", usd_short(*saved_usd))
+            }
+            Self::Plan { stretch } => format!(
+                "condense gave you {} more usage this week",
+                stretch_label(*stretch)
+                    .unwrap_or_default()
+                    .trim_start_matches('+')
+            ),
+        }
     }
 
     /// The stretch on this tool's own plan, else money saved on API traffic.
@@ -114,22 +102,7 @@ impl Savings {
             return Some(Self::Plan { stretch });
         }
         let saved_usd = info::usd(&value["api"]["saved_usd"]);
-        let share = value["api"]["saved_pct"].as_f64().unwrap_or(0.0);
-        (saved_usd > 0.0).then_some(Self::Api { saved_usd, share })
-    }
-
-    fn text(&self) -> String {
-        match self {
-            Self::Api { saved_usd, .. } => {
-                format!("{} saved on your API bill", usd_short(*saved_usd))
-            }
-            Self::Plan { stretch } => format!(
-                "{} more usage estimated",
-                stretch_label(*stretch)
-                    .unwrap_or_default()
-                    .trim_start_matches('+')
-            ),
-        }
+        (saved_usd > 0.0).then_some(Self::Api { saved_usd })
     }
 }
 
@@ -318,21 +291,20 @@ async fn announce<T: Tool>(api: &Api, cfg: &Config, tool: &T, cmd: &mut tokio::p
         "  observe usage at {}",
         hosts::sibling(&cfg.api_host, "helm", scheme)
     );
+    let path = format!("/v1/me/analytics/value{}", week_query(SystemTime::now()));
     let (value, latest) = tokio::join!(
-        tokio::time::timeout(
-            BANNER_TIMEOUT,
-            api.get_json::<Value>("/v1/me/analytics/value")
-        ),
+        tokio::time::timeout(BANNER_TIMEOUT, api.get_json::<Value>(&path)),
         tokio::time::timeout(BANNER_TIMEOUT, selfupdate::newer(cfg)),
     );
-    let savings = value
+    let line = value
         .ok()
         .and_then(Result::ok)
-        .and_then(|v| Savings::of(&v, tool.kind()));
-    if let Some(savings) = savings
-        && !tool.footer(cfg, cmd, &savings)
+        .and_then(|v| Savings::of(&v, tool.kind()))
+        .map(|s| ui::bold(&ui::green(&s.line())));
+    if let Some(line) = line
+        && !tool.footer(cfg, cmd, &line)
     {
-        eprintln!("  {}", ui::bold(&ui::green(&savings.line())));
+        eprintln!("  {line}");
     }
     if let Ok(Some(latest)) = latest {
         eprintln!(
@@ -470,6 +442,27 @@ fn usd_short(n: f64) -> String {
     }
 }
 
+/// `?start=…&end=…` for the last 7 UTC days, today included.
+fn week_query(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let today = i64::try_from(secs / 86_400).unwrap_or(0);
+    format!("?start={}&end={}", ymd(today - 6), ymd(today))
+}
+
+/// Days since 1970-01-01 as `YYYY-MM-DD` (Hinnant's `civil_from_days`).
+fn ymd(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -487,19 +480,27 @@ mod tests {
                 {"family": "codex", "stretch": 2.4},
                 {"family": "claude_code", "stretch": 1.58},
             ]},
-            "api": {"saved_usd": "412.30", "saved_pct": 0.42},
+            "api": {"saved_usd": "412.30"},
         });
         assert_eq!(
             text(&v, "claude_code").as_deref(),
-            Some("58% more usage estimated with condense in last 30 days")
+            Some("condense gave you 58% more usage this week")
         );
         assert_eq!(
             text(&v, "codex").as_deref(),
-            Some("140% more usage estimated with condense in last 30 days")
+            Some("condense gave you 140% more usage this week")
         );
         assert_eq!(
             text(&v, "opencode").as_deref(),
-            Some("$412 saved on your API bill with condense in last 30 days")
+            Some("condense saved you $412 this week")
+        );
+        assert_eq!(
+            text(
+                &json!({"subscription": {"families": [{"family": "claude_code", "stretch": 3.4}]}}),
+                "claude_code"
+            )
+            .as_deref(),
+            Some("condense gave you 3× more usage this week")
         );
     }
 
@@ -508,7 +509,7 @@ mod tests {
         let api = json!({"subscription": null, "api": {"saved_usd": "1520.10"}});
         assert_eq!(
             text(&api, "claude_code").as_deref(),
-            Some("$1.5K saved on your API bill with condense in last 30 days")
+            Some("condense saved you $1.5K this week")
         );
         let flat = json!({
             "subscription": {"families": [{"family": "claude_code", "stretch": 1.02}]},
@@ -519,25 +520,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_fills_to_the_share_condense_took_off() {
-        owo_colors::set_override(false);
-        let plan = Savings::Plan { stretch: 2.0 };
-        assert_eq!(
-            plan.footer("Dense Claude"),
-            "Dense Claude ██████░░░░░░ 100% more usage estimated in last 30 days"
-        );
-        assert_eq!(
-            Savings::Plan { stretch: 3.4 }.footer("Dense Claude"),
-            "Dense Claude ████████░░░░ 3× more usage estimated in last 30 days"
-        );
-        let api = Savings::Api {
-            saved_usd: 412.3,
-            share: 0.25,
-        };
-        assert_eq!(
-            api.footer("Dense Claude"),
-            "Dense Claude ███░░░░░░░░░ $412 saved on your API bill in last 30 days"
-        );
+    fn week_query_spans_the_last_seven_utc_days() {
+        let day = |d: u64| UNIX_EPOCH + Duration::from_secs(d * 86_400 + 3_600);
+        assert_eq!(week_query(day(20_766)), "?start=2026-11-03&end=2026-11-09");
+        assert_eq!(week_query(day(19_783)), "?start=2024-02-24&end=2024-03-01");
+        assert_eq!(ymd(11_016), "2000-02-29");
+        assert_eq!(ymd(0), "1970-01-01");
     }
 
     #[test]

@@ -111,6 +111,9 @@ pub enum Command {
     Setup,
     /// Show identity, api host, and persisted tools.
     Status,
+    /// Claude Code status line for the launch footer (hidden).
+    #[command(hide = true)]
+    Statusline,
     /// Remove shims for the named tools (no args: all).
     Unpersist {
         #[arg(value_name = "TOOL")]

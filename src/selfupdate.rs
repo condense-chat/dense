@@ -23,6 +23,15 @@ struct Manifest {
     version: String,
 }
 
+/// The latest release when it is newer than this binary; `None` on any
+/// failure or a non-semver (dev) manifest.
+pub async fn newer(cfg: &Config) -> Option<String> {
+    let api = Api::anonymous(cfg.release_base()).ok()?;
+    let path = format!("/releases/latest/download/manifest-{}.json", platform());
+    let manifest = api.get_json::<Manifest>(&path).await.ok()?;
+    newer_than(env!("CARGO_PKG_VERSION"), &manifest.version)
+}
+
 pub async fn uninstall(cfg: &Config) -> Result<()> {
     // The daemon first, or a managed one wraps the engines again behind this.
     if daemon::autostart::installed(cfg).is_some()
@@ -125,6 +134,12 @@ fn asset_name(platform: &str) -> String {
     format!("dense-{platform}{suffix}")
 }
 
+fn newer_than(current: &str, latest: &str) -> Option<String> {
+    let current = semver::Version::parse(current).ok()?;
+    let latest = semver::Version::parse(latest).ok()?;
+    (latest > current).then(|| latest.to_string())
+}
+
 /// Digest of the running binary — what a non-semver manifest compares to.
 fn own_sha256() -> Result<String> {
     let exe = std::env::current_exe().ctx("locating the running binary")?;
@@ -173,4 +188,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newer_than_only_reports_a_strictly_newer_semver() {
+        assert_eq!(newer_than("0.14.0", "0.15.0").as_deref(), Some("0.15.0"));
+        assert_eq!(newer_than("0.14.0", "0.14.0"), None);
+        assert_eq!(newer_than("0.15.0", "0.14.0"), None);
+        assert_eq!(newer_than("0.14.0", "dev"), None);
+    }
 }

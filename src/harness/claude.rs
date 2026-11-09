@@ -12,7 +12,7 @@ use crate::api::auth::Creds;
 use crate::api::dialect::Dialect;
 use crate::config::Config;
 use crate::harness::commands;
-use crate::harness::{self, Savings, Target, Tool};
+use crate::harness::{self, Target, Tool};
 
 const FOOTER_ENV: &str = "CONDENSE_FOOTER";
 
@@ -80,7 +80,7 @@ impl Tool for Claude {
 
     /// Session-scoped `statusLine` running `dense statusline`; a status line
     /// the user set up themselves keeps its row.
-    fn footer(&self, cfg: &Config, cmd: &mut tokio::process::Command, savings: &Savings) -> bool {
+    fn footer(&self, cfg: &Config, cmd: &mut tokio::process::Command, line: &str) -> bool {
         let Ok(exe) = std::env::current_exe() else {
             return false;
         };
@@ -92,7 +92,7 @@ impl Tool for Claude {
             exe.to_string_lossy().replace('\'', r"'\''")
         );
         let settings = serde_json::json!({"statusLine": {"type": "command", "command": command}});
-        cmd.env(FOOTER_ENV, savings.footer("Dense Claude"))
+        cmd.env(FOOTER_ENV, line)
             .arg("--settings")
             .arg(settings.to_string());
         true
@@ -336,7 +336,7 @@ mod plugin_tests {
 
     #[test]
     fn footer_shows_until_the_first_api_call() {
-        let line = Some("condense ███".to_string());
+        let line = Some("condense gave you 58% more usage this week".to_string());
         let fresh = serde_json::json!({"cost": {"total_api_duration_ms": 0}});
         let used = serde_json::json!({"cost": {"total_api_duration_ms": 1840}});
         assert_eq!(footer_line(&fresh, line.clone()), line);

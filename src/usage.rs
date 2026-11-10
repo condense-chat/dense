@@ -67,6 +67,7 @@ pub async fn run(cfg: &Config, sub: &str, json: bool, attributed_only: bool) -> 
         return Err(Error::Auth("not logged in — run `dense login`".into()));
     }
     let api = Api::authed(cfg, &creds)?;
+    let progress = (!json).then(|| ui::progress("Loading plan usage..."));
     let plan = fetch_plan(&oauth.access_token).await?;
     let mut rows = Vec::new();
     for w in windows(&plan) {
@@ -82,6 +83,7 @@ pub async fn run(cfg: &Config, sub: &str, json: bool, attributed_only: bool) -> 
         };
         rows.push(row(&w, &got, &inferred));
     }
+    drop(progress);
     if json {
         let out = json!({"sub": sub, "windows": rows});
         println!(
@@ -115,7 +117,7 @@ fn bar(used: f64, scale: f64, width: usize) -> String {
 fn comparison(used: f64, without: f64, scale: f64, width: usize, indent: &str) -> String {
     let available = width.saturating_sub(indent.len());
     let inline = available >= 54;
-    let prefix = if inline { 16 } else { 0 };
+    let prefix = if inline { 18 } else { 0 };
     let marker = usize::from(scale > 100.0);
     let value_width = format!("{scale:.0}% est.").len();
     let cells = available
@@ -123,7 +125,7 @@ fn comparison(used: f64, without: f64, scale: f64, width: usize, indent: &str) -
         .min(48);
     let chart_width = cells + marker;
     let mut out = String::new();
-    for (index, (label, value)) in [("Regular Claude", without), ("Dense Claude", used)]
+    for (index, (label, value)) in [("Without Condense", without), ("With Condense", used)]
         .iter()
         .enumerate()
     {
@@ -137,7 +139,7 @@ fn comparison(used: f64, without: f64, scale: f64, width: usize, indent: &str) -
             let pad =
                 " ".repeat(chart_width.saturating_sub(console::measure_text_width(&rendered)));
             out.push_str(&format!(
-                "{indent}{label:<14}  {}{pad}  {}\n",
+                "{indent}{label:<16}  {}{pad}  {}\n",
                 paint(&rendered),
                 ui::bold(&percent)
             ));
@@ -266,9 +268,27 @@ fn row(w: &Window, got: &Value, inferred: &Value) -> Value {
 }
 
 fn summary(rows: &[Value], width: usize) -> String {
+    let indent = if width >= 4 { "  " } else { "" };
+    let body = summary_body(rows, width.saturating_sub(indent.len()));
+    let mut out = String::from("\n");
+    for line in body.lines() {
+        if !line.is_empty() {
+            out.push_str(indent);
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn summary_body(rows: &[Value], width: usize) -> String {
     let width = width.clamp(1, 76);
     if rows.is_empty() {
-        return format!("{}\n", wrapped("No active Claude limits", width, ""));
+        return format!(
+            "{}\n\n{}\n",
+            ui::bold(&wrapped("dense / Claude plan usage", width, "")),
+            wrapped("No active Claude plan limits to show.", width, "")
+        );
     }
     let num = |r: &Value, k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -279,8 +299,8 @@ fn summary(rows: &[Value], width: usize) -> String {
     let indent = if width >= 4 { "  " } else { "" };
     let mut out = format!(
         "{}\n{}\n\n",
-        ui::bold(&wrapped("Claude plan usage", width, "")),
-        ui::dim(&wrapped("Comparing the same work", width, ""))
+        ui::bold(&wrapped("dense / Claude plan usage", width, "")),
+        ui::dim(&wrapped("Plan used for the same work", width, ""))
     );
     for r in rows {
         let title = text(r, "title")
@@ -305,7 +325,7 @@ fn summary(rows: &[Value], width: usize) -> String {
             let gain = (num(r, "usage_multiplier") - 1.0) * 100.0;
             let direction = if gain >= 0.0 { "more" } else { "less" };
             out.push_str(&ui::bold(&wrapped(
-                &format!("{:.0}% {direction} usage · estimated", gain.abs()),
+                &format!("{:.0}% {direction} work per plan · estimated", gain.abs()),
                 width,
                 indent,
             )));
@@ -341,18 +361,7 @@ fn summary(rows: &[Value], width: usize) -> String {
 }
 
 fn terminal_width() -> usize {
-    console::Term::stdout()
-        .size_checked()
-        .map(|(_, cols)| usize::from(cols))
-        .filter(|&cols| cols > 0)
-        .or_else(|| {
-            std::env::var("COLUMNS")
-                .ok()?
-                .parse::<usize>()
-                .ok()
-                .filter(|&cols| cols > 0)
-        })
-        .unwrap_or(80)
+    ui::width(false)
 }
 
 fn usage_url(base: &str, w: &Window, inferred: bool) -> Result<reqwest::Url> {
@@ -450,7 +459,8 @@ fn wrapped(text: &str, width: usize, indent: &str) -> String {
         text,
         textwrap::Options::new(width.max(1))
             .initial_indent(indent)
-            .subsequent_indent(indent),
+            .subsequent_indent(indent)
+            .word_splitter(textwrap::WordSplitter::NoHyphenation),
     )
 }
 
@@ -521,9 +531,9 @@ mod tests {
         assert_eq!(r["usage_multiplier"], 2.0);
         assert_eq!(r["inferred_requests"], 2);
         let display = summary(&[r], 80);
-        assert!(display.contains("Regular Claude"));
+        assert!(display.contains("Without Condense"));
         assert!(display.contains("200%"));
-        assert!(display.contains("100% more usage · estimated"));
+        assert!(display.contains("100% more work per plan · estimated"));
 
         let attributed = json!({"models": [{
             "model": "claude-fable-5-1", "provider": "anthropic",
@@ -569,11 +579,11 @@ mod tests {
                 );
             }
             let words = display.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(words.contains("Regular Claude"));
-            assert!(words.contains("Dense Claude"));
+            assert!(words.contains("Without Condense"));
+            assert!(words.contains("With Condense"));
             assert!(words.contains("201%"));
             assert!(words.contains("100%"));
-            assert!(words.contains("101% more usage · estimated"));
+            assert!(words.contains("101% more work per plan · estimated"));
             assert!(words.contains("Resets 2026-09-22 04:59 UTC"));
         }
     }

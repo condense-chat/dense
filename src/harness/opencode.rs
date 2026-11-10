@@ -93,17 +93,19 @@ impl Tool for OpenCode {
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     commands::sweep_legacy(cfg);
     let plugins = stage_plugins(cfg).unwrap_or_else(|e| {
-        eprintln!("  warning: could not stage OpenCode plugins: {e}");
+        crate::ui::warning(format!("Could not prepare OpenCode plugins: {e}"));
         Vec::new()
     });
     let catalog = load_catalog();
     if catalog.is_empty() {
-        eprintln!(
-            "  no OpenAI- or Anthropic-dialect provider is set up in OpenCode — \
-             nothing to route through condense"
+        crate::ui::stderr_note(
+            "No OpenAI or Anthropic provider is set up in OpenCode; nothing to route through Condense",
         );
     } else {
-        eprintln!("  routing {} providers through condense", catalog.len());
+        crate::ui::stderr_note(format!(
+            "Routing {} providers through Condense",
+            catalog.len()
+        ));
     }
     harness::launch(cfg, OpenCode { catalog, plugins }, args).await
 }

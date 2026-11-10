@@ -103,7 +103,7 @@ impl Tool for Claude {
 pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     commands::sweep_legacy(cfg);
     let plugin_dir = commands::claude_plugin_dir(cfg)
-        .map_err(|e| eprintln!("  warning: could not stage the /dense command: {e}"))
+        .map_err(|e| crate::ui::warning(format!("Could not prepare the /dense command: {e}")))
         .ok();
     harness::launch(cfg, Claude { plugin_dir }, args).await
 }

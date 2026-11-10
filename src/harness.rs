@@ -116,10 +116,10 @@ pub(crate) fn with_v1(base: &str) -> String {
 pub async fn launch<T: Tool>(cfg: &Config, tool: T, args: &[String]) -> Result<()> {
     let bin = tool::resolve_real(cfg, tool.binary())?;
     if crate::daemon::managed::switched_off(cfg) {
-        eprintln!(
-            "dense is turned off by your organization; running {} directly",
+        ui::stderr_note(format!(
+            "Dense is turned off by your organization; running {} directly",
             tool.label()
-        );
+        ));
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         return run_direct(&bin, &args);
     }
@@ -282,15 +282,15 @@ async fn spawn_and_wait(
 
 async fn announce<T: Tool>(api: &Api, cfg: &Config, tool: &T, cmd: &mut tokio::process::Command) {
     let scheme = hosts::default_scheme_for(&cfg.api_host);
-    eprintln!(
-        "● condense activated — {} is routing through {}",
+    ui::stderr_success(format!(
+        "{} is using Condense via {}",
         tool.label(),
         cfg.api_host
-    );
-    eprintln!(
-        "  observe usage at {}",
+    ));
+    ui::stderr_detail(format!(
+        "Usage: {}",
         hosts::sibling(&cfg.api_host, "helm", scheme)
-    );
+    ));
     let path = format!("/v1/me/analytics/value{}", week_query(SystemTime::now()));
     let (value, latest) = tokio::join!(
         tokio::time::timeout(BANNER_TIMEOUT, api.get_json::<Value>(&path)),
@@ -300,17 +300,16 @@ async fn announce<T: Tool>(api: &Api, cfg: &Config, tool: &T, cmd: &mut tokio::p
         .ok()
         .and_then(Result::ok)
         .and_then(|v| Savings::of(&v, tool.kind()))
-        .map(|s| ui::bold(&ui::green(&s.line())));
+        .map(|s| s.line());
     if let Some(line) = line
-        && !tool.footer(cfg, cmd, &line)
+        && !tool.footer(cfg, cmd, &ui::bold(&ui::green(&line)))
     {
-        eprintln!("  {line}");
+        ui::stderr_success(line);
     }
     if let Ok(Some(latest)) = latest {
-        eprintln!(
-            "  {}",
-            ui::yellow(&format!("dense {latest} is out, run `dense self update`"))
-        );
+        ui::stderr_note(format!(
+            "Dense {latest} is available. Update with `dense self update`."
+        ));
     }
     eprintln!();
 }

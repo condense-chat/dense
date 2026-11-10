@@ -5,7 +5,6 @@
 //! reconnects stdin to the tty so the prompts work; with no tty it explains
 //! and uses defaults.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::api::auth;
@@ -13,8 +12,7 @@ use crate::config::Config;
 use crate::{Result, daemon, desktop, env_file, persist, tool, ui};
 
 pub async fn run(cfg: &Config) -> Result<()> {
-    let interactive = std::io::stdin().is_terminal();
-    // Login runs in its own frame so the code is the first thing on screen.
+    let interactive = ui::interactive();
     if !auth::load_creds(cfg).is_authenticated() {
         auth::login(cfg).await?;
     }
@@ -22,12 +20,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
     if daemon::managed::after_login(cfg).await && cfg!(feature = "managed-setup") {
         let wiring = env_file::ensure_env(cfg, persist::may_modify_path(cfg))?;
         persist::report_wiring(cfg, &wiring);
-        println!("this device is managed by your organization: there is nothing else to set up");
+        ui::success("Your organization manages this device. There is nothing else to set up");
         return Ok(());
     }
     let res = wizard(cfg, interactive);
     if res.is_err() && interactive {
-        let _ = cliclack::outro_cancel(ui::yellow("setup did not finish."));
+        ui::warning("Setup did not finish. Run `dense setup` to try again.");
     }
     res
 }
@@ -38,15 +36,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
 fn ask(interactive: bool, question: &str, explain: &str, default_yes: bool) -> Option<bool> {
     if !interactive {
         let default = if default_yes { "yes" } else { "no" };
-        println!("{question}");
-        println!("{}", ui::dim(explain));
-        println!("{}", ui::dim(&format!("[no tty — default: {default}]")));
-        println!();
+        ui::note(question);
+        ui::detail(explain);
+        ui::detail(format!("No interactive terminal. Using default: {default}"));
         return Some(default_yes);
     }
-    let _ = cliclack::log::remark(ui::dim(&format!(
-        "{explain}\ny / n · enter keeps the default"
-    )));
+    ui::stderr_detail(explain);
+    ui::stderr_detail("y / n to choose; Enter keeps the default");
     cliclack::confirm(question)
         .initial_value(default_yes)
         .interact()
@@ -71,10 +67,9 @@ fn ask_desktop(interactive: bool) -> Option<bool> {
     )
 }
 
-// A cancelled prompt already closed the frame ("Operation cancelled.").
 fn cancelled(interactive: bool) -> Result<()> {
     if interactive {
-        println!("{}", ui::dim("rerun `dense setup` anytime."));
+        ui::hint("Try again", "dense setup");
     }
     Ok(())
 }
@@ -112,8 +107,7 @@ fn path_warnings(cfg: &Config, tools: &[String], wiring: &env_file::PathWiring) 
 /// installed set.
 fn pick_tools(cfg: &Config, interactive: bool) -> Option<Vec<String>> {
     let question = "Which tools should always go through condense?";
-    let explain = "\"persisting\" a tool makes its bare command (e.g. `claude`) route through \
-                   condense every time. Unchecked tools still work on demand via `dense <tool>`.";
+    let explain = "Selected tools use Condense whenever you run them (for example, `claude`). Unchecked tools still work with `dense <tool>`.";
     let installed: Vec<String> = persist::names()
         .filter(|name| tool::resolve_real(cfg, name).is_ok())
         .map(str::to_string)
@@ -124,15 +118,13 @@ fn pick_tools(cfg: &Config, interactive: bool) -> Option<Vec<String>> {
         } else {
             installed.join(", ")
         };
-        println!("{question}");
-        println!("{}", ui::dim(explain));
-        println!("{}", ui::dim(&format!("[no tty — default: {default}]")));
-        println!();
+        ui::note(question);
+        ui::detail(explain);
+        ui::detail(format!("No interactive terminal. Using default: {default}"));
         return Some(installed);
     }
-    let _ = cliclack::log::remark(ui::dim(&format!(
-        "{explain}\n↑↓ move · space toggles · enter confirms"
-    )));
+    ui::stderr_detail(explain);
+    ui::stderr_detail("Arrow keys to move; Space to select; Enter to confirm");
     let mut prompt = cliclack::multiselect(question)
         .initial_values(installed.clone())
         .required(false);
@@ -153,14 +145,14 @@ fn persist_summary(tools: &[String]) -> String {
     let unpersist = ui::cyan("dense unpersist <tool>");
     if tools.is_empty() {
         return format!(
-            "Nothing persisted — tools go through condense only when run as `{}`.\n\
-             Make one always-on later with `{persist}`.",
+            "Automatic routing is off. Tools use Condense only when run as `{}`.\n\
+             Turn it on later with `{persist}`.",
             ui::cyan("dense <tool>")
         );
     }
     format!(
-        "Persisted: {} — the bare command now always goes through condense.\n\
-         Add more with `{persist}`; go back to on-demand with `{unpersist}`.",
+        "Automatic routing: {}. These commands now use Condense.\n\
+         Add more with `{persist}`; turn it off with `{unpersist}`.",
         ui::bold(&tools.join(", "))
     )
 }
@@ -174,34 +166,9 @@ fn start_hint(tools: &[String]) -> String {
     )
 }
 
-/// A warning that stays inside the cliclack frame when there is one.
-fn info(interactive: bool, text: &str) {
-    if interactive {
-        let _ = cliclack::log::info(text);
-    } else {
-        println!("{text}");
-    }
-}
-
-fn warn(interactive: bool, text: &str) {
-    if interactive {
-        let _ = cliclack::log::warning(text);
-    } else {
-        eprintln!("{}", ui::yellow(text));
-    }
-}
-
 fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
-    let note = format!(
-        "dense is open source — read the code: {}",
-        env!("CARGO_PKG_REPOSITORY")
-    );
-    if interactive {
-        let _ = cliclack::intro(ui::cyan("condense setup"));
-        let _ = cliclack::log::remark(ui::dim(&note));
-    } else {
-        println!("{}\n", ui::dim(&note));
-    }
+    ui::title("Setup");
+    ui::field("Source", env!("CARGO_PKG_REPOSITORY"));
 
     let Some(tools) = pick_tools(cfg, interactive) else {
         return cancelled(interactive);
@@ -223,51 +190,47 @@ fn wizard(cfg: &Config, interactive: bool) -> Result<()> {
     let wiring = env_file::ensure_env(cfg, modify_path)?;
     persist::remember_path_choice(cfg, modify_path)?;
     if let env_file::PathWiring::Manual(notes) = &wiring {
-        warn(interactive, &notes.join("\n"));
+        ui::warning(notes.join("\n"));
     }
     if !tools.is_empty() {
         let mut report = persist::install_shims(cfg, &tools)?;
         persist::wire_claude(cfg, &mut report)?;
         for settings in &report.editors {
-            info(
-                interactive,
-                &format!(
-                    "Claude Code in {} now runs through dense",
-                    settings.display()
-                ),
-            );
+            ui::note("Claude Code in your editor is set up to use Condense");
+            ui::detail(format!("Settings: {}", settings.display()));
         }
         if let Some(entry) = &report.daemon {
-            info(
-                interactive,
-                &format!("dense daemon keeps it that way ({})", entry.display()),
+            ui::field(
+                "Editor updates",
+                "Enabled; settings are repaired automatically",
             );
+            ui::detail(format!("Service file: {}", entry.display()));
         }
         for warning in &report.warnings {
-            warn(interactive, warning);
+            ui::warning(warning);
         }
     }
     for warning in path_warnings(cfg, &tools, &wiring) {
-        warn(interactive, &warning);
+        ui::warning(warning);
     }
     if route_desktop {
         match desktop::route(cfg, None, true) {
             Ok(report) => {
                 for warning in &report.warnings {
-                    warn(interactive, warning);
+                    ui::warning(warning);
                 }
-                info(interactive, &report.lines.join("\n"));
+                ui::note(&report.summary);
+                for (label, value) in &report.fields {
+                    ui::field(label, value);
+                }
+                desktop::coverage(0);
             }
-            Err(e) => warn(interactive, &format!("Claude Desktop not routed: {e}")),
+            Err(e) => ui::warning(format!("Claude Desktop not routed: {e}")),
         }
     }
 
-    let later = persist_summary(&tools);
-    if interactive {
-        let _ = cliclack::log::info(&later);
-        let _ = cliclack::outro(start_hint(&tools));
-    } else {
-        println!("\n{later}\n{}", start_hint(&tools));
-    }
+    ui::success("Setup complete");
+    ui::note(persist_summary(&tools));
+    ui::note(start_hint(&tools));
     Ok(())
 }

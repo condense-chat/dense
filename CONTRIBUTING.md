@@ -31,6 +31,45 @@ with `.ctx(..)` for human context); `unwrap`/`expect`/`panic` are denied
 crate-wide (tests may). Keep comments minimal — inline notes, real TODOs, or a short
 clarification only; no narrative or historical paragraphs.
 
+## Terminal output
+
+Use `src/ui.rs` for human-facing output. Start with a title and the result,
+then show labeled details and a useful next command. Use `OK` for completed
+actions, `INFO` for neutral states, `CHECK` for diagnostic findings, and
+`WARN` or `ERROR` when something needs attention. An already-completed action
+should say that there is nothing to change.
+
+Keep wording concrete: “log in,” “automatic routing,” and “background service.”
+Explain engine, shim, and PATH details only where they help the user act.
+Never claim routing is active when login or organization settings prevent it.
+
+The shared renderer wraps prose, preserves commands inside backticks, and uses
+color only on the destination terminal. `NO_COLOR` and `TERM=dumb` disable
+color. Warnings, errors, login, and launch notices go to stderr; JSON and
+child-process stdout stay free of decoration. Interactive prompts keep their
+keyboard controls, with explicit defaults when there is no interactive terminal.
+
+Use `ui::Report` for buffered summaries with the same headings, fields, and
+wrapping. Default views should answer the user's question in plain language.
+Keep account IDs and file paths behind `--details` when they are not needed for
+the next action. `info` includes compact token split bars by default in both
+terminals and pipes; `--details` adds exact counts and IDs. Emoji charts remain
+available with `--bar` or `--matrix`. Use `ui::Report::bars` for proportional
+charts that keep small categories visible and stack on narrow terminals. Missing usage
+must say unavailable, and session totals awaiting pricing must say they are partial.
+
+Use `ui::progress` around slow work and drop its guard before printing results.
+The small animated bar clears on success or error, shows no invented percentage,
+and stays hidden for pipes, JSON, and `TERM=dumb`.
+
+To preview the CLI without Cargo's build messages, run from this repository:
+
+```sh
+cargo run --quiet -- claude-desktop status
+```
+
+Installed clients run `dense` directly and never see Cargo's build messages.
+
 ## Releasing
 
 Releases are cut from `main` with [git-cliff](https://git-cliff.org),

@@ -20,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{Result, desktop, device, persist};
+use crate::{Result, desktop, device, persist, ui};
 
 const LOCK_ATTEMPTS: u32 = 10;
 const LOCK_RETRY: Duration = Duration::from_millis(20);
@@ -116,14 +116,18 @@ impl State {
 /// `dense daemon install`: the daemon is the user's own now, so [`release`]
 /// leaves it running.
 pub fn install(cfg: &Config) -> Result<()> {
+    let progress = ui::progress("Starting the background service...");
     sessions::remember_root(cfg);
     let device_id = device::id(cfg)?;
     mark_added(cfg, false)?;
     let report = autostart::install(cfg)?;
-    println!("daemon autostart installed -> {}", report.path.display());
-    println!("device {device_id}");
+    drop(progress);
+    ui::title("Background service");
+    ui::success("Dense is set to start when you log in to this computer");
+    ui::field("Service file", report.path.display());
+    ui::field("Device", device_id);
     for note in &report.notes {
-        eprintln!("warning: {note}");
+        ui::warning(note);
     }
     Ok(())
 }
@@ -165,7 +169,7 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
             return Err(Error::msg(msg));
         }
         // Exit cleanly so a supervisor's restart loop treats this as done.
-        eprintln!("{msg}; exiting");
+        ui::stderr_note(format!("{msg}; exiting"));
         return Ok(());
     };
     let exe = std::env::current_exe().ctx("locating the dense binary")?;
@@ -259,14 +263,18 @@ pub fn uninstall(cfg: &Config) -> Result<()> {
 }
 
 pub fn remove_autostart(cfg: &Config) -> Result<()> {
-    match autostart::uninstall(cfg, live_pid(cfg))? {
+    let progress = ui::progress("Stopping the background service...");
+    let report = autostart::uninstall(cfg, live_pid(cfg))?;
+    drop(progress);
+    match report {
         Some(report) => {
-            println!("daemon autostart removed ({})", report.path.display());
+            ui::success("Background service autostart removed");
+            ui::detail(report.path.display());
             for note in &report.notes {
-                eprintln!("warning: {note}");
+                ui::warning(note);
             }
         }
-        None => println!("daemon autostart was not installed"),
+        None => ui::note("Background service was already disabled. Nothing to remove"),
     }
     Ok(())
 }

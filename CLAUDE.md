@@ -13,7 +13,7 @@ condense monorepo as a git submodule, but versions and ships on its own.
 - **No panics.** `unsafe` is forbidden; `unwrap`/`expect`/`panic`/
   `unwrap_in_result` are denied crate-wide. Fallible code returns `crate::Result`
   — the thiserror `Error` in `error.rs`, with the `.ctx(..)` extension for human
-  context (the lib's `wrap_err`); `main` renders it via color-eyre.
+  context (the lib's `wrap_err`); `main` renders it via the shared `ui` helpers.
   `cargo clippy --all-targets -- -D warnings` must pass.
 - **No `mod.rs`.** Module files are self-named (`foo.rs` + `foo/`), never
   `mod.rs` (`mod_module_files` is denied).

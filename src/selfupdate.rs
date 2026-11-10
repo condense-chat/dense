@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::api::Api;
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{Result, daemon, desktop, env_file, persist};
+use crate::{Result, daemon, desktop, env_file, persist, ui};
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -33,36 +33,63 @@ pub async fn newer(cfg: &Config) -> Option<String> {
 }
 
 pub async fn uninstall(cfg: &Config) -> Result<()> {
+    ui::title("Uninstall");
+    let mut complete = true;
     // The daemon first, or a managed one wraps the engines again behind this.
     if daemon::autostart::installed(cfg).is_some()
         && let Err(e) = daemon::remove_autostart(cfg)
     {
-        eprintln!("warning: could not remove the daemon autostart ({e})");
+        complete = false;
+        ui::warning(format!(
+            "Could not remove background service autostart: {e}"
+        ));
     }
-    if let Err(e) = desktop::uninstall(cfg, None) {
-        eprintln!("warning: could not restore Claude Desktop's engines ({e})");
+    match desktop::restore(cfg, None) {
+        Ok(report) if report.changed => ui::success("Claude Desktop's original engines restored"),
+        Ok(_) => {}
+        Err(e) => {
+            complete = false;
+            ui::warning(format!("Could not restore Claude Desktop's engines: {e}"));
+        }
     }
     daemon::managed::report_uninstall(cfg).await;
     persist::unwire_editors(cfg);
     for name in persist::load_record(cfg).tools.keys() {
-        let _ = std::fs::remove_file(persist::shim_path(cfg, name));
+        let path = persist::shim_path(cfg, name);
+        complete &= removed(std::fs::remove_file(&path), &path);
     }
     if let Err(e) = env_file::unwire(cfg) {
-        eprintln!("warning: {e}; remove the `# >>> dense >>>` block from it by hand");
+        complete = false;
+        ui::warning(format!(
+            "{e}; remove the `# >>> dense >>>` block from it by hand"
+        ));
     }
     crate::harness::commands::cleanup(cfg);
-    let _ = std::fs::remove_dir_all(cfg.data_dir());
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(&exe);
+    complete &= removed(std::fs::remove_dir_all(cfg.data_dir()), &cfg.data_dir());
+    match std::env::current_exe() {
+        Ok(exe) => complete &= removed(std::fs::remove_file(&exe), &exe),
+        Err(e) => {
+            complete = false;
+            ui::warning(format!(
+                "Could not locate the Dense binary to remove it: {e}"
+            ));
+        }
     }
-    println!(
-        "dense removed. Credentials under {} were kept.",
-        cfg.config_dir().display()
+    if complete {
+        ui::success("Dense removed");
+    } else {
+        ui::warning("Uninstall finished with issues. Review the warnings above.");
+    }
+    ui::field(
+        "Credentials",
+        format!("Kept in {}", cfg.config_dir().display()),
     );
     Ok(())
 }
 
 pub async fn update(cfg: &Config) -> Result<()> {
+    ui::title("Update");
+    let progress = ui::progress("Checking for updates...");
     let platform = platform();
     let api = Api::anonymous(cfg.release_base())?;
 
@@ -70,25 +97,29 @@ pub async fn update(cfg: &Config) -> Result<()> {
     let manifest: Manifest = (|| api.get_json::<Manifest>(&manifest_path))
         .retry(ExponentialBuilder::default().with_max_times(2))
         .await?;
+    drop(progress);
 
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).ctx("own version")?;
     match semver::Version::parse(&manifest.version) {
         Ok(latest) if latest <= current => {
-            println!("dense {current} is already up to date.");
+            ui::success(format!("Dense {current} is already up to date"));
             return Ok(());
         }
-        Ok(latest) => println!("updating dense {current} -> {latest} ..."),
+        Ok(latest) => ui::note(format!("Updating Dense {current} to {latest}...")),
         // A non-semver version (a dev broker's "dev") can't be ordered;
         // the manifest hash against the running binary decides instead.
         Err(_) => {
             if own_sha256()?.eq_ignore_ascii_case(&manifest.sha256) {
-                println!(
-                    "dense {current} is already up to date ({} build).",
+                ui::success(format!(
+                    "Dense {current} is already up to date ({} build)",
                     manifest.version
-                );
+                ));
                 return Ok(());
             }
-            println!("updating dense {current} -> {} ...", manifest.version);
+            ui::note(format!(
+                "Updating Dense {current} to {}...",
+                manifest.version
+            ));
         }
     }
 
@@ -96,6 +127,7 @@ pub async fn update(cfg: &Config) -> Result<()> {
         .url
         .clone()
         .unwrap_or_else(|| format!("/releases/latest/download/{}", asset_name(&platform)));
+    let progress = ui::progress("Downloading and verifying the update...");
     let bytes = api.get_bytes(&url).await?;
 
     let got = sha256_hex(&bytes);
@@ -109,11 +141,23 @@ pub async fn update(cfg: &Config) -> Result<()> {
     // Resolved first: linux reports the running binary as deleted once replaced.
     let exe = std::env::current_exe().ctx("locating the running binary")?;
     replace_self(&bytes)?;
-    println!("updated to {}.", manifest.version);
+    drop(progress);
+    ui::success(format!("Updated to Dense {}", manifest.version));
     if desktop::has_wrapped_engines(cfg) {
         refresh_desktop_engines(&exe);
     }
     Ok(())
+}
+
+fn removed(result: std::io::Result<()>, path: &std::path::Path) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            ui::warning(format!("Could not remove {}: {e}", path.display()));
+            false
+        }
+    }
 }
 
 /// The new binary re-copies itself over Desktop's engines.
@@ -124,7 +168,7 @@ fn refresh_desktop_engines(exe: &std::path::Path) {
         .status()
         .is_ok_and(|s| s.success());
     if !done {
-        eprintln!("warning: run `dense claude-desktop install` to update Desktop's engines");
+        ui::warning("Run `dense claude-desktop install` to update Desktop's engines");
     }
 }
 

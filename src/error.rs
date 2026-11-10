@@ -1,11 +1,6 @@
-//! The library error type. The CLI binary renders these via color-eyre.
-
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Attach human context to any error, mapping it into [`Error::Message`] —
-/// the lib's lightweight stand-in for color-eyre's `wrap_err`. The original
-/// error rides along as the `source`, so the rendered report keeps the full
-/// cause chain.
+/// Attach context while preserving the original error's cause chain.
 pub trait Context<T> {
     fn ctx(self, msg: impl std::fmt::Display) -> Result<T>;
 }

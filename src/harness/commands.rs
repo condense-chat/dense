@@ -112,7 +112,7 @@ pub fn stage_codex_plugin(cfg: &Config) {
         Ok(())
     };
     if let Err(e) = write() {
-        eprintln!("dense: could not stage the codex plugin: {e}");
+        crate::ui::warning(format!("Could not prepare the Codex plugin: {e}"));
     }
     drop_stale_siblings(&root);
 }
@@ -133,7 +133,7 @@ pub fn stage_codex_prompt(cfg: &Config) {
         return;
     }
     if let Err(e) = write_if_changed(&path, CODEX_BODY) {
-        eprintln!("dense: could not write {}: {e}", path.display());
+        crate::ui::warning(format!("Could not write {}: {e}", path.display()));
         return;
     }
     let _ = record(cfg, &path, CODEX_BODY.as_bytes());

@@ -94,6 +94,7 @@ pub async fn login(cfg: &Config) -> Result<()> {
 }
 
 pub fn logout(cfg: &Config) -> Result<()> {
+    let was_logged_in = load_creds(cfg).is_authenticated();
     for path in [cfg.token_file(), cfg.user_file()] {
         match std::fs::remove_file(&path) {
             Ok(()) => tracing::info!("removed {}", path.display()),
@@ -101,7 +102,13 @@ pub fn logout(cfg: &Config) -> Result<()> {
             Err(e) => return Err(e).ctx(format!("removing {}", path.display())),
         }
     }
-    println!("logged out of {}", cfg.api_host);
+    ui::title("Logout");
+    if was_logged_in {
+        ui::success(format!("Logged out of {}", cfg.api_host));
+    } else {
+        ui::note("Already logged out. Nothing to remove");
+    }
+    ui::hint("Log in again", "dense login");
     Ok(())
 }
 
@@ -138,27 +145,22 @@ pub fn resolve_mode(api_host: &str, auth_required: Option<bool>) -> AuthMode {
     }
 }
 
-// The frame wrapper — every exit path closes the cliclack frame.
 async fn device_flow(cfg: &Config) -> Result<()> {
-    let _ = cliclack::intro(ui::cyan("condense login"));
+    ui::stderr_title("Login");
     let result = device_flow_inner(cfg).await;
-    match &result {
-        Ok(()) => {
-            let _ = cliclack::outro(format!("logged in to {}.", cfg.api_host));
-        }
-        Err(_) => {
-            let _ = cliclack::outro_cancel(ui::yellow("login did not finish."));
-        }
+    if result.is_ok() {
+        ui::stderr_success(format!("Logged in to {}", cfg.api_host));
+        ui::stderr_detail(
+            "Next: dense setup to choose your tools, or dense claude to start a session.",
+        );
     }
+
     result
 }
 
 async fn device_flow_inner(cfg: &Config) -> Result<()> {
     let api = Api::anonymous(&cfg.api_base_url)?;
-    let _ = cliclack::log::remark(ui::dim(&format!(
-        "starting authorization with {}",
-        cfg.api_base_url
-    )));
+    ui::stderr_note(format!("Connecting to {}", cfg.api_base_url));
     let start: DeviceStart = api
         .post_json("/v1/device/start", &device_start_body(cfg))
         .await?;
@@ -179,24 +181,14 @@ async fn device_flow_inner(cfg: &Config) -> Result<()> {
             format!("lost the page? open {link}"),
         )
     };
-    let _ = cliclack::note(
-        title,
-        format!(
-            "Code: {}\n\n{}",
-            ui::bold(&start.user_code),
-            ui::dim(&fallback)
-        ),
-    );
+    ui::stderr_note(title);
+    ui::stderr_detail(format!("Code: {}", start.user_code));
+    ui::stderr_detail(&fallback);
     maybe_open(cfg, &link);
 
-    let spinner = cliclack::spinner();
-    spinner.start("waiting for authorization...");
-    let result = poll_device(cfg, &api, &start).await;
-    match &result {
-        Ok(()) => spinner.stop("authorized."),
-        Err(e) => spinner.error(format!("{e}")),
-    }
-    result
+    ui::stderr_note("Waiting for browser approval...");
+    let _progress = ui::progress("Waiting for browser approval...");
+    poll_device(cfg, &api, &start).await
 }
 
 /// Optional identity fields so the server can create the `devices` row on link.
@@ -296,13 +288,15 @@ fn read_cred(path: &std::path::Path) -> Option<String> {
 
 async fn register(cfg: &Config) -> Result<()> {
     let api = Api::anonymous(&cfg.api_base_url)?;
-    let spinner = cliclack::spinner();
-    spinner.start(format!("registering with {} ...", cfg.api_base_url));
+    ui::stderr_title("Login");
+    ui::stderr_note(format!("Registering with {}", cfg.api_base_url));
+    let progress = ui::progress("Signing in...");
     let result = register_request(&api, cfg).await;
-    match &result {
-        Ok(()) => spinner.stop("registered."),
-        Err(e) => spinner.error(format!("{e}")),
+    drop(progress);
+    if result.is_ok() {
+        ui::stderr_success(format!("Logged in to {}", cfg.api_host));
     }
+
     result
 }
 

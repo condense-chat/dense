@@ -8,21 +8,19 @@ use crate::config::Config;
 use crate::{Result, daemon, desktop, persist, tool, ui};
 
 pub async fn run(cfg: &Config) -> Result<()> {
-    println!(
-        "{} {}\n",
-        ui::bold("dense doctor —"),
-        ui::dim(&cfg.api_base_url)
-    );
+    ui::title("Installation check");
+    ui::field("Server", &cfg.api_base_url);
+    ui::section("Checks");
 
     line(on_path("dense"), "dense on PATH", "");
     line(
         path_contains(&cfg.shim_dir()),
-        "override dir on PATH",
+        "Automatic routing available in this shell",
         &cfg.shim_dir().display().to_string(),
     );
     line(
         cfg.env_file().exists(),
-        "env file present",
+        "Shell setup file",
         &cfg.env_file().display().to_string(),
     );
 
@@ -37,15 +35,21 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let creds = auth::load_creds(cfg);
     line(
         creds.is_authenticated(),
-        "authenticated",
+        "Saved login",
         &cfg.cred_dir().display().to_string(),
     );
     if let Some(token) = creds.token.as_deref() {
+        let progress = ui::progress("Checking your login with the server...");
         let status = auth::probe_token(cfg, token).await;
+        drop(progress);
         line(
             status == 200,
-            "token valid (/v1/me)",
-            &format!("status {status}"),
+            "Login accepted by server",
+            &if status == 0 {
+                "Could not reach the server; check your connection".into()
+            } else {
+                format!("HTTP {status}")
+            },
         );
     }
 
@@ -70,20 +74,16 @@ pub async fn run(cfg: &Config) -> Result<()> {
         let path = persist::shim_path(cfg, name);
         line(
             path.exists(),
-            &format!("shim: {name}"),
+            &format!("Automatic routing: {name}"),
             &path.display().to_string(),
         );
     }
+    ui::hint("Configure tools", "dense setup");
     Ok(())
 }
 
 fn line(ok: bool, label: &str, detail: &str) {
-    let mark = if ok {
-        ui::green("\u{2713}")
-    } else {
-        ui::red("\u{2717}")
-    };
-    print_row(&mark, label, detail);
+    ui::check(ok, label, detail);
 }
 
 fn on_path(name: &str) -> bool {
@@ -104,14 +104,6 @@ fn path_dirs() -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-fn print_row(mark: &str, label: &str, detail: &str) {
-    if detail.is_empty() {
-        println!("  {mark} {label}");
-    } else {
-        println!("  {mark} {label}  {}", ui::dim(&format!("({detail})")));
-    }
-}
-
 fn warn(label: &str, detail: &str) {
-    print_row(&ui::yellow("!"), label, detail);
+    ui::check(false, label, detail);
 }

@@ -1,7 +1,7 @@
 //! `dense info` — account, lifetime savings, and (given a session id) one
 //! session as condense saw it.
 
-use std::io::IsTerminal;
+mod compact;
 
 use serde_json::{Map, Value, json};
 
@@ -23,9 +23,6 @@ pub(crate) const MOON_SPENT: &str = "🌑";
 
 type Paint = fn(&str) -> String;
 
-/// `--matrix`: the /context-style glyph grid with colour (default on a
-/// terminal). `--bar`: moon-phase emoji bars, which survive a slash command
-/// echoing them as markdown (default when piped).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Style {
     Bar,
@@ -86,6 +83,7 @@ impl Split {
 
 pub async fn run(
     cfg: &Config,
+    details: bool,
     json: bool,
     layout: Option<Style>,
     session: Option<&str>,
@@ -95,6 +93,7 @@ pub async fn run(
         return Err(Error::Auth("not logged in — run `dense login`".into()));
     }
     let api = Api::authed(cfg, &creds)?;
+    let progress = (!json).then(|| ui::progress("Loading account and savings..."));
     let session_id = resolve_session(session, cfg.session_id());
     let (me, billing, session) = tokio::join!(
         get(&api, "/v1/me"),
@@ -102,18 +101,16 @@ pub async fn run(
         fetch_session(&api, session_id.as_deref()),
     );
     let report = report(&me?, &billing?, session_id.as_deref(), session);
+    drop(progress);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&report).ctx("rendering info JSON")?
         );
-    } else {
-        let style = layout.unwrap_or(if std::io::stdout().is_terminal() {
-            Style::Matrix
-        } else {
-            Style::Bar
-        });
+    } else if let Some(style) = layout {
         print!("{}", summary(&report, style));
+    } else {
+        print!("{}", compact::summary(&report, details, ui::width(false)));
     }
     Ok(())
 }
@@ -263,7 +260,8 @@ fn summary(report: &Value, style: Style) -> String {
     let org = str_of(account, "org")
         .map(|o| format!(" ({o})"))
         .unwrap_or_default();
-    out.push_str(&format!("{} {who}{org}\n", ui::bold("dense —")));
+    out.push_str(&ui::heading("Account & savings"));
+    out.push_str(&format!("  {who}{org}\n"));
     let mut plan = vec![];
     if let Some(tier) = str_of(account, "tier") {
         plan.push(match str_of(account, "status").filter(|s| !s.is_empty()) {

@@ -6,7 +6,7 @@ use crate::api::auth;
 use crate::api::devices::{self, Heartbeat, HeartbeatReply, Reply};
 use crate::config::Config;
 use crate::error::Error;
-use crate::{Result, desktop, device, persist};
+use crate::{Result, desktop, device, persist, ui};
 
 /// After a switch change, re-heartbeat this soon so the new mode is reported.
 pub const REPORT_DELAY: Duration = Duration::from_secs(1);
@@ -144,7 +144,7 @@ pub fn forced_on(cfg: &Config) -> bool {
 /// Say so when a manual routing change is the org's to make.
 pub fn note_forced(cfg: &Config) {
     if cfg!(feature = "managed-setup") && switch_for_login(cfg).is_some() {
-        println!("this device is managed by your organization: its switch decides what routes");
+        ui::note("Your organization manages this device and controls which sessions use Condense");
     }
 }
 
@@ -205,7 +205,7 @@ pub async fn after_login(cfg: &Config) -> bool {
         Ok(Some((reply, _))) => reply.managed,
         Ok(None) => {
             if state.limited {
-                eprintln!("warning: {DEVICE_LIMIT_MSG}");
+                ui::warning(DEVICE_LIMIT_MSG);
             }
             false
         }
@@ -221,13 +221,13 @@ pub async fn after_login(cfg: &Config) -> bool {
         return managed;
     }
     match autostart::install(cfg) {
-        Ok(_) => {
-            eprintln!("this device is managed by your organization; the dense daemon is installed")
-        }
-        Err(e) => eprintln!(
-            "warning: this device is managed by your organization, but installing the dense daemon failed ({}); run `dense daemon install`",
-            error_chain(&e)
+        Ok(_) => ui::stderr_note(
+            "Your organization manages this device; the Dense background service is installed",
         ),
+        Err(e) => ui::warning(format!(
+            "Your organization manages this device, but the background service could not be installed ({}). Run `dense daemon install`.",
+            error_chain(&e)
+        )),
     }
     true
 }
@@ -256,25 +256,32 @@ fn drop_usage(cfg: &Config) {
 pub fn status_lines(cfg: &Config, state: &State) -> Vec<(&'static str, String)> {
     let device = device::load(cfg).unwrap_or_else(|| "none yet".into());
     let beat = match (state.last_ok_at, &state.last_error) {
-        (_, Some(err)) => format!("last heartbeat failed: {err}"),
-        (Some(at), None) => format!("last heartbeat ok {}s ago", now().saturating_sub(at)),
-        (None, None) => "never heartbeated".into(),
+        (_, Some(err)) => format!("last sync failed: {err}"),
+        (Some(at), None) => format!("last synced {}s ago", now().saturating_sub(at)),
+        (None, None) => "not synced yet".into(),
     };
     let switch = match (state.managed, state.enabled) {
         _ if state.limited => DEVICE_LIMIT_MSG.into(),
-        (Some(false), _) => "not managed (no org device management)".into(),
+        (Some(false), _) => "You manage this device".into(),
         (_, Some(on)) => format!(
             "{} (member {}, device {})",
             if on { "enabled" } else { "disabled" },
             flag(state.member_enabled),
             flag(state.device_enabled)
         ),
-        (_, None) => "unknown (no heartbeat yet)".into(),
+        (_, None) => "Not checked yet".into(),
     };
     let mut lines = vec![
         ("device", format!("{device}; {beat}")),
         ("switch", switch),
-        ("mode", reported_mode(cfg, state).as_str().to_string()),
+        (
+            "mode",
+            match reported_mode(cfg, state) {
+                switch::Mode::Condensing => "Automatic routing configured",
+                switch::Mode::Transparent => "Automatic routing off",
+            }
+            .into(),
+        ),
     ];
     if desktop::in_use(cfg) {
         lines.push(("desktop", desktop::summary(cfg, &state.rewraps, now())));
@@ -296,20 +303,24 @@ pub async fn report_uninstall(cfg: &Config) {
     };
     let creds = auth::load_creds(cfg);
     if !creds.is_authenticated() {
-        eprintln!("warning: not logged in; the server still lists this device as installed");
+        ui::warning("Not logged in; the server still lists this device as installed");
         return;
     }
+    let progress = ui::progress("Removing this device from your account...");
     let result = match Api::authed(cfg, &creds) {
         Ok(api) => devices::uninstall(&api, &device_id).await,
         Err(e) => Err(e),
     };
+    drop(progress);
     match result {
-        Ok(true) => println!("device {device_id} marked uninstalled"),
-        Ok(false) => println!("device {device_id} was never registered; nothing to mark"),
-        Err(e) => eprintln!(
-            "warning: could not report the uninstall ({})",
+        Ok(true) => ui::success(format!("Device {device_id} marked uninstalled")),
+        Ok(false) => ui::note(format!(
+            "Device {device_id} was never registered; nothing to remove"
+        )),
+        Err(e) => ui::warning(format!(
+            "Could not report the uninstall: {}",
             error_chain(&e)
-        ),
+        )),
     }
 }
 

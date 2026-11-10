@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use crate::Result;
 use crate::config::Config;
 use crate::error::{Context, Error};
-use crate::{atomic, daemon, env_file, tool};
+use crate::{atomic, daemon, env_file, tool, ui};
 
 /// VS Code-family editors, by their dir under the OS config dir.
 const EDITORS: &[&str] = &["Code", "Code - Insiders", "Cursor", "VSCodium", "Windsurf"];
@@ -145,29 +145,42 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 }
 
 pub fn persist(cfg: &Config, targets: &[String], modify_path: bool) -> Result<()> {
+    let progress = ui::progress("Setting up automatic routing...");
     let wiring = env_file::ensure_env(cfg, modify_path)?;
     let mut report = install_shims(cfg, targets)?;
     wire_claude(cfg, &mut report)?;
     remember_path_choice(cfg, modify_path)?;
+    drop(progress);
+    ui::title("Automatic routing");
     for (name, shim) in &report.persisted {
-        println!("persisted {name} -> {}", shim.display());
+        ui::success(format!("`{name}` is set up to use Condense"));
+        ui::detail(format!("Launcher: {}", shim.display()));
     }
     for settings in &report.editors {
-        println!(
-            "persisted claude (editor extension) -> {}",
-            settings.display()
-        );
+        ui::success("Claude Code in your editor is set up to use Condense");
+        ui::detail(format!("Settings: {}", settings.display()));
     }
     if let Some(entry) = &report.daemon {
-        println!("daemon keeps editors wired -> {}", entry.display());
+        ui::field(
+            "Editor updates",
+            "Enabled; settings are repaired automatically",
+        );
+        ui::detail(format!("Service file: {}", entry.display()));
     }
     for name in &report.skipped {
-        println!("{name}: coming soon — skipped.");
+        ui::note(format!("{name} is not supported yet; skipped"));
     }
     for warning in &report.warnings {
-        eprintln!("warning: {warning}");
+        ui::warning(warning);
     }
     report_wiring(cfg, &wiring);
+    let names = report
+        .persisted
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    ui::hint("Undo", &format!("dense unpersist {names}"));
     Ok(())
 }
 
@@ -207,19 +220,23 @@ pub fn remove_shims(cfg: &Config, targets: &[String]) -> Result<Vec<(String, boo
 pub fn report_wiring(cfg: &Config, wiring: &env_file::PathWiring) {
     match wiring {
         env_file::PathWiring::Wired => {
-            println!("PATH updated — {}.", env_file::reload_hint(cfg));
+            ui::note(format!(
+                "Shell setup saved. {}.",
+                env_file::reload_hint(cfg)
+            ));
         }
         env_file::PathWiring::Skipped => {
-            println!("PATH left unchanged (--no-modify-path).");
+            ui::note("Shell setup left unchanged (--no-modify-path)");
+            ui::detail(env_file::activate_hint(cfg));
         }
         env_file::PathWiring::Manual(notes) => {
             for note in notes {
-                println!("note: {note}");
+                ui::warning(note);
             }
-            println!(
-                "PATH not wired — after the steps above, {}.",
+            ui::note(format!(
+                "Shell setup needs attention. After the steps above, {}.",
                 env_file::reload_hint(cfg)
-            );
+            ));
         }
     }
 }
@@ -233,17 +250,23 @@ pub fn shim_path(cfg: &Config, name: &str) -> PathBuf {
 }
 
 pub fn unpersist(cfg: &Config, targets: &[String]) -> Result<()> {
+    let progress = ui::progress("Removing automatic routing...");
     let removed = remove_shims(cfg, targets)?;
-    for (name, was_there) in &removed {
-        if *was_there {
-            println!("unpersisted {name}");
+    drop(progress);
+    ui::title("Automatic routing");
+    for (name, removed) in &removed {
+        if *removed {
+            ui::success(format!("`{name}` no longer uses Condense automatically"));
         } else {
-            println!("{name}: not persisted");
+            ui::note(format!(
+                "`{name}` is already disconnected. Nothing to remove"
+            ));
         }
     }
     if removed.iter().any(|(name, _)| name == "claude") {
         daemon::release(cfg)?;
     }
+    ui::hint("Try one session", "dense <tool>");
     Ok(())
 }
 
@@ -251,7 +274,10 @@ pub fn unpersist(cfg: &Config, targets: &[String]) -> Result<()> {
 pub fn unwire_editors(cfg: &Config) {
     for (path, outcome) in wire_editors(cfg, Wire::Clear) {
         if let Err(e) = outcome {
-            eprintln!("warning: {}: {e}", path.display());
+            ui::warning(format!(
+                "Could not update editor settings in {}: {e}",
+                path.display()
+            ));
         }
     }
 }

@@ -77,9 +77,9 @@ Run `dense status` to check your login and `dense doctor` to check the installat
 | --- | --- |
 | `dense login / dense logout` | Sign this machine in or out. |
 | `dense setup` | Change which agents use Condense. |
-| `dense info [SESSION]` | See account totals or inspect a session. Use --bar, --matrix, or --json for the output format. |
+| `dense info [SESSION]` | See savings and account settings, or inspect a session. Includes token split charts. Add `--details` for exact counts and IDs; `--bar`, `--matrix`, and `--json` are also available. |
 | `dense usage claude` | Check Claude limits and estimated gain. Use --json for usage data or --attributed-only to exclude untagged requests. |
-| `dense status` | Check the active login and endpoint. |
+| `dense status` | See your login, tool setup, and background service. Add `--details` for server and diagnostic information. |
 | `dense doctor` | Check the CLI installation. |
 | `dense self update` | Update the CLI. |
 | `dense self uninstall` | Remove the CLI and its shell integration. |

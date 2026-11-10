@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::config::{Config, DEFAULT_API_URL};
 use crate::error::Error;
-use crate::{api, hosts};
+use crate::{api, hosts, ui};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -46,6 +46,7 @@ pub fn list(cfg: &Config) -> Result<()> {
     names.extend(cfg.list_cached_profiles());
     names.sort();
     names.dedup();
+    ui::title("Profiles");
     for name in names {
         let api = if name == "prod" {
             DEFAULT_API_URL.to_string()
@@ -54,8 +55,12 @@ pub fn list(cfg: &Config) -> Result<()> {
                 .map(|p| p.api_url)
                 .unwrap_or_default()
         };
-        let marker = if name == active { "*" } else { " " };
-        println!("{marker} {name:<14} {api}");
+        let label = if name == active {
+            format!("{name} (active)")
+        } else {
+            name
+        };
+        ui::field(&label, api);
     }
     Ok(())
 }
@@ -70,7 +75,7 @@ pub async fn switch(cfg: &Config, name: &str, source: Option<&str>) -> Result<()
             ));
         }
         cfg.clear_target()?;
-        println!("switched to prod (baked default).");
+        ui::success("Switched to the default profile: prod");
         return Ok(());
     }
     let profile = match source {
@@ -79,7 +84,8 @@ pub async fn switch(cfg: &Config, name: &str, source: Option<&str>) -> Result<()
     };
     cfg.save_cached_profile(&profile)?;
     cfg.write_target(name)?;
-    println!("switched to profile `{name}` -> {}", profile.api_url);
+    ui::success(format!("Switched to profile `{name}`"));
+    ui::field("Server", profile.api_url);
     Ok(())
 }
 

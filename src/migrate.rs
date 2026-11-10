@@ -26,15 +26,15 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
     if let env_file::PathWiring::Manual(notes) = env_file::ensure_env(cfg, rewire)? {
         for note in notes {
-            eprintln!("note: {note}");
+            crate::ui::warning(note);
         }
     }
-    println!(
-        "moved dense files from {} to {} and {}",
+    crate::ui::stderr_note(format!(
+        "Moved Dense files from {} to {} and {}",
         old.display(),
         cfg.config_dir().display(),
         cfg.data_dir().display()
-    );
+    ));
     Ok(())
 }
 

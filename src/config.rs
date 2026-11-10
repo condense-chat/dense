@@ -439,7 +439,9 @@ fn resolve_profile(
         if let Some(p) = load_named(config_dir, &target) {
             return Ok(p);
         }
-        eprintln!("warning: target profile `{target}` is not registered; using prod.");
+        crate::ui::warning(format!(
+            "Target profile `{target}` is not registered; using prod."
+        ));
     }
     Ok(Profile::prod())
 }

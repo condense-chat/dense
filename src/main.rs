@@ -1,6 +1,3 @@
-//! The `dense` CLI. Parses the command line, dispatches to the modules that do
-//! the work, and renders any error via color-eyre.
-
 mod api;
 mod atomic;
 mod cli;
@@ -19,14 +16,16 @@ mod persist;
 mod profile;
 mod selfupdate;
 mod setup;
+mod status;
 mod tool;
 mod ui;
 mod usage;
 
 pub(crate) use error::Result;
 
-use clap::Parser;
-use color_eyre::Result as EyreResult;
+use std::process::ExitCode;
+
+use clap::{CommandFactory, FromArgMatches};
 use tracing_subscriber::EnvFilter;
 
 use api::auth;
@@ -35,7 +34,7 @@ use config::Config;
 
 fn init_tracing(verbose: u8) {
     let level = match verbose {
-        0 => "info",
+        0 => "warn",
         1 => "debug",
         _ => "trace",
     };
@@ -43,20 +42,35 @@ fn init_tracing(verbose: u8) {
         .unwrap_or_else(|_| EnvFilter::new(format!("dense={level}")));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(ui::color_enabled(true))
         .with_writer(std::io::stderr)
         .try_init();
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> EyreResult<()> {
-    if let Some((real, args)) = desktop::engine::launch_target() {
-        return desktop::engine::run(&real, &args).await.map_err(Into::into);
+async fn main() -> ExitCode {
+    ui::init();
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            ui::error(&error);
+            ExitCode::FAILURE
+        }
     }
-    color_eyre::config::HookBuilder::default()
-        .display_env_section(false)
-        .display_location_section(false)
-        .install()?;
-    let cli = Cli::parse();
+}
+
+async fn run() -> Result<()> {
+    if let Some((real, args)) = desktop::engine::launch_target() {
+        return desktop::engine::run(&real, &args).await;
+    }
+    let matches = Cli::command()
+        .color(if ui::color_enabled(false) || ui::color_enabled(true) {
+            clap::ColorChoice::Auto
+        } else {
+            clap::ColorChoice::Never
+        })
+        .get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if let Command::Statusline { line } = &cli.command {
         harness::claude::statusline(line);
         return Ok(());
@@ -66,12 +80,14 @@ async fn main() -> EyreResult<()> {
     let url = Config::cli_url(cli.url.clone(), cli.environment.as_deref());
     let cfg = Config::resolve(url, cli.environment.clone())?;
     if let Err(e) = migrate::run(&cfg) {
-        eprintln!("warning: could not finish moving dense files to their new dirs: {e}");
+        ui::warning(format!(
+            "Could not finish moving Dense files to their new folders: {e}"
+        ));
     }
 
     let result: Result<()> = match cli.command {
-        Command::Status => {
-            status(&cfg);
+        Command::Status { details } => {
+            status::run(&cfg, details);
             Ok(())
         }
         Command::Statusline { .. } => Ok(()),
@@ -132,6 +148,7 @@ async fn main() -> EyreResult<()> {
         Command::SelfCmd(SelfCommand::Uninstall) => selfupdate::uninstall(&cfg).await,
         Command::Info {
             bar,
+            details,
             json,
             matrix,
             session,
@@ -141,26 +158,8 @@ async fn main() -> EyreResult<()> {
                 (_, true) => Some(info::Style::Matrix),
                 _ => None,
             };
-            info::run(&cfg, json, layout, session.as_deref()).await
+            info::run(&cfg, details, json, layout, session.as_deref()).await
         }
     };
-    result.map_err(Into::into)
-}
-
-fn presence(found: bool) -> &'static str {
-    if found { "present" } else { "missing" }
-}
-
-fn status(cfg: &Config) {
-    let creds = auth::load_creds(cfg);
-    let mode = auth::resolve_mode(&cfg.api_host, cfg.auth_required);
-    println!("profile: {}", cfg.profile());
-    println!("api:     {}", cfg.api_base_url);
-    println!("host:    {} ({mode:?})", cfg.api_host);
-    println!("creds:   {}", cfg.cred_dir().display());
-    println!("token:   {}", presence(creds.token.is_some()));
-    println!("user:    {}", presence(creds.user_id.is_some()));
-    for (label, value) in daemon::status_lines(cfg) {
-        println!("{:<9}{value}", format!("{label}:"));
-    }
+    result
 }

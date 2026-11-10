@@ -5,7 +5,13 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "dense", version, about = "Durable condense CLI")]
+#[command(
+    name = "dense",
+    version,
+    about = "Use your coding tools through Condense",
+    after_help = "Start here:\n  dense setup                   Set up login and your tools\n  dense claude                  Try one Claude Code session\n  dense claude-desktop install   Connect Claude Desktop\n  dense status                  See what's configured\n\nLearn more: dense <command> --help",
+    styles = help_styles()
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -27,7 +33,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run Claude Code through the condense proxy (args pass straight through).
+    /// Run Claude Code through Condense. All arguments pass through.
     #[command(disable_help_flag = true)]
     Claude {
         #[arg(
@@ -37,10 +43,10 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
-    /// Route Claude Desktop's local engine through condense.
+    /// Set up or check Condense for Claude Desktop's local Code sessions.
     #[command(subcommand)]
     ClaudeDesktop(DesktopCommand),
-    /// Launch Codex routed through condense.
+    /// Run Codex through Condense. All arguments pass through.
     #[command(disable_help_flag = true)]
     Codex {
         #[arg(
@@ -53,28 +59,32 @@ pub enum Command {
     /// Background service: runs dense's jobs on this machine.
     #[command(subcommand, hide = true)]
     Daemon(DaemonCommand),
-    /// Verify the install is wired correctly.
+    /// Check your installation and see how to fix any issues.
     Doctor,
-    /// Account, lifetime savings, and — given a session — that session's context and spend.
+    /// See your account, savings, and optional session details.
     Info {
-        /// Emoji bars (default when piped, e.g. from a slash command).
+        /// Show savings as emoji bars.
         #[arg(long, conflicts_with_all = ["json", "matrix"])]
         bar: bool,
+        /// Include exact token counts and account and session IDs.
+        #[arg(long, conflicts_with_all = ["bar", "json", "matrix"])]
+        details: bool,
         /// Print JSON instead of the summary.
         #[arg(long)]
         json: bool,
-        /// Glyph grid like Claude Code's /context (default on a terminal).
+        /// Show savings as a detailed emoji grid.
         #[arg(long, conflicts_with = "json")]
         matrix: bool,
         /// Defaults to $CONDENSE_SESSION_ID, which `dense <tool>` sets for its child.
         #[arg(value_name = "SESSION_ID")]
         session: Option<String>,
     },
-    /// Authenticate this machine (device-flow or register).
+    /// Log in to Condense on this computer.
     Login,
-    /// Clear stored credentials.
+    /// Log out of Condense on this computer.
     Logout,
 
+    /// Run OpenCode through Condense. All arguments pass through.
     #[command(disable_help_flag = true)]
     Opencode {
         #[arg(
@@ -84,7 +94,7 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
-    /// Install shims so the named tools route through dense (no args: all).
+    /// Use Condense whenever you run a tool (default: all supported tools).
     Persist {
         /// Write the env file but don't edit shell profiles.
         #[arg(long)]
@@ -107,22 +117,26 @@ pub enum Command {
     /// Manage the dense binary itself.
     #[command(subcommand, name = "self")]
     SelfCmd(SelfCommand),
-    /// First-run setup wizard (invoked by the installer).
+    /// Set up login and choose which tools use Condense.
     Setup,
-    /// Show identity, api host, and persisted tools.
-    Status,
+    /// See your login and how each tool uses Condense.
+    Status {
+        /// Include server, file paths, and background service diagnostics.
+        #[arg(long)]
+        details: bool,
+    },
     /// Claude Code status line for the launch footer (hidden).
     #[command(hide = true)]
     Statusline {
         #[arg(allow_hyphen_values = true)]
         line: String,
     },
-    /// Remove shims for the named tools (no args: all).
+    /// Stop automatic routing for tools (default: all supported tools).
     Unpersist {
         #[arg(value_name = "TOOL")]
         targets: Vec<String>,
     },
-    /// Subscription limits used, with condense vs without it.
+    /// Compare Claude plan usage with and without Condense.
     Usage {
         /// Exclude untagged Claude-harness usage from the estimate.
         #[arg(long)]
@@ -151,20 +165,20 @@ pub enum DaemonCommand {
 
 #[derive(Subcommand)]
 pub enum DesktopCommand {
-    /// Put dense in front of Desktop's engine, and keep new versions wrapped.
+    /// Connect local Code sessions and automatically follow Desktop updates.
     Install {
         #[arg(long, hide = true, value_name = "DIR")]
         data_dir: Option<PathBuf>,
-        /// Wrap what's installed now, without the background daemon.
+        /// Connect installed engines only; don't enable automatic updates.
         #[arg(long)]
         no_watch: bool,
     },
-    /// Show which of Desktop's engine versions are routed.
+    /// See connection status, automatic updates, and supported sessions.
     Status {
         #[arg(long, hide = true, value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },
-    /// Restore Desktop's original engine and stop wrapping new ones.
+    /// Disconnect Condense and restore Desktop's original engines.
     Uninstall {
         #[arg(long, hide = true, value_name = "DIR")]
         data_dir: Option<PathBuf>,
@@ -177,4 +191,13 @@ pub enum SelfCommand {
     Uninstall,
     /// Update dense to the latest release.
     Update,
+}
+
+fn help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::AnsiColor;
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default().bold())
+        .usage(AnsiColor::Cyan.on_default().bold())
+        .literal(AnsiColor::Green.on_default())
+        .placeholder(AnsiColor::Cyan.on_default())
 }

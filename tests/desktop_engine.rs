@@ -744,11 +744,11 @@ fn the_watcher_is_announced_only_once_the_daemon_started() {
     // No service manager on PATH, so the daemon can't start.
     let failed = rig.install();
     assert!(failed.status.success(), "{}", stderr(&failed));
-    assert!(!stream(&failed).contains("watcher enabled"));
+    assert!(!stream(&failed).contains("new engines connect automatically"));
     assert!(stderr(&failed).contains("could not be started"));
 
     rig.fake_service_manager();
-    assert!(stream(&rig.install()).contains("watcher enabled"));
+    assert!(stream(&rig.install()).contains("new engines connect automatically"));
 }
 
 #[test]
@@ -764,13 +764,62 @@ fn logged_out_says_wrapped_and_never_claims_routing() {
 
     let out = stream(&run(&mut rig.install_no_watch()));
     assert!(!out.contains("route through"), "{out}");
-    assert!(out.contains("run directly until `dense login`"), "{out}");
-    assert!(status().contains("wrapped, sessions run directly"));
+    assert!(out.contains("Log in to connect"), "{out}");
+    assert!(out.contains("`dense login`"), "{out}");
+    assert!(
+        status()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("login required (sessions run directly)")
+    );
 
     rig.log_in();
     let out = stream(&run(&mut rig.install_no_watch()));
     assert!(out.contains("route through 127.0.0.1"), "{out}");
-    assert!(status().contains(": routed\n"));
+    assert!(status().contains(": Connected\n"));
+}
+
+#[test]
+fn repeated_desktop_uninstall_explains_that_nothing_remains() {
+    let rig = Rig::new();
+    let engine = rig.publish("2.1.309");
+    assert!(run(&mut rig.install_no_watch()).status.success());
+    for expected in [
+        "Condense disconnected from Claude Desktop",
+        "Already disconnected. Nothing to remove",
+    ] {
+        let out = run(rig
+            .dense()
+            .args(["claude-desktop", "uninstall", "--data-dir"])
+            .arg(rig.engines()));
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(stream(&out).contains(expected), "{}", stream(&out));
+        assert!(stream(&out).contains("Reconnect: dense claude-desktop install"));
+        assert!(!stream(&out).contains('\x1b'));
+        assert_eq!(
+            fs::read(engine.join("claude")).expect("restored engine"),
+            ENGINE
+        );
+        assert!(!engine.join("claude.real").exists());
+    }
+}
+
+#[test]
+fn an_unstarted_watcher_never_promises_to_connect_future_engines() {
+    let rig = Rig::new();
+    let out = rig.install();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("could not be started"));
+    assert!(!stream(&out).contains("will prepare"));
+    assert!(!stream(&out).contains("new engines connect automatically"));
+    assert!(
+        stream(&out)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("run this again")
+    );
 }
 
 // Runs the real seal check, so it lives here: a spawn inside a unit test holds
@@ -783,8 +832,16 @@ fn a_bundle_anthropic_did_not_sign_is_left_untouched() {
     fs::create_dir_all(&macos).expect("mkdir");
     fs::rename(dir.join("claude"), macos.join("claude")).expect("move engine");
 
-    let out = stream(&run(&mut rig.install_no_watch()));
-    assert!(out.contains("isn't signed by Anthropic"), "{out}");
+    let out = run(&mut rig.install_no_watch());
+    assert!(
+        stderr(&out)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("isn't signed by Anthropic"),
+        "{}",
+        stderr(&out)
+    );
     assert_eq!(fs::read(macos.join("claude")).expect("engine"), ENGINE);
     assert!(!dir.join("claude.real.app").exists());
 }
@@ -895,7 +952,10 @@ fn self_uninstall_warns_and_carries_on() {
     let out = run(rig.dense_at(&exe).args(["self", "uninstall"]));
     let err = stderr(&out);
     assert!(out.status.success(), "{err}");
-    assert!(err.contains("could not restore"), "{err}");
+    assert!(err.contains("Could not restore"), "{err}");
+    assert!(err.contains("Uninstall finished with issues"), "{err}");
+    assert!(!stream(&out).contains("Dense removed"));
+    assert!(!stream(&out).contains("Reconnect:"));
     assert!(err.contains("ctl"), "{err}");
     assert!(!rig.entry().exists());
     assert!(!rig.data_dir().exists());
@@ -915,7 +975,7 @@ fn a_managed_on_routes_desktop_and_refuses_to_take_it_back() {
     assert_eq!(fs::read(dir.join("claude.real")).expect("engine"), ENGINE);
     assert!(!rig.routing_file().exists());
     let status = run(rig.dense().args(["claude-desktop", "status"]));
-    assert!(!stream(&status).contains("watcher: disabled"));
+    assert!(!stream(&status).contains("Disabled; run"));
 
     let undo: [&[&str]; 3] = [
         &["claude-desktop", "uninstall"],
@@ -1038,7 +1098,7 @@ fn install_before_desktop_and_the_watcher_follows_it_through_an_uninstall() {
         .dense()
         .args(["claude-desktop", "status", "--data-dir"])
         .arg(rig.engines()));
-    assert!(String::from_utf8_lossy(&status.stdout).contains("no engine yet"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("No engine yet"));
     rig.once();
 
     let dir = rig.publish("2.1.309");
@@ -1067,7 +1127,13 @@ fn install_without_the_watcher_says_to_run_it_again() {
     let rig = Rig::new();
     let out = run(&mut rig.install_no_watch());
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("run this again"));
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("run this again")
+    );
     assert!(!rig.routing_file().exists());
 }
 

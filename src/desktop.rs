@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::api::auth;
 use crate::config::Config;
 use crate::error::Context;
-use crate::{Result, daemon};
+use crate::{Result, daemon, ui};
 
 use bundle::Bundles;
 
@@ -90,8 +90,15 @@ struct Payload {
 /// What [`route`] did, for the caller to show.
 #[derive(Debug, Default)]
 pub struct Report {
-    pub lines: Vec<String>,
+    pub fields: Vec<(&'static str, String)>,
+    pub ready: bool,
+    pub summary: String,
     pub warnings: Vec<String>,
+}
+
+pub struct Removal {
+    pub changed: bool,
+    pub restored: Vec<String>,
 }
 
 /// What the daemon's Desktop job carries from one pass to the next.
@@ -289,12 +296,22 @@ pub fn summary(cfg: &Config, rewraps: &Rewraps, now: u64) -> String {
 
 pub fn install(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<()> {
     let report = route(cfg, data_dir, watch)?;
-    for line in &report.lines {
-        println!("{line}");
+    ui::title("Claude Desktop");
+    if report.ready {
+        ui::success(&report.summary);
+    } else {
+        ui::note(&report.summary);
+    }
+    ui::section("Setup details");
+    for (label, value) in &report.fields {
+        ui::field(label, value);
     }
     for warning in &report.warnings {
-        eprintln!("warning: {warning}");
+        ui::warning(warning);
     }
+    coverage(0);
+    ui::hint("Check status", "dense claude-desktop status");
+    ui::hint("Undo", "dense claude-desktop uninstall");
     Ok(())
 }
 
@@ -314,65 +331,112 @@ pub fn keep_daemon(cfg: &Config) -> Result<()> {
 
 pub fn status(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
     let roots = roots_or_default(recorded_or(cfg, data_dir));
-    if roots.is_empty() {
-        let state = if detected() {
-            "no engine downloaded yet"
-        } else {
-            "not on this computer yet"
-        };
-        println!("Claude Desktop: {state}");
-    }
-    for root in &roots {
-        println!("engines: {}", root.display());
-    }
-    let logged_in = auth::load_creds(&Config::resolve(None, None)?).is_authenticated();
+    let engine = Config::resolve(None, None)?;
+    let logged_in = auth::load_creds(&engine).is_authenticated();
     let found = installs(&roots);
-    if found.is_empty() && !roots.is_empty() {
-        println!("  no engine yet");
+    let routed = found.iter().filter(|i| i.is_wrapped()).count();
+    let off = cfg!(feature = "desktop-switch") && daemon::managed::switched_off(cfg);
+    ui::title("Claude Desktop");
+    if off {
+        ui::note("Routing is paused by your organization");
+    } else if routed > 0 && routed < found.len() && logged_in {
+        ui::note(format!(
+            "{routed} of {} local engines connected; some need attention",
+            found.len()
+        ));
+        ui::hint("Connect remaining engines", "dense claude-desktop install");
+    } else if routed > 0 && logged_in {
+        ui::success(format!(
+            "{routed} of {} local engines connected to Condense",
+            found.len()
+        ));
+    } else if routed > 0 {
+        ui::note("Setup is saved. Log in to start routing sessions");
+        ui::hint("Log in", "dense login");
+    } else {
+        ui::note("Local Code sessions are not connected to Condense");
+        ui::hint("Connect", "dense claude-desktop install");
     }
-    for found in found {
-        let state = match (found.is_wrapped(), logged_in) {
-            (false, _) => "NOT routed",
-            (true, false) => "wrapped, sessions run directly until `dense login`",
-            (true, true) => "routed",
-        };
-        println!("  {}: {state}", found.label());
-    }
-    let wanted = Routing::load(cfg).is_some() || daemon::managed::forced_on(cfg);
-    let watcher = match (wanted, daemon::running(cfg)) {
-        (false, _) => "disabled",
-        (true, false) => "registered, not running",
-        (true, true) => "running",
-    };
-    println!("watcher: {watcher}");
-    if !roots.is_empty() {
-        println!(
-            "{}",
-            cowork_status(roots.iter().map(|r| cloud_sessions(r)).sum())
+    ui::section("Local engines");
+    if found.is_empty() {
+        ui::field(
+            "Engine",
+            "No engine yet. Start a Code session in Claude Desktop to download one.",
         );
     }
+    for found in found {
+        let state = match (found.is_wrapped(), logged_in, off) {
+            (false, _, _) => "Not connected",
+            (true, _, true) => "Ready; routing paused by your organization",
+            (true, false, _) => "Ready; login required (sessions run directly)",
+            (true, true, false) => "Connected",
+        };
+        ui::field("Version", format!("{}: {state}", found.label()));
+    }
+    ui::field("Server", &engine.api_base_url);
+    for root in &roots {
+        ui::field("Folder", root.display());
+    }
+    ui::section("Automatic updates");
+    let wanted = Routing::load(cfg).is_some() || daemon::managed::forced_on(cfg);
+    let running = daemon::running(cfg);
+    ui::field(
+        "Watcher",
+        match (wanted, running) {
+            (false, _) => "Disabled; run `dense claude-desktop install` after Desktop updates",
+            (true, false) => "Not running; new engines won't connect automatically",
+            (true, true) => "Running; new engines connect automatically",
+        },
+    );
+    if wanted && !running {
+        ui::hint("Restart watcher", "dense claude-desktop install");
+    }
+    coverage(roots.iter().map(|r| cloud_sessions(r)).sum());
     Ok(())
 }
 
-pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
+pub fn restore(cfg: &Config, data_dir: Option<PathBuf>) -> Result<Removal> {
+    let progress = ui::progress("Restoring Claude Desktop...");
     let _lock = lock(cfg)?;
     // Inside the lock, so a pass waiting on it finds routing off and wraps nothing.
-    let routing = Routing::take(cfg).unwrap_or_default();
+    let routing = Routing::take(cfg);
+    let configured = routing.is_some() || forced_file(cfg).exists();
+    let routing = routing.unwrap_or_default();
     let _ = std::fs::remove_file(forced_file(cfg));
+    let mut restored = Vec::new();
     let mut result = Ok(());
     for found in installs(&roots_or_default(data_dir.or(routing.data_dir))) {
         match found.unwrap_engine() {
-            Ok(true) => println!("restored {}", found.label()),
+            Ok(true) => restored.push(found.label()),
             Ok(false) => {}
             Err(e) => result = result.and(Err(e)),
         }
     }
-    // The daemon may still serve another job; hand it the ownership, and
-    // [`daemon::release`] removes it once none does.
+    drop(progress);
     if routing.added_daemon {
         result = result.and(daemon::mark_added(cfg, true));
     }
-    result.and(daemon::release(cfg))
+    result.and(daemon::release(cfg))?;
+    Ok(Removal {
+        changed: configured || !restored.is_empty(),
+        restored,
+    })
+}
+
+pub fn uninstall(cfg: &Config, data_dir: Option<PathBuf>) -> Result<()> {
+    let report = restore(cfg, data_dir)?;
+    ui::title("Claude Desktop");
+    if report.changed {
+        ui::success("Condense disconnected from Claude Desktop");
+        for version in report.restored {
+            ui::field("Restored", version);
+        }
+        ui::field("Updates", "Automatic routing disabled");
+    } else {
+        ui::note("Already disconnected. Nothing to remove");
+    }
+    ui::hint("Reconnect", "dense claude-desktop install");
+    Ok(())
 }
 
 /// The daemon's Desktop job: follow Desktop through installs, engine downloads
@@ -424,12 +488,21 @@ fn cloud_sessions(root: &Path) -> usize {
         .sum()
 }
 
+pub fn coverage(cloud: usize) {
+    ui::section("What Condense can route");
+    ui::field("Code", "Sessions using this computer's local engine");
+    ui::field("Cowork", cowork_status(cloud));
+    ui::field("Chat", "Not routed");
+}
+
 fn cowork_status(cloud: usize) -> String {
-    let rule = "Cowork: routed only when Desktop runs it on this computer's engine; \
-                not routed in Anthropic's cloud or Desktop's VM";
+    let rule = "Only sessions using this computer's local engine. Anthropic's cloud and Desktop's VM are not routed.";
     match cloud {
         0 => rule.to_string(),
-        n => format!("{rule}\n  {n} session(s) with folder access ran in Anthropic's cloud"),
+        n => format!(
+            "{rule}\n{n} {} with folder access ran in Anthropic's cloud.",
+            if n == 1 { "session" } else { "sessions" }
+        ),
     }
 }
 
@@ -547,14 +620,13 @@ fn lock(cfg: &Config) -> Result<File> {
 fn nothing_routed(found: &[Install], watch: bool, data_dir: Option<&Path>) -> &'static str {
     let present = data_dir.map_or_else(detected, Path::is_dir);
     match (found.is_empty(), watch, present) {
-        (false, _, _) => "No engine is routed yet.",
-        (true, true, true) => "No Desktop engine yet: the next one Desktop downloads is routed.",
+        (false, _, _) => "No local engines are ready. Review the warnings below.",
+        (true, true, true) => "No engine yet. Dense will prepare the next one Desktop downloads.",
         (true, true, false) => {
-            "Claude Desktop hasn't run on this computer yet: its engine is routed \
-             from its first Code session."
+            "Claude Desktop hasn't run on this computer yet. Dense will prepare its local engines when it does."
         }
         (true, false, _) => {
-            "No Desktop engine yet: run this again once Desktop has downloaded one."
+            "No engine yet. Start a Code session in Claude Desktop, then run this again."
         }
     }
 }
@@ -598,6 +670,7 @@ fn roots_or_default(data_dir: Option<PathBuf>) -> Vec<PathBuf> {
 
 /// [`install`] without printing, for callers with their own output.
 pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Report> {
+    let _progress = ui::progress("Preparing Claude Desktop...");
     let _lock = lock(cfg)?;
     let data_dir = recorded_or(cfg, data_dir);
     let exe = std::env::current_exe().ctx("locating the dense binary")?;
@@ -613,24 +686,26 @@ pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Rep
         match found.wrap(&exe, true, bundle::CODESIGNED) {
             Ok(Outcome::Wrapped) => {
                 routed += 1;
-                report.lines.push(format!("wrapped {}", found.label()));
+                report
+                    .fields
+                    .push(("Engine", format!("{}: ready", found.label())));
             }
             Ok(Outcome::Current) => {
                 routed += 1;
                 report
-                    .lines
-                    .push(format!("already wrapped {}", found.label()));
+                    .fields
+                    .push(("Engine", format!("{}: already ready", found.label())));
             }
             Ok(Outcome::Skipped(why)) => {
                 report
-                    .lines
-                    .push(format!("skipped {}: {why}", found.label()));
+                    .warnings
+                    .push(format!("Engine {} skipped: {why}", found.label()));
             }
             // With the watcher on, a later pass tries again.
             Err(e) => {
                 report
                     .warnings
-                    .push(format!("could not wrap {}: {e}", found.label()));
+                    .push(format!("Could not connect engine {}: {e}", found.label()));
                 failed = Some(e);
             }
         }
@@ -638,6 +713,7 @@ pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Rep
     if let Some(e) = failed.filter(|_| !watch) {
         return Err(e);
     }
+    let mut watching = false;
     if watch {
         let added_daemon = daemon::autostart::installed(cfg).is_none()
             || Routing::load(cfg).is_some_and(|routing| routing.added_daemon);
@@ -648,23 +724,27 @@ pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Rep
         .save(cfg)?;
         match daemon::autostart::install(cfg) {
             Ok(autostart) => {
-                report.lines.push(format!(
-                    "daemon autostart installed -> {}",
-                    autostart.path.display()
-                ));
-                report.warnings.extend(autostart.notes);
+                watching = true;
                 report
-                    .lines
-                    .push("watcher enabled: new engine versions are wrapped automatically".into());
+                    .fields
+                    .push(("Service file", autostart.path.display().to_string()));
+                report.warnings.extend(autostart.notes);
+                report.fields.push((
+                    "Updates",
+                    "Enabled; new engines connect automatically".into(),
+                ));
             }
             // Not fatal: wrapped engines keep working without the daemon.
             Err(e) => report.warnings.push(e.to_string()),
         }
     }
-    if routed == 0 {
+    if !watch {
         report
-            .lines
-            .push(nothing_routed(&found, watch, data_dir.as_deref()).into());
+            .fields
+            .push(("Updates", "Unchanged (--no-watch)".into()));
+    }
+    if routed == 0 {
+        report.summary = nothing_routed(&found, watching, data_dir.as_deref()).into();
         return Ok(report);
     }
     // Desktop passes no flags, so the engine only ever sees the default profile.
@@ -676,22 +756,21 @@ pub fn route(cfg: &Config, data_dir: Option<PathBuf>, watch: bool) -> Result<Rep
             cfg.api_host, engine.api_host
         ));
     }
-    report
-        .lines
-        .push(if auth::load_creds(&engine).is_authenticated() {
-            format!(
-                "Desktop's Code sessions on this computer now route through {}.",
-                engine.api_host
-            )
-        } else {
-            "Desktop's engine is wrapped, but sessions run directly until `dense login`.".into()
-        });
-    report.lines.push(
-        "Cowork routes only when Desktop runs it on this computer's engine.\n\
-         Cowork in Anthropic's cloud or in Desktop's VM, and Desktop's Chat, are not routed.\n\
-         Undo with `dense claude-desktop uninstall`."
-            .into(),
-    );
+    let logged_in = auth::load_creds(&engine).is_authenticated();
+    let off = cfg!(feature = "desktop-switch") && daemon::managed::switched_off(cfg);
+    report.ready = logged_in && !off && routed == found.len();
+    report.summary = if off {
+        "Setup saved. Routing is paused by your organization.".into()
+    } else if !logged_in {
+        "Setup saved. Log in to connect your local Code sessions: `dense login`.".into()
+    } else if routed == found.len() {
+        format!("Local Code sessions now route through {}", engine.api_host)
+    } else {
+        format!(
+            "{routed} of {} local engines connected; some engines need attention",
+            found.len()
+        )
+    };
     Ok(report)
 }
 
@@ -1052,8 +1131,8 @@ mod tests {
             std::fs::write(store.join(org).join("remote-session-spaces.json"), body).unwrap();
         }
         assert_eq!(cloud_sessions(&root), 3);
-        assert!(cowork_status(3).contains("3 session(s)"));
-        assert!(!cowork_status(0).contains("session(s)"));
+        assert!(cowork_status(3).contains("3 sessions"));
+        assert!(!cowork_status(0).contains("with folder access"));
     }
 
     #[test]

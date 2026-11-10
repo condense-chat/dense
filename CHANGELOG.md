@@ -3,6 +3,11 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.15.1] - 2026-11-10
+
+### Bug Fixes
+- Load /dense commands in Desktop's engine
+
 ## [0.15.0] - 2026-11-10
 
 ### Documentation

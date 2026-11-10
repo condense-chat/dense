@@ -110,7 +110,10 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
 
 /// Desktop's engine through the Anthropic proxy; see [`harness::launch_engine`].
 pub async fn run_engine(cfg: &Config, creds: &Creds, real: &Path, args: &[OsString]) -> Result<()> {
-    harness::launch_engine(cfg, Claude { plugin_dir: None }, creds, real, args).await
+    let plugin_dir = commands::claude_plugin_dir(cfg)
+        .map_err(|e| crate::desktop::engine::log(cfg, &format!("plugin not staged: {e}")))
+        .ok();
+    harness::launch_engine(cfg, Claude { plugin_dir }, creds, real, args).await
 }
 
 /// `dense statusline`: prints the launch footer until the session's first API

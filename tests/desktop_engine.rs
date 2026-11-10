@@ -450,7 +450,13 @@ fn logged_in_routes_and_keeps_desktops_token() {
     assert!(report.contains("token=desktop-oauth"), "{report}");
     assert!(report.contains("kind=1"), "{report}");
     assert!(
-        report.contains("args=--output-format stream-json"),
+        report.contains("args=--plugin-dir ") && report.ends_with("--output-format stream-json\n"),
+        "{report}"
+    );
+    assert!(
+        rig.data_dir()
+            .join("harness/claude/commands/info.md")
+            .is_file(),
         "{report}"
     );
 }

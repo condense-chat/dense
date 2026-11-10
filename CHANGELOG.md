@@ -3,6 +3,20 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.15.0] - 2026-11-10
+
+### Documentation
+- Add condense.chat, docs and dashboard links
+
+### Features
+- Show 30-day savings and new-release notice at launch- Plain weekly savings line instead of the bar- Unify terminal output and clarify savings
+
+### Performance
+- Cap the launch lookups at 1.5s
+
+### Refactor
+- Pass the footer line as an argument, not an env var
+
 ## [0.14.0] - 2026-11-08
 
 ### Bug Fixes

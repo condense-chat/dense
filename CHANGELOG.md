@@ -3,6 +3,14 @@
 All notable changes to dense. Format follows Conventional Commits; versions
 are computed by git-cliff.
 
+## [0.15.2] - 2026-11-11
+
+### Bug Fixes
+- Route built-in keyless free models- Update rustix for RUSTSEC-2026-0486
+
+### CI
+- Use official Ubuntu archive for Linux build dependencies- Fall back to Ubuntu mirror when archive DNS fails
+
 ## [0.15.1] - 2026-11-10
 
 ### Bug Fixes

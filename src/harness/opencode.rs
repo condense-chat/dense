@@ -43,9 +43,7 @@ pub struct OpenCode {
     plugins: Vec<PathBuf>,
 }
 
-/// One provider OpenCode has credentials for, rewritten for condense: its id,
-/// the condense dialect route its SDK speaks, and the upstream base condense
-/// should forward to.
+/// An enabled provider, its wire dialect, and its upstream base.
 struct Provider {
     id: String,
     route: &'static str,
@@ -108,6 +106,18 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
         ));
     }
     harness::launch(cfg, OpenCode { catalog, plugins }, args).await
+}
+
+fn autoloads_without_key(id: &str, entry: Option<&Value>) -> bool {
+    // OpenCode's built-in loader enables zero-input-price models without a key.
+    id == "opencode"
+        && field(entry, "models")
+            .and_then(Value::as_object)
+            .is_some_and(|models| {
+                models
+                    .values()
+                    .any(|model| model["cost"]["input"].as_f64() == Some(0.0))
+            })
 }
 
 /// The reroutable providers as an `OPENCODE_CONFIG_CONTENT` payload. Only
@@ -232,10 +242,7 @@ fn read_json(path: Option<PathBuf>) -> Map<String, Value> {
     }
 }
 
-/// Providers OpenCode already has credentials for, paired with the condense
-/// route and upstream base each should use. Anything OpenCode would not have
-/// enabled is left out — naming a provider in the config *enables* it, so
-/// listing the whole catalog would flood the model picker.
+/// Only name enabled providers: adding one to the config enables it in OpenCode.
 fn reroutable(
     catalog: &Map<String, Value>,
     user: &Map<String, Value>,
@@ -246,7 +253,11 @@ fn reroutable(
         .filter_map(|id| {
             let entry = catalog.get(id);
             let mine = user.get(id);
-            if mine.is_none() && !auths.contains_key(id) && !env_key_set(field(entry, "env")) {
+            if mine.is_none()
+                && !auths.contains_key(id)
+                && !env_key_set(field(entry, "env"))
+                && !autoloads_without_key(id, entry)
+            {
                 return None;
             }
             let npm = field(mine, "npm")
@@ -372,6 +383,62 @@ mod tests {
         let ids: Vec<&str> = picked.iter().map(|p| p.id.as_str()).collect();
         // groq is authless here anyway, but note it is also a dialect we skip
         assert_eq!(ids, ["openrouter"]);
+    }
+
+    #[test]
+    fn keyless_opencode_routes_without_changing_auth_or_models() {
+        let catalog = map(r#"{"opencode": {
+            "npm": "@ai-sdk/openai-compatible",
+            "api": "https://opencode.ai/inference/openai/v1",
+            "models": {
+                "big-pickle": {"cost": {"input": 0, "output": 0}},
+                "paid-model": {"cost": {"input": 3, "output": 15}}
+            }
+        }}"#);
+        let picked = reroutable(&catalog, &Map::new(), &Map::new());
+        assert_eq!(picked.len(), 1);
+        let cfg: Value = serde_json::from_str(&build_config(&targets(), &picked, &[])).unwrap();
+        let provider = &cfg["provider"]["opencode"];
+        assert_eq!(
+            provider["options"]["baseURL"],
+            "https://api.example.com/openai/v1"
+        );
+        assert_eq!(
+            provider["options"]["headers"][UPSTREAM_HEADER],
+            "https://opencode.ai/inference/openai/v1"
+        );
+        assert!(provider["options"]["apiKey"].is_null());
+        assert!(provider["models"].is_null());
+        assert!(provider["npm"].is_null());
+    }
+
+    #[test]
+    fn zero_priced_models_do_not_enable_other_providers() {
+        let catalog = map(r#"{"openrouter": {
+            "npm": "@openrouter/ai-sdk-provider",
+            "api": "https://openrouter.ai/api/v1",
+            "models": {"free-model": {"cost": {"input": 0, "output": 0}}}
+        }}"#);
+        assert!(reroutable(&catalog, &Map::new(), &Map::new()).is_empty());
+    }
+
+    #[test]
+    fn keyless_opencode_requires_a_free_model_in_the_catalog() {
+        for models in [
+            json!({}),
+            json!({"unknown": {}}),
+            json!({"paid": {"cost": {"input": 1}}}),
+        ] {
+            let catalog = map(&json!({"opencode": {
+                "api": "https://opencode.ai/inference/openai/v1", "models": models
+            }})
+            .to_string());
+            assert!(reroutable(&catalog, &Map::new(), &Map::new()).is_empty());
+            assert_eq!(
+                reroutable(&catalog, &Map::new(), &map(r#"{"opencode": {}}"#)).len(),
+                1
+            );
+        }
     }
 
     #[test]

@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Linux build deps
         if: startsWith(matrix.platform, 'linux')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools file
+        run: bash scripts/install-linux-build-deps.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
